@@ -1,0 +1,11 @@
+pycache/
+*.pyc
+*.pyo
+.pyd
+.Python
+env/
+venv/
+.env
+.git/
+.github/
+screenshot_.png
