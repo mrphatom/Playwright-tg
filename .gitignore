@@ -5,11 +5,12 @@ env/
 pycache/
 Docker
 .dockerignore
-Screenshots / Downloads
+Automation Data
 *.png
 *.jpg
 *.pdf
 downloads/
+sessions/
 IDEs
 .vscode/
 .idea/
