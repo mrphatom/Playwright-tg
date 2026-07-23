@@ -1,6 +1,6 @@
 # 🌐 Playwright-tg: Architectural Narrative & Technical Guide
 
-Welcome to the comprehensive technical documentation and user manual for **TeleScout AI** — an autonomous, multi-threaded Telegram automation bridge powered by Playwright, Google Gemini AI, and a persistent browser pooling pipeline.
+Welcome to the comprehensive technical documentation and user manual for **Playwright-tg** — an autonomous, multi-threaded Telegram automation bridge powered by Playwright, Google Gemini AI, and a persistent browser pooling pipeline.
 
 This guide serves developers looking to scale or modify the codebase, as well as end-users seeking to master the natural-language automation pipeline.
 
