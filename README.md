@@ -23,8 +23,8 @@ Playwright-tg is an enterprise-grade, asynchronous Telegram automation agent. It
 
 1. **Clone the repository**
    ```bash
-   git clone [https://github.com/mrphatom/TeleScout-AI.git](https://github.com/mrphatom/TeleScout-AI.git)
-   cd TeleScout-AI
+   git clone [https://github.com/mrphatom/Playwright-tg.git](https://github.com/mrphatom/Playwright-tg.git)
+   cd Playwright-tg
    ```
 
 2. **Configure environment variables**  
