@@ -1,4 +1,4 @@
-name: Build and Publish Docker Image
+name: CI/CD Pipeline - Test & Publish
 
 on:
   push:
@@ -11,7 +11,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push-image:
+  test-and-build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -21,6 +21,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --- CI PHASE: Run Security & Logic Tests ---
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies for testing
+        run: pip install -r requirements.txt
+
+      - name: Run Pytest
+        run: pytest test_bot.py -v
+      # -------------------------------------------
+
+      # --- CD PHASE: Build and Publish Docker Image ---
       - name: Log in to the Container registry
         uses: docker/login-action@v3
         with:
@@ -38,7 +53,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          # Only push if it's a merge/push to main (not just a PR check)
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
 
