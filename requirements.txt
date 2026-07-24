@@ -2,3 +2,5 @@ python-telegram-bot==20.7
 playwright==1.41.2
 aiohttp==3.9.3
 google-generativeai==0.4.1
+psutil==5.9.8
+pytest==8.0.2
