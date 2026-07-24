@@ -1,4 +1,4 @@
-# 🌐 TeleScout AI: Architectural Narrative & Technical Guide
+# 🌐 Playwright-tg: Architectural Narrative & Technical Guide
 
 Welcome to the comprehensive technical documentation for **TeleScout AI**. This guide outlines the system architecture, security models, and advanced operational strategies for developers and users.
 
@@ -8,7 +8,7 @@ Welcome to the comprehensive technical documentation for **TeleScout AI**. This 
 
 Traditional scrapers launch a new browser process for every request. This adds 3–5 seconds of overhead and consumes massive amounts of RAM, quickly crashing small servers.
 
-TeleScout utilizes a **Persistent Browser Pool Pattern**:
+Playwright-tg utilizes a **Persistent Browser Pool Pattern**:
 
 1. **Initialization:** On startup (via Telegram's `post_init` hook), one headless Chromium engine boots up.
 2. **Context Spawning:** When an authorized user sends a `/check` command, a lightweight, isolated `BrowserContext` (essentially a sandboxed incognito tab) is spawned instantly.
@@ -53,7 +53,7 @@ Modern frameworks (React, Tailwind) generate dynamic CSS class names (e.g., `<di
 ### The TeleScout AI Paradigm
 Instead of using `extract:.price-tag`, use `ai_extract:prompt`.
 
-TeleScout extracts the raw, rendered text payload of the entire webpage via `document.body.innerText`. It strips the HTML, limits the token count to fit context windows, and passes the raw text to **Google Gemini 1.5 Flash** alongside your prompt.
+Playwright-tg extracts the raw, rendered text payload of the entire webpage via `document.body.innerText`. It strips the HTML, limits the token count to fit context windows, and passes the raw text to **Google Gemini 1.5 Flash** alongside your prompt.
 
 - **Immune to UI Redesigns:** Extracts data based on semantic meaning rather than layout structure.
 - **Data Synthesis:** Can calculate, summarize, and synthesize information (e.g., *"Summarize the top 3 reviews"*).
