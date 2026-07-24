@@ -15,7 +15,8 @@ def test_path_traversal_prevention():
     assert sanitize_session_name("my_twitter_login") == "my_twitter_login"
     
     # Malicious inputs
-    assert sanitize_session_name("../../etc/passwd") == "_____etc_passwd"
+    # ../../ = 6 invalid characters, so we expect 6 underscores
+    assert sanitize_session_name("../../etc/passwd") == "______etc_passwd"
     assert sanitize_session_name("C:\\Windows\\System32") == "C__Windows_System32"
     assert sanitize_session_name("login(1)!") == "login_1__"
 
@@ -28,5 +29,3 @@ def test_telegram_truncation():
     truncated = truncate_text(long_text, 4000)
     assert len(truncated) <= 4000
     assert truncated.endswith("...[Truncated]")
-
-
