@@ -88,6 +88,9 @@ If a target platform aggressively blocks data center IP addresses, inject reside
 ```
 
 ### 🚀 Troubleshooting & Diagnostics
- #### Timeout Errors (⁠PlaywrightTimeoutError⁠): Indicates that the target website took longer than 40 seconds to reach ⁠domcontentloaded⁠. This typically happens if the site uses heavy Cloudflare JS challenges or infinite loaders.
- #### Missing AI Results: Ensure your ⁠GEMINI_API_KEY⁠ is actively populated in your ⁠.env⁠ file. If the key is absent, the bot will gracefully bypass ⁠ai_extract⁠ blocks with a warning message rather than crashing the thread.
- #### Memory Management: If hosting on a budget 1GB VPS, ensure your ⁠docker-compose.yml⁠ memory limits are enforced (⁠memory: 1.5G⁠ or similar buffer) to prevent the Linux kernel OOM (Out Of Memory) killer from dropping container processes during heavy page rendering.
+ #### 1). Timeout Errors (⁠PlaywrightTimeoutError⁠): 
+     Indicates that the target website took longer than 40 seconds to reach ⁠domcontentloaded⁠. This typically happens if the site uses heavy Cloudflare JS challenges or infinite loaders.
+ #### 2). Missing AI Results: 
+     Ensure your ⁠GEMINI_API_KEY⁠ is actively populated in your ⁠.env⁠ file. If the key is absent, the bot will gracefully bypass ⁠ai_extract⁠ blocks with a warning message rather than crashing the thread.
+ #### 3). Memory Management: 
+     If hosting on a budget 1GB VPS, ensure your ⁠docker-compose.yml⁠ memory limits are enforced (⁠memory: 1.5G⁠ or similar buffer) to prevent the Linux kernel OOM (Out Of Memory) killer from dropping container processes during heavy page rendering.
