@@ -25,7 +25,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11' # Bumped to 3.11 to silence the Google API EOL warning
           cache: 'pip'
 
       - name: Install dependencies for testing
