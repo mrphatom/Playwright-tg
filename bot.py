@@ -73,8 +73,12 @@ def is_valid_url(url: str) -> bool:
 
 def sanitize_session_name(name: str) -> str:
     """Prevents Path Traversal attacks by sanitizing filenames."""
-    return re.sub(r'[^a-zA-Z0-9_-]', '_', name.strip())
-
+    # Strip whitespace and replace any non-alphanumeric character (except _ and -) with underscore
+    sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', name.strip())
+    # Additionally, replace any leading dashes with underscores to prevent issues
+    sanitized = re.sub(r'^-+', '_', sanitized)
+    return sanitized
+    
 def truncate_text(text: str, max_length: int = 4000) -> str:
     """Safely truncates text for Telegram message limits."""
     if len(text) <= max_length:
