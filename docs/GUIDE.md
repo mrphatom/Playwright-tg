@@ -1,6 +1,6 @@
 # 🌐 Playwright-tg: Architectural Narrative & Technical Guide
 
-Welcome to the comprehensive technical documentation for **TeleScout AI**. This guide outlines the system architecture, security models, and advanced operational strategies for developers and users.
+Welcome to the comprehensive technical documentation for **Playwright-tg AI**. This guide outlines the system architecture, security models, and advanced operational strategies for developers and users.
 
 ---
 
