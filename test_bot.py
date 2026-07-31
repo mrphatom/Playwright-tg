@@ -2,6 +2,10 @@ import pytest
 import os
 import sqlite3
 import json
+
+# Set environment variable BEFORE importing bot module so bot uses test_telescout.db
+os.environ["DB_PATH"] = "test_telescout.db"
+
 from bot import (
     is_valid_url, 
     sanitize_session_name, 
@@ -11,9 +15,6 @@ from bot import (
     load_encrypted_session,
     init_db
 )
-
-# Test DB Setup
-os.environ["DB_PATH"] = "test_telescout.db"
 
 @pytest.fixture(autouse=True)
 def setup_test_db():
