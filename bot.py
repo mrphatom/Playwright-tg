@@ -45,7 +45,6 @@ PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
 # Encryption Key for Sessions at Rest
 ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY")
 if not ENCRYPTION_KEY:
-    # Generate a deterministic key derived from Bot Token if custom key is not provided
     token_seed = (TELEGRAM_BOT_TOKEN or "default_secret_seed").encode("utf-8")
     ENCRYPTION_KEY = base64.urlsafe_b64encode(token_seed.ljust(32)[:32]).decode("utf-8")
 
@@ -58,7 +57,9 @@ if GEMINI_API_KEY:
 else:
     ai_model = None
 
-DB_PATH = os.getenv("DB_PATH", "telescout.db")
+def get_db_path() -> str:
+    """Returns the current database path dynamically."""
+    return os.getenv("DB_PATH", "telescout.db")
 
 # State Management
 class BrowserPool:
@@ -74,7 +75,7 @@ user_cooldowns: Dict[int, float] = {}
 # ==========================================
 def init_db():
     """Initializes the SQLite database tables."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
         
         # Sessions table (encrypted storage)
@@ -119,7 +120,7 @@ def init_db():
 def log_audit(user_id: int, command: str, target_url: Optional[str], status: str):
     """Inserts a command log entry into SQLite."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(get_db_path()) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO audit_logs (user_id, command, target_url, status) VALUES (?, ?, ?, ?)",
@@ -135,7 +136,7 @@ def save_encrypted_session(user_id: int, name: str, session_data: dict):
     encrypted_bytes = cipher_suite.encrypt(json_str.encode("utf-8"))
     encrypted_str = encrypted_bytes.decode("utf-8")
     
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO sessions (user_id, name, encrypted_data) 
@@ -146,7 +147,7 @@ def save_encrypted_session(user_id: int, name: str, session_data: dict):
 
 def load_encrypted_session(user_id: int, name: str) -> Optional[dict]:
     """Retrieves and decrypts a browser session from SQLite."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT encrypted_data FROM sessions WHERE user_id = ? AND name = ?", (user_id, name))
         row = cursor.fetchone()
@@ -161,14 +162,14 @@ def load_encrypted_session(user_id: int, name: str) -> Optional[dict]:
 
 def list_user_sessions(user_id: int) -> List[str]:
     """Lists all active session names for a user."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sessions WHERE user_id = ?", (user_id,))
         return [row[0] for row in cursor.fetchall()]
 
 def delete_user_session(user_id: int, name: str) -> bool:
     """Deletes a saved session from SQLite."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM sessions WHERE user_id = ? AND name = ?", (user_id, name))
         conn.commit()
@@ -176,7 +177,7 @@ def delete_user_session(user_id: int, name: str) -> bool:
 
 def save_watcher_to_db(watcher_id: str, chat_id: int, url: str, actions: List[str], interval: int):
     """Persists a watcher configuration to SQLite."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO watchers (watcher_id, chat_id, url, actions_json, interval_seconds, is_active)
@@ -186,7 +187,7 @@ def save_watcher_to_db(watcher_id: str, chat_id: int, url: str, actions: List[st
 
 def deactivate_watcher_in_db(watcher_id: str):
     """Marks a watcher as inactive in SQLite."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE watchers SET is_active = 0 WHERE watcher_id = ?", (watcher_id,))
         conn.commit()
@@ -202,7 +203,6 @@ def is_valid_url(url: str) -> bool:
         return False
 
 def is_domain_allowed(url: str) -> bool:
-    """Checks if the URL matches the domain whitelist (if configured)."""
     if not ALLOWED_DOMAINS:
         return True
     try:
@@ -227,7 +227,6 @@ def mask_sensitive_action(action: str) -> str:
 # DECORATORS
 # ==========================================
 def restricted(func):
-    """Access control decorator."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if ALLOWED_USERS and user_id not in ALLOWED_USERS:
@@ -238,7 +237,6 @@ def restricted(func):
     return wrapper
 
 def rate_limited(func):
-    """Prevents command spamming."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         now = time.time()
@@ -253,7 +251,6 @@ def rate_limited(func):
 # BROWSER & AI INTEGRATIONS
 # ==========================================
 async def start_browser_pool(application: Application):
-    """Initializes the browser pool and restores watchers from SQLite on startup."""
     init_db()
     logger.info("Initializing Global Browser Pool...")
     pool.playwright = await async_playwright().start()
@@ -262,13 +259,11 @@ async def start_browser_pool(application: Application):
     )
     logger.info("Browser Pool Ready.")
     
-    # Restore persisted watchers from SQLite
     await restore_watchers_from_db(application.bot)
 
 async def restore_watchers_from_db(context_bot):
-    """Reads active watchers from SQLite and spawns background tasks on reboot."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(get_db_path()) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT watcher_id, chat_id, url, actions_json, interval_seconds FROM watchers WHERE is_active = 1")
             rows = cursor.fetchall()
@@ -371,7 +366,6 @@ async def run_browser_task(url: str, actions: List[str], user_id: int, status_ms
     if "proxy:on" in actions and PROXY_SERVER:
         context_opts["proxy"] = {"server": PROXY_SERVER, "username": PROXY_USERNAME, "password": PROXY_PASSWORD}
 
-    # Handle session loading from encrypted database
     for action in actions:
         if action.startswith("load_session:"):
             safe_name = sanitize_session_name(action.replace("load_session:", ""))
@@ -515,7 +509,6 @@ async def watch_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     watcher_id = uuid.uuid4().hex[:6]
     
-    # Save to SQLite for reboot persistence
     save_watcher_to_db(watcher_id, chat_id, url, actions, interval)
     
     task = asyncio.create_task(watcher_loop(chat_id, url, actions, interval, watcher_id, context.bot))
