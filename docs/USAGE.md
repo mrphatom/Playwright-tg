@@ -1,96 +1,107 @@
-# 🌐 Playwright-tg: Architectural Narrative & Technical Guide
+# 🕹️ Playwright-tg: Practical Usage & Examples
 
-Welcome to the comprehensive technical documentation and user manual for **Playwright-tg** — an autonomous, multi-threaded Telegram automation bridge powered by Playwright, Google Gemini AI, and a persistent browser pooling pipeline.
+Playwright-tg operates using a pipeline syntax. You start with a base command (like `/check` or `/watch`), provide the target URL, and then chain a series of "actions" together using the pipe character `|`.
 
-This guide serves developers looking to scale or modify the codebase, as well as end-users seeking to master the natural-language automation pipeline.
-
----
-
-## 📖 Part 1: Executive Narrative & Architectural Overview
-
-### The Problem It Solves
-Traditional web scraping and browser automation tools are rigid. They break whenever a website updates its DOM (Document Object Model) class names, struggle with heavy client-side JavaScript rendering, get instantly blocked by basic anti-bot infrastructure, and run slowly because they spin up and tear down heavy browser binaries for every individual task.
-
-### The TeleScout Solution
-TeleScout solves these bottlenecks by fusing asynchronous event-driven Telegram communication with a persistent browser architecture.
-
-1. **Persistent Browser Pooling:** Instead of launching Chromium on every request (which burns CPU and adds 3–5 seconds of latency), TeleScout spins up a single background browser instance on startup. User requests spawn isolated, lightweight browser contexts (tabs/incognito windows) concurrently.
-2. **AI-Driven Data Extraction:** Traditional scrapers rely on brittle CSS selectors (e.g., `div > span.price`). TeleScout dumps the entire text payload of a rendered page directly into Google Gemini 1.5 Flash, allowing users to query webpage data using conversational prompts (e.g., *“What is the discount percentage of this item?”*).
-3. **Resilient Evasion & Sessions:** Through inline script masking (`navigator.webdriver` spoofing), optional proxy routing, and local session-state caching (`storage_state`), the bot bypasses routine bot detection flags and maintains active user logins securely across tasks.
+**Basic Structure:**
+```bash
+/command [https://example.com](https://example.com) | action_1 | action_2 | action_3
+```
 
 ---
 
-## 🛠️ Part 2: Developer Guide & System Architecture
+## 🛠️ Action Glossary
 
-### Core Design Patterns
+Here are all the building blocks you can use in your pipelines:
 
-#### 1. Lifecycle Hooks (`post_init` & `post_stop`)
-The Telegram bot utilizes `python-telegram-bot`'s asynchronous lifecycle hooks to bind the browser pool directly to the event loop lifecycle.
-
-This guarantees that Chromium initializes before any updates are polled and gracefully terminates when the application shuts down, preventing zombie browser processes.
-
-#### 2. The Action Pipeline Interpreter
-When a user sends a command string separated by pipes (`|`), the command handler parses it into an ordered execution array:
-
-- `type:selector=value` $\rightarrow$ Locates input element and triggers `.fill()`
-- `click:selector` $\rightarrow$ Locates interactive node and triggers `.click()`
-- `wait:seconds` $\rightarrow$ Suspends async task execution for dynamic JS rendering
-- `extract:selector` $\rightarrow$ Scrapes standard structural inner text nodes
-- `ai_extract:prompt` $\rightarrow$ Passes raw text body to Gemini via Google GenAI SDK
-- `save_session:name` / `load_session:name` $\rightarrow$ Serializes/Deserializes cookies & localStorage
+| Action | Syntax | Description |
+| :--- | :--- | :--- |
+| **Type** | `type:<css_selector>=<text>` | Types text into an input field (e.g., search bar or login form). |
+| **Click** | `click:<css_selector>` | Clicks a button, link, or interactive element. |
+| **Wait** | `wait:<seconds>` | Pauses the pipeline. Crucial for letting dynamic Javascript or loaders finish. |
+| **Extract** | `extract:<css_selector>` | Scrapes raw text from all elements matching the CSS selector. |
+| **AI Extract** | `ai_extract:<prompt>` | Passes the page content to Gemini AI to answer your natural language prompt. |
+| **Save Session** | `save_session:<name>` | Encrypts and saves your current cookies/login state to the database. |
+| **Load Session** | `load_session:<name>` | Injects a previously saved session before navigating to the URL. |
+| **Proxy** | `proxy:on` | Routes this specific task through the proxy configured in your `.env`. |
 
 ---
 
-## 👤 Part 3: End-User Manual & Operational Guide
+## 👀 Watcher Conditions (For `/watch` only)
 
-### Basic Navigation
+When running a background watcher, you must tell the bot when to alert you and stop.
 
-To test the bot's baseline functionality, send a basic inspection URL:
+| Condition | Syntax | Description |
+| :--- | :--- | :--- |
+| **Interval** | `every:<seconds>` | How often to check the page (Minimum: 30 seconds). |
+| **Text Check** | `condition_contains:<text>` | Triggers if the specified text appears anywhere on the page (case-insensitive). |
+| **AI Check** | `condition_ai:<prompt>` | Triggers if the AI evaluates your prompt as 'TRUE'. |
 
+---
+
+## 📚 Real-World Scenarios & Examples
+
+### 1. The Simple Screenshot
+Just want to see what a webpage looks like right now?
 ```bash
 /check [https://news.ycombinator.com](https://news.ycombinator.com)
 ```
+*Result:* Returns a full-page screenshot and the page title.
 
-**Expected Output:** The bot returns a status ticker, navigates to Hacker News, captures a high-resolution full-page screenshot, extracts the page title, and sends it directly to your chat.
+### 2. Standard Data Extraction (CSS)
+Grab specific text elements, like the trending repositories on GitHub.
+```bash
+/check [https://github.com/trending](https://github.com/trending) | extract:h2.h3 a
+```
+
+### 3. AI-Powered Market Research (Recommended)
+Don't want to dig for CSS selectors? Let Gemini do the reading for you.
+```bash
+/check [https://news.ycombinator.com](https://news.ycombinator.com) | ai_extract:Summarize the top 3 trending tech discussions on this page
+```
+
+### 4. Logging In and Saving a Session
+Automate a login flow, wait for the redirect, and save the authenticated state for future use.
+```bash
+/check [https://example.com/login](https://example.com/login) | type:#username=admin | type:#password=secret | click:#submit | wait:5 | save_session:admin_main
+```
+
+### 5. Using a Saved Session
+Skip the login screen completely by loading the session you saved in Scenario 4.
+```bash
+/check [https://example.com/dashboard](https://example.com/dashboard) | load_session:admin_main | ai_extract:What is my current account balance?
+```
+
+### 6. The Continuous Watcher (Stock/Price Checker)
+Check an Amazon product page every 60 seconds and alert you when it's back in stock.
+```bash
+/watch [https://example.com/store-item](https://example.com/store-item) | every:60 | condition_contains:In Stock
+```
+
+### 7. The AI Watcher (Smart Alerts)
+Use AI logic for complex watcher conditions. Check every 2 minutes (120 seconds).
+```bash
+/watch [https://news.ycombinator.com](https://news.ycombinator.com) | every:120 | condition_ai:Is there any news about artificial intelligence breakthroughs today?
+```
 
 ---
 
-### Advanced Command Pipeline Manual
+## 🤖 Full Command List
 
-You can chain multiple instructions using the pipe (`|`) delimiter. Every pipeline starts with `/check <URL>`.
+Type these directly into your Telegram chat to manage your bot:
 
-#### 1. Interacting with Forms & Buttons
-To fill out a search bar or log into a portal:
+- `/start` — Shows the welcome message and basic syntax.
+- `/health` — Displays VPS Server CPU, RAM usage, and active browser pool status.
+- `/check <url> | <actions>` — Runs a one-off automation pipeline.
+- `/watch <url> | every:<sec> | <condition>` — Starts a persistent background watcher.
+- `/watchers` — Lists all currently running background watchers and their IDs.
+- `/stopwatch <ID>` — Manually stops a running watcher.
+- `/sessions` — Lists the names of your saved, encrypted browser sessions.
+- `/deletesession <name>` — Permanently deletes a saved session from the database.
 
-```bash
-/check [https://example.com/login](https://example.com/login) | type:#username=myuser | type:#password=mypass | click:#login-btn | wait:3
-```
+---
 
-#### 2. AI-Powered Natural Language Scraping
-Bypass complicated CSS structures entirely by letting Gemini read the page layout:
+## 💡 Pro-Tips for Success
 
-```bash
-/check [https://news.ycombinator.com](https://news.ycombinator.com) | ai_extract:Summarize the top 3 trending AI stories on this page
-```
-
-#### 3. Persistent Authentication (Sessions)
-Save or load login sessions across runs:
-
-```bash
-/check [https://example.com/login](https://example.com/login) | type:#user=admin | type:#pass=123 | click:#submit | save_session:my_session
-```
-
-#### 4. Stealth & Proxy Routing
-If a target platform aggressively blocks data center IP addresses, inject residential proxies into your pipeline:
-
-```bash
-/check [https://target-website.com](https://target-website.com) | proxy:[http://user:pass@proxy.example.com:8080](http://user:pass@proxy.example.com:8080) | ai_extract:Extract product details
-```
-
-### 🚀 Troubleshooting & Diagnostics
- #### 1). Timeout Errors (⁠PlaywrightTimeoutError⁠): 
-     Indicates that the target website took longer than 40 seconds to reach ⁠domcontentloaded⁠. This typically happens if the site uses heavy Cloudflare JS challenges or infinite loaders.
- #### 2). Missing AI Results: 
-     Ensure your ⁠GEMINI_API_KEY⁠ is actively populated in your ⁠.env⁠ file. If the key is absent, the bot will gracefully bypass ⁠ai_extract⁠ blocks with a warning message rather than crashing the thread.
- #### 3). Memory Management: 
-     If hosting on a budget 1GB VPS, ensure your ⁠docker-compose.yml⁠ memory limits are enforced (⁠memory: 1.5G⁠ or similar buffer) to prevent the Linux kernel OOM (Out Of Memory) killer from dropping container processes during heavy page rendering.
+1. **Wait for Loaders:** If a site has a slow loading animation after you click a button, always add a `wait:` action before taking a screenshot or extracting data (e.g., `| click:#submit | wait:3 | extract:.result`).
+2. **Selector Specificity:** When using `type:` or `click:`, use exact IDs (`#element`) or name attributes (`input[name="email"]`) whenever possible. Broad classes (like `.btn`) might click the wrong button if there are multiple elements on the page.
+3. **AI Limits:** The `ai_extract:` action sends the visible text of the page to Gemini. If a webpage is infinitely long (like a social media feed), the AI only sees what loaded during the initial render. Use a `wait:` action to let the page settle first.
