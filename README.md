@@ -1,11 +1,11 @@
-# 🤖 TeleScout AI: Enterprise Web Automation Agent
+# 🤖 Playwright-tg: Enterprise Web Automation Agent
 
 ![CI/CD Pipeline](https://img.shields.io/badge/CI%2FCD-Pipeline-blue?logo=githubactions&logoColor=white)
 ![Playwright](https://img.shields.io/badge/Playwright-2EAD33?logo=playwright&logoColor=white)
 ![Gemini AI](https://img.shields.io/badge/Google_Gemini-1.5_Flash-8E44AD?logo=googlegemini&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white)
 
-TeleScout is an asynchronous, AI-powered Telegram bot for stealth web automation. It fuses Playwright's headless browsing with Google Gemini 1.5 Flash, allowing you to control browser sessions, extract structured data via AI, bypass CAPTCHAs, and run continuous background watchers—all via natural language commands in Telegram.
+Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automation. It fuses Playwright's headless browsing with Google Gemini 1.5 Flash, allowing you to control browser sessions, extract structured data via AI, bypass CAPTCHAs, and run continuous background watchers—all via natural language commands in Telegram.
 
 ---
 
@@ -24,8 +24,8 @@ TeleScout is an asynchronous, AI-powered Telegram bot for stealth web automation
 
 1. **Clone the repository**
    ```bash
-   git clone [https://github.com/mrphatom/TeleScout-AI.git](https://github.com/mrphatom/TeleScout-AI.git)
-   cd TeleScout-AI
+   git clone [https://github.com/mrphatom/Playwright-tg.git](https://github.com/mrphatom/Playwright-tg.git)
+   cd Playwright-tg
    ```
 
 2. **Configure environment variables**  
