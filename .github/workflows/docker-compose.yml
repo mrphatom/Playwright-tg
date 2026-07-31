@@ -2,14 +2,14 @@ version: '3.8'
 
 services:
   bot:
-    # Image names MUST be lowercase, so Playwright-tg becomes playwright-tg
     image: ghcr.io/mrphatom/playwright-tg:main
     container_name: telescout-bot
     restart: unless-stopped
     env_file:
       - .env
     volumes:
-      - ./sessions:/app/sessions
+      # Mount SQLite database file to host so DB persists across image pulls
+      - ./telescout.db:/app/telescout.db
     deploy:
       resources:
         limits:
