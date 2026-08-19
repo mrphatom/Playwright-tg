@@ -1,0 +1,57 @@
+app = "playwright-tg-mrphatom"
+
+primary_region = "iad"
+
+
+
+[build]
+
+  dockerfile = "Dockerfile"
+  
+
+
+[env]
+
+  DB_PATH = "/data/telescout.db"
+  
+  MAX_CONCURRENT_TASKS = "3"
+  
+  COMMAND_TIMEOUT = "90"
+  
+  ALLOWED_DOMAINS = ""
+  
+
+
+[[mounts]]
+
+  source = "telescout_data"
+  
+  destination = "/data"
+  
+
+
+[vm]
+
+  memory = "2048mb"
+  
+  cpu_kind = "shared"
+  
+  cpus = 1
+  
+
+
+[[restart]]
+
+  policy = "always"
+  
+
+
+
+
+
+
+
+
+
+
+
