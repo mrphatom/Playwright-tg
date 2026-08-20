@@ -30,6 +30,98 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 
 ---
 
+## GreyAI Telegram Profile and Command Reference
+
+### Description
+
+GreyAI is a fast Telegram assistant for ordinary conversation and authorized web work. Users can send text, short voice notes, or screenshots. Natural-language chat stays on the low-latency chat path, while browsing, named websites, extraction, monitoring, scheduling, login, and account-management requests enter the governed agent path. The agent can discover a clearly named website such as Google News, but every discovered URL still passes HTTPS, domain-allowlist, SSRF, quota, timeout, and concurrency checks before browser execution.
+
+### Information and permissions
+
+Free accounts receive the configured base quota. Pro and Max plans are purchased with Telegram Stars and provide 1,000 and 5,000 monthly execution units respectively. Active administrators can use administrator and developer capabilities. Ordinary users can request developer access with `/devrequest`; only an administrator can approve it. Developer API keys are scoped, rate-limited, owner-bound, hashed at rest, revocable, and never shown in listings.
+
+When a new key is created, GreyAI sends a separate, clearly labeled message containing the key ID, label, scope, rate limit, and secret. That one-time message self-deletes after the configured copy window, which defaults to 90 seconds and is bounded between 30 and 300 seconds. The secret is not stored in plaintext and is never displayed again. If the message is exposed, revoke the key immediately with `/revokekey <key_id>` and create a replacement.
+
+### User commands
+
+| Command | Purpose | Example |
+|---|---|---|
+| `/start` | Start GreyAI and receive your referral link | `/start` |
+| `/help` | Show the in-Telegram feature and command guide | `/help` |
+| `/health` | View bot, browser, database, watcher, schedule, and resource health | `/health` |
+| `/check` | Run a browser workflow with URL and pipe-separated actions | `/check https://example.com \| ai_extract:Summarize this page` |
+| `/watch` | Monitor a page on an interval until a condition is met | `/watch 300 https://example.com \| condition_contains:In Stock` |
+| `/watchers` | List active monitors | `/watchers` |
+| `/stopwatch` | Stop one monitor | `/stopwatch <watcher_id>` |
+| `/schedule` | Create a recurring web briefing | `/schedule 08:00 Europe/London weekdays https://example.com \| Summarize` |
+| `/schedules` | List recurring briefings | `/schedules` |
+| `/unschedule` | Cancel one briefing | `/unschedule <schedule_id>` |
+| `/sessions` | List encrypted browser-session metadata | `/sessions` |
+| `/deletesession` | Delete one saved browser session | `/deletesession <name>` |
+| `/dashboard` | Request a secure one-time operations-dashboard link | `/dashboard` |
+| `/upgrade` | View or purchase Pro or Max with Telegram Stars | `/upgrade max` |
+| `/referral` | Create or display your invite link | `/referral` |
+| `/report` | Submit a support or safety report | `/report The browser task failed` |
+| `/appeal` | Open an account review appeal | `/appeal Please review my limitation` |
+| `/support` | Request platform support | `/support` |
+| `/paysupport` | Request payment support | `/paysupport` |
+| `/terms` | View the platform terms notice | `/terms` |
+
+### Natural-language examples
+
+```text
+Summarize the latest Google News headlines
+
+Check https://example.com and tell me whether Apple Pie is in stock
+
+Every weekday at 08:00 Europe/London, summarize Google News and send me one briefing
+
+Log in to my saved session and extract the order status
+
+What can you do?
+```
+
+### Voice notes and screenshots
+
+A voice note is transcribed and then routed as either a normal chat message or an agent task. A photo or screenshot is analyzed for visible text, labels, prices, objects, and UI intent before the same routing decision. Media is authorized before download, size-limited, processed with the dedicated multimodal model, bounded as untrusted context, and deleted from temporary storage after processing.
+
+### Developer commands and API integration
+
+| Command | Permission | Purpose |
+|---|---|---|
+| `/devrequest <reason>` | Any active user | Submit a developer-access request to an administrator |
+| `/devrequests` | Administrator | Review open and resolved developer requests |
+| `/grantdeveloper <telegram_id>` | Administrator | Approve an open request and grant developer access |
+| `/denydeveloper <telegram_id> [reason]` | Administrator | Deny an open request |
+| `/revokedeveloper <telegram_id>` | Administrator | Revoke developer access and all active keys; administrators cannot be downgraded |
+| `/newkey <name> check` | Active developer or administrator | Create a scoped API key and receive its secret once |
+| `/devkeys` | Active developer or administrator | List labeled metadata without secret values |
+| `/revokekey <key_id>` | Key owner or authorized administrator | Revoke a key |
+| `/developerstats` | Active developer or administrator | View key activity, request counts, and denied events |
+
+Other Telegram bots use the versioned integration API:
+
+```http
+POST https://playwright-tg-mrphatom.fly.dev/api/v1/check
+Authorization: Bearer gai_live.key_...
+Content-Type: application/json
+```
+
+```json
+{
+  "url": "https://example.com",
+  "extract": "Return the current availability and price."
+}
+```
+
+The initial enabled scope is `check`. Keys are not dashboard credentials, and the API applies the same URL, SSRF, quota, timeout, concurrency, and redaction controls as Telegram browser tasks.
+
+### Administrator command groups
+
+Administrators can search users, inspect account state, ban and unban accounts, review reports and appeals, resolve tickets, inspect referral activity, grant and revoke administrator roles, review developer requests, approve or deny developer access, and inspect platform health. The available commands are `/admin`, `/admin_user`, `/grantadmin`, `/revokeadmin`, `/ban`, `/unban`, `/reports`, `/appeals`, `/review`, `/resolveappeal`, `/referrals`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, and `/revokedeveloper`.
+
+---
+
 ## 🚀 Quickstart (VPS / Production)
 
 1. **Clone the repository**
