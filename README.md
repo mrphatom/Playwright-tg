@@ -230,7 +230,13 @@ GreyAI sends rate-limited Telegram alerts to the configured administrators in `A
 
 ### Shared-chat invocation
 
-GreyAI supports three Telegram invocation surfaces. **Inline mode** lets an authorized user type `@GreyBrowserBot your question` in any private chat, group, or channel and choose GreyAI’s answer. Enable this in [@BotFather](https://t.me/BotFather) with `/setinline`; inline results are intended for questions and read-only public-page explanations, while full browser tasks should remain in the private GreyAI chat [2] [3].
+GreyAI supports three Telegram invocation surfaces.
+
+### Natural-language subreddit monitoring
+
+Reddit subreddit references are supported without a literal URL. For example, `Head to Reddit r/forhire and watch every 1 hour for a new web developer post` resolves safely to `https://www.reddit.com/r/forhire`, creates a persistent watcher, and checks it hourly. `every hour` is accepted as shorthand for one hour. When the condition is detected, GreyAI sends the watcher alert and stops that watcher according to the existing watcher lifecycle. Reddit is explicitly allowlisted in the production configuration; all existing HTTPS, host, public-mode, and SSRF checks still apply.
+
+GreyAI does not claim that a monitor exists unless the watcher is successfully created. Use `/watchers` to list active monitors and `/stopwatch <watcher_id>` to cancel one. **Inline mode** lets an authorized user type `@GreyBrowserBot your question` in any private chat, group, or channel and choose GreyAI’s answer. Enable this in [@BotFather](https://t.me/BotFather) with `/setinline`; inline results are intended for questions and read-only public-page explanations, while full browser tasks should remain in the private GreyAI chat [2] [3].
 
 **Groups are opt-in.** A group administrator must run `/enablegreyai`. After activation, GreyAI ignores ordinary group messages and responds only to explicit `@GreyBrowserBot` mentions, replies to GreyAI messages, and `/ask <request>`. `/disablegreyai` turns group handling off. Authorization, quotas, rate limits, and the existing domain and SSRF protections still apply.
 

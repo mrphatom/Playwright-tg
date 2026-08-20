@@ -368,6 +368,35 @@ def test_deterministic_web_fallback_uses_selected_session(monkeypatch):
     assert plan["actions"] == ["load_session:x_login", "ai_extract:it"]
 
 
+def test_subreddit_watch_request_discovers_reddit_and_builds_hourly_condition(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["reddit.com"])
+    request = "Head to Reddit 'r/forhire' and watch every 1 hour for a new web developer post"
+
+    assert bot.classify_message_route(request) == "task"
+    plan = bot.parse_deterministic_web_request(request)
+
+    assert plan["mode"] == "watch"
+    assert plan["url"] == "https://www.reddit.com/r/forhire"
+    assert plan["interval_seconds"] == 3600
+    assert plan["condition"] == "a new web developer post"
+    assert plan["actions"] == ["condition_ai:a new web developer post"]
+    assert plan["discovered_url"] is True
+
+
+def test_subreddit_request_reaches_interpreter_fallback_without_gemini(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["reddit.com"])
+    monkeypatch.setattr(bot, "gemini_configured", lambda: False)
+    plan = asyncio.run(bot.parse_natural_language_intent("watch r/forhire every hour for a new developer post"))
+
+    assert plan["mode"] == "watch"
+    assert plan["url"] == "https://www.reddit.com/r/forhire"
+    assert plan["interval_seconds"] == 3600
+
+
 def test_deterministic_web_fallback_handles_check_and_watch(monkeypatch):
     import bot
     monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
