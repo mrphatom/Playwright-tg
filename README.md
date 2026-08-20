@@ -181,6 +181,8 @@ They can block a host or family of subdomains immediately:
    TELEGRAM_BOT_TOKEN=your_telegram_bot_token
    GEMINI_API_KEY=your_gemini_api_key
    GEMINI_API_KEY_2=your_optional_fallback_gemini_api_key
+   GEMINI_API_KEY_3=your_optional_fallback_gemini_api_key_3
+   GEMINI_API_KEY_4=your_optional_fallback_gemini_api_key_4
    GEMINI_MODEL=gemini-3.6-flash
    MULTIMODAL_MODEL=gemini-3.5-flash-lite
    CHAT_TIMEOUT_SECONDS=20
@@ -281,7 +283,7 @@ The current plans are **Pro at 750 Stars for 30 days with 1,000 monthly executio
 
 Voice notes and photos are processed only after normal authorization checks. Media is size-limited, downloaded to a temporary file, sent to the dedicated `MULTIMODAL_MODEL` with a 45-second `MEDIA_TIMEOUT_SECONDS` deadline, and deleted in a `finally` cleanup path. Short Telegram voice notes use `audio/ogg`; screenshots use `image/jpeg` or `image/png`. Quota exhaustion is reported as provider capacity, not as a false “try a shorter voice note” message. The interpreted content is bounded and marked as untrusted before it reaches either chat or agent routing. The dashboard uses bounded requests, explicit degraded/error states, and retrying polling rather than leaving panels indefinitely stuck on “Loading…”.
 
-Set `GEMINI_API_KEY_2` to enable the optional provider failover. The primary key is used first; quota/rate-limit responses, timeouts, transport failures, and Gemini 5xx responses temporarily cool down that key and retry the text request with `TEXT_FALLBACK_MODEL` (default `gemini-3.5-flash-lite`) before trying the secondary key. Media continues to use the dedicated `MULTIMODAL_MODEL`. The failover is per model call, so an active Playwright page, saved session, operation ID, and task state are not restarted. Invalid-request and authentication errors are not treated as quota exhaustion. Keys are server-side secrets and are never logged or placed in request URLs. Gemini rate limits are applied per project rather than per key, so the two keys should belong to independently billed projects if they are intended to provide independent quota capacity [1].
+Set `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`, and `GEMINI_API_KEY_4` to enable the ordered four-key provider pool. The primary key is used first; quota/rate-limit responses, timeouts, transport failures, and Gemini 5xx responses temporarily cool down that key and retry the text request with `TEXT_FALLBACK_MODEL` (default `gemini-3.5-flash-lite`) before advancing through the remaining healthy keys. Media uses the same four-key pool with the dedicated `MULTIMODAL_MODEL`. The failover is per model call, so an active Playwright page, saved session, operation ID, and task state are not restarted. Only the non-secret provider slot is retained for diagnostics; key values are never logged, displayed, or placed in request URLs. Invalid-request and authentication errors are not treated as quota exhaustion. Gemini rate limits are applied per project rather than per key, so independent projects are recommended when separate quota capacity is required [1].
 
 ### Automated provider alerts
 

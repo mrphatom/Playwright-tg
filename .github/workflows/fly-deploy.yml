@@ -104,15 +104,19 @@ jobs:
           echo "API key secret configuration failed after 3 attempts" >&2
           exit 1
 
-      - name: Configure Gemini fallback secret
+      - name: Configure Gemini fallback secrets
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
         run: |
           test -n "$GEMINI_API_KEY_2"
+          test -n "$GEMINI_API_KEY_3"
+          test -n "$GEMINI_API_KEY_4"
           for attempt in 1 2 3; do
             echo "Gemini fallback secret configuration attempt ${attempt}/3"
-            if flyctl secrets set GEMINI_API_KEY_2="$GEMINI_API_KEY_2" --app playwright-tg-mrphatom; then
+            if flyctl secrets set GEMINI_API_KEY_2="$GEMINI_API_KEY_2" GEMINI_API_KEY_3="$GEMINI_API_KEY_3" GEMINI_API_KEY_4="$GEMINI_API_KEY_4" --app playwright-tg-mrphatom; then
               exit 0
             fi
             if [ "$attempt" -lt 3 ]; then

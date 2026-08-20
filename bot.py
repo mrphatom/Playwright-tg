@@ -113,6 +113,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2")
+GEMINI_API_KEY_3 = os.getenv("GEMINI_API_KEY_3")
+GEMINI_API_KEY_4 = os.getenv("GEMINI_API_KEY_4")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 TEXT_FALLBACK_MODEL = os.getenv("TEXT_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 MULTIMODAL_MODEL = os.getenv("MULTIMODAL_MODEL", "gemini-3.5-flash-lite")
@@ -460,19 +462,22 @@ provider_alerts = ProviderAlertManager()
 
 
 class GeminiFailoverProvider:
-    """Use one of two Gemini keys per request without restarting caller workflows."""
+    """Use an ordered pool of up to four Gemini keys per request without restarting caller workflows."""
 
-    def __init__(self, primary_key: Optional[str], secondary_key: Optional[str], model: str, cooldown_seconds: int = 20, media_model: Optional[str] = None, text_fallback_model: Optional[str] = None):
+    def __init__(self, primary_key: Optional[str], secondary_key: Optional[str], model: str, cooldown_seconds: int = 20, media_model: Optional[str] = None, text_fallback_model: Optional[str] = None, tertiary_key: Optional[str] = None, quaternary_key: Optional[str] = None):
         self.primary_key = primary_key
         self.secondary_key = secondary_key
+        self.tertiary_key = tertiary_key
+        self.quaternary_key = quaternary_key
         self.model = model
         self.text_fallback_model = text_fallback_model or model
         self.media_model = media_model or model
         self.cooldown_seconds = max(1, cooldown_seconds)
         self._cooldowns: Dict[str, float] = {}
+        self.last_successful_key_slot: Optional[int] = None
 
     def _candidate_keys(self) -> List[str]:
-        return [key for key in (self.primary_key, self.secondary_key) if key]
+        return [key for key in (self.primary_key, self.secondary_key, self.tertiary_key, self.quaternary_key) if key]
 
     def _is_retryable(self, error: Exception) -> bool:
         code = getattr(error, "code", None)
@@ -556,6 +561,7 @@ class GeminiFailoverProvider:
                 category = self._record_provider_error(error)
                 self._schedule_failure_alert(category, self.model, False)
                 raise error
+            self.last_successful_key_slot = 1
             self._schedule_recovery_alert(self.model)
             return text
         if not keys:
@@ -590,6 +596,7 @@ class GeminiFailoverProvider:
                         self._schedule_failure_alert(category, first_failure_model, True)
                     else:
                         self._schedule_recovery_alert(model)
+                    self.last_successful_key_slot = key_index + 1
                     return text
                 except Exception as error:
                     last_error = error
@@ -638,6 +645,7 @@ class GeminiFailoverProvider:
                     self._schedule_failure_alert(category, self.media_model, True)
                 else:
                     self._schedule_recovery_alert(self.media_model)
+                self.last_successful_key_slot = index + 1
                 return result
             except Exception as error:
                 last_error = error
@@ -665,11 +673,13 @@ gemini_provider = GeminiFailoverProvider(
     GEMINI_MODEL,
     media_model=MULTIMODAL_MODEL,
     text_fallback_model=TEXT_FALLBACK_MODEL,
+    tertiary_key=GEMINI_API_KEY_3,
+    quaternary_key=GEMINI_API_KEY_4,
 )
 
 
 def gemini_configured() -> bool:
-    return bool(GEMINI_API_KEY or GEMINI_API_KEY_2 or ai_model)
+    return bool(GEMINI_API_KEY or GEMINI_API_KEY_2 or GEMINI_API_KEY_3 or GEMINI_API_KEY_4 or ai_model)
 
 
 def get_db_path() -> str:
