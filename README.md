@@ -45,8 +45,9 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
    GEMINI_API_KEY=your_gemini_api_key
    GEMINI_API_KEY_2=your_optional_fallback_gemini_api_key
    GEMINI_MODEL=gemini-3.6-flash
-   MULTIMODAL_MODEL=gemini-3.6-flash
+   MULTIMODAL_MODEL=gemini-3.5-flash-lite
    CHAT_TIMEOUT_SECONDS=20
+   MEDIA_TIMEOUT_SECONDS=45
    MEDIA_MAX_BYTES=12000000
    MAX_MEDIA_CONTEXT_CHARS=6000
    ALLOWED_TELEGRAM_USERS=123456789,987654321
@@ -127,9 +128,9 @@ Users can request a one-time dashboard link with `/dashboard`, create an invite 
 
 The current plans are **Pro at 750 Stars for 30 days with 1,000 monthly execution units** and **Max at 1,000 Stars for 30 days with 5,000 monthly execution units**. Telegram payment validation checks the selected plan, amount, currency, invoice owner, and idempotent payment record before granting the matching entitlement.
 
-Voice notes and photos are processed only after normal authorization checks. Media is size-limited, downloaded to a temporary file, sent to Gemini for interpretation, and deleted in a `finally` cleanup path. The interpreted content is bounded and marked as untrusted before it reaches either chat or agent routing. The dashboard uses bounded requests, explicit degraded/error states, and retrying polling rather than leaving panels indefinitely stuck on “Loading…”.
+Voice notes and photos are processed only after normal authorization checks. Media is size-limited, downloaded to a temporary file, sent to the dedicated `MULTIMODAL_MODEL` with a 45-second `MEDIA_TIMEOUT_SECONDS` deadline, and deleted in a `finally` cleanup path. Short Telegram voice notes use `audio/ogg`; screenshots use `image/jpeg` or `image/png`. Quota exhaustion is reported as provider capacity, not as a false “try a shorter voice note” message. The interpreted content is bounded and marked as untrusted before it reaches either chat or agent routing. The dashboard uses bounded requests, explicit degraded/error states, and retrying polling rather than leaving panels indefinitely stuck on “Loading…”.
 
-Set `GEMINI_API_KEY_2` to enable the optional provider failover. The primary key is used first; quota/rate-limit responses, timeouts, transport failures, and Gemini 5xx responses temporarily cool down that key and retry the same model request with the secondary key. The failover is per model call, so an active Playwright page, saved session, operation ID, and task state are not restarted. Invalid-request and authentication errors are not treated as quota exhaustion. Keys are server-side secrets and are never logged or placed in request URLs.
+Set `GEMINI_API_KEY_2` to enable the optional provider failover. The primary key is used first; quota/rate-limit responses, timeouts, transport failures, and Gemini 5xx responses temporarily cool down that key and retry the same model request with the secondary key. The failover is per model call, so an active Playwright page, saved session, operation ID, and task state are not restarted. Invalid-request and authentication errors are not treated as quota exhaustion. Keys are server-side secrets and are never logged or placed in request URLs. Gemini rate limits are applied per project rather than per key, so the two keys should belong to independently billed projects if they are intended to provide independent quota capacity [1].
 
 A referral is attributed through Telegram’s `/start` deep-link parameter and cannot be reassigned. It becomes qualified only after the invited user completes a verified Telegram Stars Pro purchase. The referrer and invited user then receive configurable one-time quota bonuses recorded in the referral reward ledger. Invalid codes, self-referrals, duplicate attribution, and referrals from banned accounts are rejected.
 
@@ -159,6 +160,10 @@ Content-Type: application/json
 The response contains an operation ID, page title, validated URL, and redacted extraction results. It does not contain browser cookies, saved sessions, credentials, screenshots, or internal stack traces. The API enforces the same public-mode domain allowlist, SSRF protections, platform quota, browser timeout, and concurrency controls as Telegram commands. Each key also has a configurable per-minute limit, defaulting to 30 requests and capped server-side at 120.
 
 Developers can manage keys through the authenticated dashboard at `GET /api/v1/keys`, `POST /api/v1/keys`, and `DELETE /api/v1/keys/{key_id}`. Usage is available at `GET /api/v1/developer/stats`. Dashboard mutations require the existing secure session and CSRF token; bearer keys do not grant dashboard privileges.
+
+## References
+
+[1]: https://ai.google.dev/gemini-api/docs/rate-limits "Gemini API rate limits"
 
 ## 📂 Documentation
 

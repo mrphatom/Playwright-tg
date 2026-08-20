@@ -796,3 +796,55 @@ def test_gemini_failover_does_not_retry_malformed_request(monkeypatch):
         asyncio.run(provider.generate_text("hello", {"max_output_tokens": 8}))
 
     assert calls == ["primary"]
+
+
+def test_media_failover_uses_secondary_after_primary_quota_error(tmp_path):
+    import bot
+    from urllib.error import HTTPError
+
+    media = tmp_path / "sample.ogg"
+    media.write_bytes(b"ogg-bytes")
+    provider = bot.GeminiFailoverProvider("primary", "secondary", "text-model", media_model="media-model")
+    calls = []
+
+    def fake_request(key, path, mime_type, instruction):
+        calls.append((key, mime_type))
+        if key == "primary":
+            raise HTTPError("https://gemini", 429, "quota", {}, None)
+        return "transcribed voice note"
+
+    provider._request_media = fake_request
+    result = asyncio.run(provider.generate_media(str(media), "audio/ogg", "transcribe"))
+
+    assert result == "transcribed voice note"
+    assert calls == [("primary", "audio/ogg"), ("secondary", "audio/ogg")]
+    assert provider.media_model == "media-model"
+
+
+def test_media_quota_failure_has_safe_provider_error(tmp_path):
+    import bot
+    from urllib.error import HTTPError
+
+    media = tmp_path / "sample.png"
+    media.write_bytes(b"png-bytes")
+    provider = bot.GeminiFailoverProvider("primary", "secondary", "text-model", media_model="media-model")
+
+    def fake_request(key, path, mime_type, instruction):
+        raise HTTPError("https://gemini", 429, "quota", {}, None)
+
+    provider._request_media = fake_request
+
+    with pytest.raises(bot.MediaProviderUnavailable, match="quota"):
+        asyncio.run(provider.generate_media(str(media), "image/png", "identify"))
+
+
+def test_media_timeout_is_distinct_from_input_size(tmp_path):
+    import bot
+
+    media = tmp_path / "sample.png"
+    media.write_bytes(b"png-bytes")
+    provider = bot.GeminiFailoverProvider("primary", None, "text-model", media_model="media-model")
+    provider._request_media = lambda *args: (_ for _ in ()).throw(TimeoutError("upstream timeout"))
+
+    with pytest.raises(bot.MediaProviderTimeout, match="timed out"):
+        asyncio.run(provider.generate_media(str(media), "image/png", "identify"))
