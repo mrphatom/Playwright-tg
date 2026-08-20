@@ -92,7 +92,17 @@ jobs:
           API_KEY_HASH_SECRET: ${{ secrets.API_KEY_HASH_SECRET }}
         run: |
           test -n "$API_KEY_HASH_SECRET"
-          flyctl secrets set API_KEY_HASH_SECRET="$API_KEY_HASH_SECRET" --app playwright-tg-mrphatom
+          for attempt in 1 2 3; do
+            echo "API key secret configuration attempt ${attempt}/3"
+            if flyctl secrets set API_KEY_HASH_SECRET="$API_KEY_HASH_SECRET" --app playwright-tg-mrphatom; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep 30
+            fi
+          done
+          echo "API key secret configuration failed after 3 attempts" >&2
+          exit 1
 
       - name: Configure Gemini fallback secret
         env:
@@ -100,7 +110,17 @@ jobs:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
         run: |
           test -n "$GEMINI_API_KEY_2"
-          flyctl secrets set GEMINI_API_KEY_2="$GEMINI_API_KEY_2" --app playwright-tg-mrphatom
+          for attempt in 1 2 3; do
+            echo "Gemini fallback secret configuration attempt ${attempt}/3"
+            if flyctl secrets set GEMINI_API_KEY_2="$GEMINI_API_KEY_2" --app playwright-tg-mrphatom; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep 30
+            fi
+          done
+          echo "Gemini fallback secret configuration failed after 3 attempts" >&2
+          exit 1
 
       - name: Ensure public IPv4 for dashboard hostname
         env:
