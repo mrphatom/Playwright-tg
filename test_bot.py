@@ -1331,3 +1331,70 @@ def test_chat_prompt_preserves_agent_receipt_continuity():
 
     assert "op_receipt" in prompt
     assert "do not claim this is a first-time conversation" in prompt
+
+
+def test_broad_live_web_requests_route_to_agent_without_urls(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["google.com"])
+    task_requests = [
+        "Search for Apple on google and tell me the price of the iPhone 15",
+        "Look up the latest Apple news",
+        "Find the current price and availability of the iPhone 15",
+        "Check online weather in London today",
+        "Research whether the latest iPhone is in stock",
+        "Google the latest headlines about Apple",
+    ]
+    for request in task_requests:
+        assert bot.classify_message_route(request) == "task", request
+        plan = bot.parse_deterministic_web_request(request)
+        assert plan and plan["mode"] == "check", request
+        assert plan["url"].startswith("https://www.google.com/search?q="), request
+
+
+def test_ordinary_web_education_stays_chat():
+    import bot
+
+    chat_requests = [
+        "How does Google search work?",
+        "What is a web browser?",
+        "Tell me about the iPhone 15",
+        "Explain how online pricing trends work in general",
+    ]
+    for request in chat_requests:
+        assert bot.classify_message_route(request) == "chat", request
+
+
+def test_task_route_fails_closed_instead_of_falling_back_to_chat(monkeypatch):
+    import bot
+
+    chat_id = 7781
+    class FakeStatus:
+        def __init__(self, owner):
+            self.owner = owner
+        async def edit_text(self, text, **kwargs):
+            self.owner.edits.append(text)
+    class FakeMessage:
+        text = "Search for Apple on google and tell me the current iPhone 15 price"
+        def __init__(self):
+            self.replies = []
+            self.edits = []
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+            status = FakeStatus(self)
+            return status
+    message = FakeMessage()
+    update = SimpleNamespace(
+        message=message,
+        channel_post=None,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(id=42),
+    )
+    async def unknown_plan(*args, **kwargs):
+        return None
+    monkeypatch.setattr(bot, "parse_natural_language_intent", unknown_plan)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    asyncio.run(bot._process_natural_language(update, SimpleNamespace()))
+
+    assert any("recognized this as a web or browser task" in text for text in message.edits)
+    assert not any("can't browse" in text.lower() or "cannot browse" in text.lower() for text in message.edits)
