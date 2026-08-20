@@ -1256,3 +1256,78 @@ def test_hard_maintenance_blocks_browser_work_and_redacts_failure_reason(monkeyp
     assert "supersecret" not in bot._sanitize_failure_reason(RuntimeError("api_key=supersecret"))
     assert "hidden" not in bot._sanitize_failure_reason(RuntimeError("token=hidden"))
     assert bot.maintenance_blocks_browser_work() is True
+
+
+def test_persisted_watcher_followup_resolves_agent_context_after_restart():
+    import bot
+
+    chat_id = 7711
+    bot.save_watcher_to_db(
+        "watcher_ctx",
+        chat_id,
+        "https://www.reddit.com/r/forhire/",
+        ["condition_contains:new web developer post"],
+        3600,
+    )
+    bot.active_watchers.pop(chat_id, None)
+
+    reply = bot.resolve_contextual_watcher_followup(chat_id, "What about the watch session we had on Reddit? It has been past an hour")
+
+    assert reply is not None
+    assert "watcher_ctx" in reply
+    assert "3600" in reply
+    assert "new web developer post" in reply
+    assert "restored/persisted" in reply
+
+
+def test_unrelated_chat_message_does_not_steal_watcher_context():
+    import bot
+
+    chat_id = 7712
+    bot.save_watcher_to_db("watcher_other", chat_id, "https://example.com", ["condition_contains:ready"], 300)
+    assert bot.resolve_contextual_watcher_followup(chat_id, "Tell me something interesting about Reddit") is None
+
+
+def test_natural_language_handler_uses_agent_context_before_chat_model(monkeypatch):
+    import bot
+
+    chat_id = 7713
+    bot.save_watcher_to_db("watcher_handler", chat_id, "https://www.reddit.com/r/forhire/", ["condition_contains:new post"], 3600)
+
+    class FakeMessage:
+        text = "What about the watch session we had?"
+        def __init__(self):
+            self.chat_id = chat_id
+            self.replies = []
+        async def reply_text(self, text, **kwargs):
+            self.replies.append((text, kwargs))
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        message=message,
+        channel_post=None,
+        effective_message=message,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(id=42),
+    )
+    context = SimpleNamespace()
+    async def fail_chat(*args, **kwargs):
+        raise AssertionError("chat model should not be called for an active watcher follow-up")
+    monkeypatch.setattr(bot, "generate_chat_reply", fail_chat)
+
+    asyncio.run(bot._process_natural_language(update, context))
+
+    assert message.replies
+    assert "watcher_handler" in message.replies[0][0]
+
+
+def test_chat_prompt_preserves_agent_receipt_continuity():
+    import bot
+
+    prompt = bot.build_chat_prompt(
+        "What about that task?",
+        [{"role": "assistant", "text": "[GreyAI agent task accepted; operation op_receipt is being executed. The application will post the result in this chat.]"}],
+    )
+
+    assert "op_receipt" in prompt
+    assert "do not claim this is a first-time conversation" in prompt

@@ -14,6 +14,7 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 - **👀 Continuous Watchers:** Monitor websites in the background. If a condition is met (e.g., "In Stock" or an AI evaluation), the bot alerts you and stops automatically. Watchers survive server reboots!
 - **⏰ Scheduled Briefings:** Deliver timezone-aware daily or weekday summaries from multiple URLs, with persistent schedules restored after restarts.
 - **💬 Conversational Chat:** Ask ordinary questions, brainstorm, discuss code, plan, or role-play without a command. Obvious chat messages use a single low-latency Gemini call and bypass the browser-task planner.
+- **🔁 Chat-Agent Continuity:** Follow-up messages resolve the current chat’s durable watcher state before ordinary chat. Questions such as “What about the watch session we had on Reddit?” return the watcher ID, URL, interval, condition, and running or restored state instead of resetting the conversation or claiming that GreyAI has no access to its prior task.
 - **🎙️ Multimodal Telegram Input:** Send voice notes for transcription or photos/screenshots for visual identification, OCR, and image-aware answers. Captions and interpreted media can enter either chat mode or the authorized browser-agent path.
 - **🔎 Website Discovery:** Say “go to Google News and summarize it” without manually typing a URL. Gemini may resolve a clearly named website, but the resulting HTTPS URL must still pass the public domain allowlist and SSRF-safe browser validation.
 - **🧠 AI-Powered Extraction:** Query webpages using conversational prompts instead of fragile CSS selectors.
@@ -92,7 +93,7 @@ What can you do?
 
 ### Voice notes and screenshots
 
-A voice note is transcribed and then routed as either a normal chat message or an agent task. A photo or screenshot is analyzed for visible text, labels, prices, objects, and UI intent before the same routing decision. Media is authorized before download, size-limited, processed with the dedicated multimodal model, bounded as untrusted context, and deleted from temporary storage after processing.
+A voice note is transcribed and then routed as either a normal chat message or an agent task. A photo or screenshot is analyzed for visible text, labels, prices, objects, and UI intent before the same routing decision. Media is authorized before download, size-limited, processed with the dedicated multimodal model, bounded as untrusted context, and deleted from temporary storage after processing. Agent task receipts are added to the bounded chat history so later conversational replies know that an application-owned task was accepted and can distinguish confirmed state from information requiring a fresh browser check.
 
 ### Developer commands and API integration
 
