@@ -68,15 +68,27 @@ def test_risk_calibration_is_conservative():
     assert cp.calibrate_risk_decision(0.99, 0.99) not in {"ban", "suspend", "limit"}
 
 
-def test_dashboard_login_tokens_are_single_use_and_revocable(platform_db):
+def test_dashboard_login_tokens_replay_the_same_active_session(platform_db):
+    cp.ensure_user(42)
+    token = cp.create_dashboard_login_token(42)
+    first = cp.exchange_dashboard_login_token(token)
+    assert first is not None
+    second = cp.exchange_dashboard_login_token(token)
+    assert second is not None
+    assert second["session"] == first["session"]
+    assert second["csrf"] == first["csrf"]
+    cp.revoke_dashboard_session(first["session"])
+    assert cp.exchange_dashboard_login_token(token) is None
+
+
+def test_dashboard_login_tokens_are_single_use_after_session_revocation(platform_db):
     cp.ensure_user(42)
     token = cp.create_dashboard_login_token(42)
     session = cp.exchange_dashboard_login_token(token)
     assert session is not None
-    assert cp.exchange_dashboard_login_token(token) is None
-    assert cp.get_dashboard_session(session["session"]) is not None
     cp.revoke_dashboard_session(session["session"])
     assert cp.get_dashboard_session(session["session"]) is None
+    assert cp.exchange_dashboard_login_token(token) is None
 
 
 def test_referrals_attribute_once_and_qualify_with_audited_rewards(platform_db, monkeypatch):
@@ -98,7 +110,9 @@ def test_referrals_attribute_once_and_qualify_with_audited_rewards(platform_db, 
     assert cp.list_referrals("qualified")[0]["referral_id"] == referral_id
 
 
-def test_payment_order_is_idempotent_and_grants_entitlement(platform_db):
+def test_payment_order_is_idempotent_and_grants_entitlement(platform_db, monkeypatch):
+    monkeypatch.setenv("PRO_PLAN_QUOTA", "1000")
+    monkeypatch.setenv("MAX_PLAN_QUOTA", "5000")
     cp.ensure_user(42)
     first_id, first_created = cp.record_payment_order(42, "telegram_stars", "charge_1", 100, "XTR", {"plan": "pro"})
     second_id, second_created = cp.record_payment_order(42, "telegram_stars", "charge_1", 100, "XTR", {"plan": "pro"})
@@ -109,3 +123,8 @@ def test_payment_order_is_idempotent_and_grants_entitlement(platform_db):
     assert cp.mark_payment_success(first_id, "pro") is True
     assert cp.mark_payment_success(first_id, "pro") is False
     assert cp.get_user(42)["plan"] == "pro"
+    max_id, max_created = cp.record_payment_order(42, "telegram_stars", "charge_max", 1000, "XTR", {"plan": "max"})
+    assert max_created is True
+    assert cp.mark_payment_success(max_id, "max") is True
+    assert cp.get_user(42)["plan"] == "max"
+    assert cp.get_user(42)["quota_limit"] == 5000

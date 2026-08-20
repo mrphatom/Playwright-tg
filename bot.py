@@ -78,7 +78,10 @@ MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "90"))
 CRYPTO_CHECKOUT_URL = os.getenv("CRYPTO_CHECKOUT_URL")
 DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "")
-PRO_PLAN_STARS = int(os.getenv("PRO_PLAN_STARS", "100"))
+PRO_PLAN_STARS = int(os.getenv("PRO_PLAN_STARS", "750"))
+MAX_PLAN_STARS = int(os.getenv("MAX_PLAN_STARS", "1000"))
+PRO_PLAN_QUOTA = int(os.getenv("PRO_PLAN_QUOTA", "1000"))
+MAX_PLAN_QUOTA = int(os.getenv("MAX_PLAN_QUOTA", "5000"))
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 # Domain Whitelist (Comma separated domains, e.g. "github.com,amazon.com". Leave empty to allow all)
@@ -1604,26 +1607,34 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    payload = "pro:" + secrets.token_urlsafe(16)
+    requested_plan = (context.args[0].lower() if context.args else "pro")
+    if requested_plan not in {"pro", "max"}:
+        return await update.message.reply_text("Usage: /upgrade [pro|max]")
+    plan = requested_plan
+    amount = PRO_PLAN_STARS if plan == "pro" else MAX_PLAN_STARS
+    quota = PRO_PLAN_QUOTA if plan == "pro" else MAX_PLAN_QUOTA
+    payload = plan + ":" + secrets.token_urlsafe(16)
     order_id, created = record_payment_order(
         user_id,
         "telegram_stars",
         payload,
-        PRO_PLAN_STARS,
+        amount,
         "XTR",
-        {"plan": "pro", "telegram_user_id": user_id},
+        {"plan": plan, "telegram_user_id": user_id, "quota_limit": quota},
     )
     if not created:
         order = get_payment_order_by_external_id("telegram_stars", payload)
         order_id = order["order_id"] if order else order_id
+    title = "GreyAI Pro" if plan == "pro" else "GreyAI Max"
+    description = ("Higher execution limits and priority access for 30 days." if plan == "pro" else "Maximum execution limits and priority access for 30 days.")
     await update.message.reply_invoice(
-        title="GreyAI Pro",
-        description="Higher execution limits and priority access for 30 days.",
+        title=title,
+        description=description,
         payload=payload,
         provider_token="",
         currency="XTR",
-        prices=[LabeledPrice("GreyAI Pro — 30 days", PRO_PLAN_STARS)],
-        start_parameter="greyai-pro",
+        prices=[LabeledPrice(f"{title} — 30 days", amount)],
+        start_parameter=f"greyai-{plan}",
     )
     log_audit(user_id, "/upgrade", None, f"INVOICE_{order_id}")
 
@@ -1662,19 +1673,26 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         log_audit(user_id, "successful_payment", None, "REJECTED_UNMATCHED_RECEIPT")
         return await update.message.reply_text("⚠️ Payment receipt could not be matched. Support has been notified.")
     attach_payment_charge(order["order_id"], payment.telegram_payment_charge_id)
-    if mark_payment_success(order["order_id"], "pro", (datetime.utcnow() + timedelta(days=30)).isoformat()):
-        referral_id = qualify_referral(user_id, "telegram_stars_pro")
+    try:
+        payment_plan = json.loads(order["payload_json"] or "{}").get("plan", "pro")
+    except (TypeError, json.JSONDecodeError):
+        payment_plan = "pro"
+    if payment_plan not in {"pro", "max"}:
+        log_audit(user_id, "successful_payment", None, "REJECTED_UNKNOWN_PLAN")
+        return await update.message.reply_text("⚠️ Payment plan could not be validated. Support has been notified.")
+    if mark_payment_success(order["order_id"], payment_plan, (datetime.utcnow() + timedelta(days=30)).isoformat()):
+        referral_id = qualify_referral(user_id, f"telegram_stars_{payment_plan}")
         if referral_id:
             log_audit(user_id, "referral", None, f"QUALIFIED_{referral_id}")
-        log_audit(user_id, "successful_payment", None, f"GRANTED_PRO_{order['order_id']}")
-        await update.message.reply_text("✅ Pro access activated for 30 days. Your quota has been increased.")
+        log_audit(user_id, "successful_payment", None, f"GRANTED_{payment_plan.upper()}_{order['order_id']}")
+        await update.message.reply_text(f"✅ {payment_plan.title()} access activated for 30 days. Your quota has been increased.")
     else:
         await update.message.reply_text("✅ This payment was already processed.")
 
 
 @restricted
 async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Terms: paid access grants software usage entitlements, not guaranteed results from third-party websites. Use /paysupport for payment support. Replace this text with your reviewed legal terms before public launch.")
+    await update.message.reply_text(f"Plans: Pro costs {PRO_PLAN_STARS} Telegram Stars and includes up to {PRO_PLAN_QUOTA} monthly execution units. Max costs {MAX_PLAN_STARS} Telegram Stars and includes up to {MAX_PLAN_QUOTA} monthly execution units. Each entitlement lasts 30 days. Paid access grants software usage entitlements, not guaranteed results from third-party websites. Use /paysupport for payment support.")
 
 
 @restricted
