@@ -302,9 +302,10 @@ def _normalize_schedule_days(raw_days: Any) -> Optional[List[int]]:
     if isinstance(raw_days, list):
         try:
             days = sorted({int(day) for day in raw_days})
+            return days if days and all(0 <= day <= 6 for day in days) else None
         except (TypeError, ValueError):
-            return None
-        return days if days and all(0 <= day <= 6 for day in days) else None
+            named_days = [str(day).strip() for day in raw_days if str(day).strip()]
+            return _normalize_schedule_days(",".join(named_days)) if named_days else None
 
     value = str(raw_days or "daily").strip().lower()
     if value in {"daily", "every day", "everyday"}:
@@ -352,7 +353,12 @@ def normalize_schedule_config(raw_config: Any) -> Optional[Dict[str, Any]]:
 
     urls = []
     for raw_url in raw_urls[:10]:
-        url = str(raw_url).strip()
+        url = str(raw_url).strip().rstrip(".,;!?)")
+        parsed_url = urlparse(url)
+        if parsed_url.scheme and parsed_url.scheme.lower() not in {"http", "https"}:
+            return None
+        if not url.lower().startswith(("http://", "https://")):
+            url = "https://" + url
         if not is_valid_url(url) or not is_domain_allowed(url):
             return None
         if url not in urls:
@@ -502,16 +508,29 @@ Keep replies concise enough for Telegram and use Markdown only when it improves 
 """.strip()
 
 
+def _contains_url_like_text(text: str) -> bool:
+    return bool(re.search(
+        r"(?:https?://|www\.)[^\s,]+|(?<![@\w])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s,]*)?",
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+
 def is_web_automation_request(user_text: str) -> bool:
-    """Detect explicit URL-based web requests before invoking the intent parser."""
+    """Detect web requests, including recurring schedules without URL schemes."""
     text = str(user_text or "").lower()
-    if not re.search(r"https?://\S+", text):
-        return False
     web_markers = (
         "check", "browse", "open", "visit", "scrape", "extract", "summarize",
         "monitor", "watch", "alert", "notify", "tell me when", "schedule",
     )
-    return any(marker in text for marker in web_markers)
+    if not any(marker in text for marker in web_markers) or not _contains_url_like_text(text):
+        return False
+    if re.search(r"https?://\S+", text):
+        return True
+    return bool(
+        re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{1,2}:\d{2}\b", text)
+        and re.search(r"\b(?:every\s+(?:day|weekday|weekdays|morning|evening)|daily|weekly)\b", text)
+    )
 
 
 def build_chat_prompt(user_text: str, history: List[Dict[str, str]]) -> str:
@@ -549,10 +568,75 @@ async def generate_chat_reply(chat_id: int, user_text: str) -> str:
         return "I couldn't generate a reply right now. Please try again in a moment."
 
 
+def parse_deterministic_schedule_request(user_text: str) -> Optional[Dict[str, Any]]:
+    """Recover strongly structured recurring requests when model output is incomplete."""
+    text = str(user_text or "").strip()
+    lowered = text.lower()
+    if not _contains_url_like_text(text) or not re.search(
+        r"\b(?:every\s+(?:day|weekday|weekdays|morning|evening)|daily|weekly)\b", lowered
+    ):
+        return None
+
+    time_match = re.search(
+        r"\b(?:at\s+)?(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)?\b",
+        lowered,
+    )
+    if not time_match:
+        return None
+    hour = int(time_match.group("hour"))
+    minute = int(time_match.group("minute") or "00")
+    ampm = time_match.group("ampm")
+    if ampm:
+        if hour < 1 or hour > 12 or minute > 59:
+            return None
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        if ampm == "am" and hour == 12:
+            hour = 0
+    elif hour > 23 or minute > 59:
+        return None
+
+    timezone_match = re.search(r"\b[A-Za-z]+/[A-Za-z0-9_+.-]+\b", text)
+    timezone_name = timezone_match.group(0) if timezone_match else "UTC"
+    if re.search(r"\bevery\s+weekdays?\b", lowered):
+        days = "weekdays"
+    elif re.search(r"\bevery\s+(?:morning|evening)\b", lowered) or re.search(r"\bdaily\b", lowered):
+        days = "daily"
+    else:
+        days = "weekdays" if "weekly" in lowered else "daily"
+
+    raw_urls = re.findall(
+        r"(?:https?://|www\.)[^\s,]+|(?<![@\w])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s,]*)?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    urls = []
+    for raw_url in raw_urls:
+        url = raw_url.rstrip(".,;!?)")
+        if url.lower().startswith("www."):
+            url = "https://" + url
+        if url not in urls:
+            urls.append(url)
+
+    summary_prompt = "Summarize the latest important updates from these pages."
+    if "morning briefing" in lowered or "summarize" in lowered:
+        summary_prompt = "Summarize the latest news for a morning briefing."
+    return normalize_natural_language_plan({
+        "mode": "schedule",
+        "schedule_time": f"{hour:02d}:{minute:02d}",
+        "timezone": timezone_name,
+        "days": days,
+        "urls": urls,
+        "delivery_mode": "combined" if "combined" in lowered else "separate",
+        "summary_prompt": summary_prompt,
+    })
+
+
 async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, Any]]:
     """Ask Gemini for a JSON intent, then validate it before execution."""
+    fallback = lambda: parse_deterministic_schedule_request(user_text)
     if not ai_model:
-        return None
+        return fallback()
 
     prompt = f"{NATURAL_LANGUAGE_SYSTEM_PROMPT}\n\nUser request:\n{user_text[:2000]}"
     try:
@@ -562,13 +646,14 @@ async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, An
             generation_config={"temperature": 0.0, "max_output_tokens": 2048},
         )
         raw_plan = parse_json_object(response.text or "")
-        return normalize_natural_language_plan(raw_plan)
+        plan = normalize_natural_language_plan(raw_plan)
+        return plan or fallback()
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         logger.warning("Natural-language intent parsing failed: %s", exc)
-        return None
+        return fallback()
     except Exception:
         logger.exception("Unexpected natural-language intent parsing error")
-        return None
+        return fallback()
 
 
 def sanitize_session_name(name: str) -> str:
