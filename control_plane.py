@@ -382,8 +382,13 @@ def is_admin(user_id: int) -> bool:
 
 
 def is_developer(user_id: int) -> bool:
+    """Return whether the account may use developer capabilities.
+
+    Administrators retain their stored admin role and inherit developer capabilities;
+    ordinary users must still receive the explicit developer role through approval.
+    """
     user = get_user(user_id)
-    return bool(user and user["role"] == ROLE_DEVELOPER and user["status"] == STATUS_ACTIVE)
+    return bool(user and user["role"] in {ROLE_DEVELOPER, ROLE_ADMIN} and user["status"] == STATUS_ACTIVE)
 
 
 def is_allowed_user(user_id: int) -> bool:
@@ -496,8 +501,8 @@ def record_developer_audit(actor_user_id: Optional[int], owner_user_id: Optional
 
 def create_api_key(user_id: int, name: str, scopes: Iterable[str], rate_limit_per_minute: int = DEFAULT_API_KEY_RATE_LIMIT) -> Dict[str, Any]:
     user = get_user(user_id)
-    if not user or user["role"] != ROLE_DEVELOPER or user["status"] != STATUS_ACTIVE:
-        raise PermissionError("active developer role required")
+    if not user or user["role"] not in {ROLE_DEVELOPER, ROLE_ADMIN} or user["status"] != STATUS_ACTIVE:
+        raise PermissionError("active developer capability required")
     clean_name = str(name or "").strip()[:80]
     if not clean_name:
         raise ValueError("API key name is required")
@@ -566,7 +571,7 @@ def authenticate_api_key(raw_key: str, required_scope: Optional[str] = None) -> 
         return None
     user = get_user(row["user_id"])
     scopes = _api_key_scopes(row)
-    if not user or user["role"] != ROLE_DEVELOPER or user["status"] != STATUS_ACTIVE:
+    if not user or user["role"] not in {ROLE_DEVELOPER, ROLE_ADMIN} or user["status"] != STATUS_ACTIVE:
         record_developer_audit(None, row["user_id"], row["key_id"], "api_key_authentication", "denied", {"reason": "developer_inactive"})
         return None
     if required_scope and required_scope not in scopes:

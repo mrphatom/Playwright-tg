@@ -11,6 +11,7 @@ import secrets
 import ipaddress
 import tempfile
 import urllib.request
+import urllib.error
 from pathlib import Path
 from datetime import datetime, timedelta, time as datetime_time
 from typing import List, Dict, Optional, Any
@@ -85,6 +86,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 MULTIMODAL_MODEL = os.getenv("MULTIMODAL_MODEL", GEMINI_MODEL)
 MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", "12000000"))
@@ -126,6 +128,120 @@ if GEMINI_API_KEY:
     ai_model = genai.GenerativeModel(GEMINI_MODEL)
 else:
     ai_model = None
+
+
+class GeminiFailoverProvider:
+    """Use one of two Gemini keys per request without restarting caller workflows."""
+
+    def __init__(self, primary_key: Optional[str], secondary_key: Optional[str], model: str, cooldown_seconds: int = 20):
+        self.primary_key = primary_key
+        self.secondary_key = secondary_key
+        self.model = model
+        self.cooldown_seconds = max(1, cooldown_seconds)
+        self._cooldowns: Dict[str, float] = {}
+
+    def _candidate_keys(self) -> List[str]:
+        return [key for key in (self.primary_key, self.secondary_key) if key]
+
+    def _is_retryable(self, error: Exception) -> bool:
+        code = getattr(error, "code", None)
+        if code in {400, 401, 403, 404}:
+            return False
+        if code == 429 or (isinstance(code, int) and 500 <= code <= 599):
+            return True
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError, urllib.error.URLError, ConnectionError)):
+            return True
+        text = str(error).lower()
+        return any(marker in text for marker in ("quota", "rate limit", "resource exhausted", "temporarily unavailable", "timeout", "timed out"))
+
+    def _mark_cooldown(self, key: str) -> None:
+        self._cooldowns[key] = time.monotonic() + self.cooldown_seconds
+
+    def _is_cooling_down(self, key: str) -> bool:
+        return time.monotonic() < self._cooldowns.get(key, 0.0)
+
+    def _request_text(self, key: str, prompt: str, generation_config: Dict[str, Any]) -> str:
+        if key == GEMINI_API_KEY and key == self.primary_key and ai_model is not None:
+            response = ai_model.generate_content(prompt, generation_config=generation_config)
+            return str(getattr(response, "text", "") or "").strip()
+        payload = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": generation_config,
+        }).encode("utf-8")
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        request = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
+        with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        return "\n".join(str(part.get("text", "")) for part in parts if part.get("text")).strip()
+
+    def _request_media(self, key: str, path: str, mime_type: str, instruction: str) -> str:
+        encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        payload = json.dumps({
+            "contents": [{"parts": [
+                {"text": instruction},
+                {"inline_data": {"mime_type": mime_type, "data": encoded}},
+            ]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1200},
+        }).encode("utf-8")
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        request = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
+        with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        return "\n".join(str(part.get("text", "")) for part in parts if part.get("text")).strip()
+
+    async def generate_text(self, prompt: str, generation_config: Optional[Dict[str, Any]] = None) -> str:
+        keys = self._candidate_keys()
+        if not keys and ai_model is not None:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(ai_model.generate_content, prompt, generation_config=generation_config or {}),
+                timeout=CHAT_TIMEOUT_SECONDS,
+            )
+            return str(getattr(response, "text", "") or "").strip()
+        if not keys:
+            raise RuntimeError("Gemini is not configured")
+        last_error = None
+        for index, key in enumerate(keys):
+            if index < len(keys) - 1 and self._is_cooling_down(key):
+                continue
+            try:
+                return await asyncio.wait_for(asyncio.to_thread(self._request_text, key, prompt, generation_config or {}), timeout=CHAT_TIMEOUT_SECONDS)
+            except Exception as error:
+                last_error = error
+                if not self._is_retryable(error) or index == len(keys) - 1:
+                    raise
+                self._mark_cooldown(key)
+        if last_error:
+            raise last_error
+        raise RuntimeError("No healthy Gemini key available")
+
+    async def generate_media(self, path: str, mime_type: str, instruction: str) -> str:
+        keys = self._candidate_keys()
+        if not keys:
+            raise RuntimeError("Gemini is not configured")
+        last_error = None
+        for index, key in enumerate(keys):
+            if index < len(keys) - 1 and self._is_cooling_down(key):
+                continue
+            try:
+                return await asyncio.wait_for(asyncio.to_thread(self._request_media, key, path, mime_type, instruction), timeout=CHAT_TIMEOUT_SECONDS)
+            except Exception as error:
+                last_error = error
+                if not self._is_retryable(error) or index == len(keys) - 1:
+                    raise
+                self._mark_cooldown(key)
+        if last_error:
+            raise last_error
+        raise RuntimeError("No healthy Gemini key available")
+
+
+gemini_provider = GeminiFailoverProvider(GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_MODEL)
+
+
+def gemini_configured() -> bool:
+    return bool(GEMINI_API_KEY or GEMINI_API_KEY_2 or ai_model)
+
 
 def get_db_path() -> str:
     """Returns the current database path dynamically."""
@@ -803,19 +919,14 @@ def remember_chat_turn(chat_id: int, user_text: str, reply_text: str):
 
 
 async def generate_chat_reply(chat_id: int, user_text: str) -> str:
-    if not ai_model:
-        return "Chat mode is not configured yet. Please set GEMINI_API_KEY."
+    if not gemini_configured():
+        return "Chat mode is not configured yet. Please set GEMINI_API_KEY or GEMINI_API_KEY_2."
     prompt = build_chat_prompt(user_text, chat_histories.get(chat_id, []))
     try:
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                ai_model.generate_content,
-                prompt,
-                generation_config={"temperature": 0.7, "max_output_tokens": 800},
-            ),
-            timeout=CHAT_TIMEOUT_SECONDS,
+        reply = await gemini_provider.generate_text(
+            prompt,
+            {"temperature": 0.7, "max_output_tokens": 800},
         )
-        reply = (response.text or "").strip()
         return truncate_text(reply, 4000) if reply else "I don't have a useful answer for that yet."
     except asyncio.TimeoutError:
         logger.warning("Conversational reply timed out chat_id=%s", chat_id)
@@ -827,7 +938,7 @@ async def generate_chat_reply(chat_id: int, user_text: str) -> str:
 
 async def review_recent_activity_with_ai(user_id: int, operation_id: str) -> None:
     """Run a conservative advisory review; it can create review work, never sanctions."""
-    if not ai_model:
+    if not gemini_configured():
         return
     try:
         recent = [
@@ -846,12 +957,10 @@ async def review_recent_activity_with_ai(user_id: int, operation_id: str) -> Non
             "Never recommend a ban, suspension, or access limit; a strong signal may only request human review.\n"
             + json.dumps(recent, separators=(",", ":"))
         )
-        response = await asyncio.to_thread(
-            ai_model.generate_content,
+        result = parse_json_object(await gemini_provider.generate_text(
             prompt,
-            generation_config={"temperature": 0.0, "max_output_tokens": 512},
-        )
-        result = parse_json_object(response.text or "")
+            {"temperature": 0.0, "max_output_tokens": 512},
+        ))
         score = float(result.get("score", 0.0))
         confidence = float(result.get("confidence", 0.0))
         decision = calibrate_risk_decision(score, confidence)
@@ -1056,17 +1165,15 @@ async def parse_natural_language_intent(user_text: str, default_session_name: Op
         return login_plan
 
     fallback = lambda: parse_deterministic_schedule_request(user_text) or parse_deterministic_web_request(user_text, default_session_name)
-    if not ai_model:
+    if not gemini_configured():
         return fallback()
 
     prompt = f"{NATURAL_LANGUAGE_SYSTEM_PROMPT}\n\nUser request:\n{user_text[:2000]}"
     try:
-        response = await asyncio.to_thread(
-            ai_model.generate_content,
+        raw_plan = parse_json_object(await gemini_provider.generate_text(
             prompt,
-            generation_config={"temperature": 0.0, "max_output_tokens": 2048},
-        )
-        raw_plan = parse_json_object(response.text or "")
+            {"temperature": 0.0, "max_output_tokens": 2048},
+        ))
         plan = normalize_natural_language_plan(raw_plan)
         if plan and plan.get("mode") in {"check", "watch"}:
             if not plan.get("discovered_url") and plan["url"].rstrip("/") not in user_text and plan["url"] not in user_text:
@@ -1303,11 +1410,11 @@ async def stop_browser_pool(application: Application):
     if pool.playwright: await pool.playwright.stop()
 
 async def evaluate_ai_condition(prompt: str, page_text: str) -> bool:
-    if not ai_model: return False
+    if not gemini_configured(): return False
     try:
         query = f"Evaluate this condition: '{prompt}'. Return EXACTLY 'TRUE' if met, or 'FALSE' if not.\n\nData:\n{page_text[:30000]}"
-        response = await asyncio.to_thread(ai_model.generate_content, query)
-        return "TRUE" in response.text.upper()
+        response = await gemini_provider.generate_text(query, {})
+        return "TRUE" in response.upper()
     except Exception as e:
         logger.error(f"AI Condition Error: {e}")
         return False
@@ -1362,7 +1469,7 @@ async def execute_pipeline(page, browser_context, actions: List[str], user_id: i
 
             elif action.startswith("ai_extract:"):
                 prompt = action.replace("ai_extract:", "", 1).strip()
-                if not ai_model:
+                if not gemini_configured():
                     result["extracted"].append("⚠️ Gemini is not configured for AI extraction.")
                 else:
                     page_text = await page.evaluate("document.body.innerText")
@@ -1372,8 +1479,8 @@ async def execute_pipeline(page, browser_context, actions: List[str], user_id: i
                         f"User request: {prompt}\n\n"
                         f"<webpage_data>\n{page_text[:30000]}\n</webpage_data>"
                     )
-                    response = await asyncio.to_thread(ai_model.generate_content, query)
-                    extracted = (response.text or "No information extracted.").strip()
+                    extracted = (await gemini_provider.generate_text(query, {})) or "No information extracted."
+                    extracted = extracted.strip()
                     result["extracted"].append(
                         "**AI extraction:**\n" + truncate_text(extracted, 3500)
                     )
@@ -2114,34 +2221,12 @@ async def developer_stats_command(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def generate_multimodal_interpretation(path: str, mime_type: str, instruction: str) -> str:
-    """Interpret a bounded local image/audio file without persisting or exposing it."""
-    if not GEMINI_API_KEY:
+    """Interpret a bounded local image/audio file through the failover provider."""
+    if not gemini_configured():
         return "Multimodal Gemini support is not configured."
     if os.path.getsize(path) > MEDIA_MAX_BYTES:
         raise ValueError("media exceeds the configured size limit")
-
-    def _generate() -> str:
-        encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
-        payload = json.dumps({
-            "contents": [{"parts": [
-                {"text": instruction},
-                {"inline_data": {"mime_type": mime_type, "data": encoded}},
-            ]}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1200},
-        }).encode("utf-8")
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{MULTIMODAL_MODEL}:generateContent"
-        request = urllib.request.Request(
-            endpoint,
-            data=payload,
-            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        return "\n".join(str(part.get("text", "")) for part in parts if part.get("text")).strip()
-
-    return await asyncio.wait_for(asyncio.to_thread(_generate), timeout=CHAT_TIMEOUT_SECONDS)
+    return await gemini_provider.generate_media(path, mime_type, instruction)
 
 
 async def _download_media_to_temp(context: ContextTypes.DEFAULT_TYPE, file_id: str, suffix: str) -> str:

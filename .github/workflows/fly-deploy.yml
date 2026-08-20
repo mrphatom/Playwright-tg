@@ -83,6 +83,14 @@ jobs:
           test -n "$API_KEY_HASH_SECRET"
           flyctl secrets set API_KEY_HASH_SECRET="$API_KEY_HASH_SECRET" --app playwright-tg-mrphatom
 
+      - name: Configure Gemini fallback secret
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+        run: |
+          test -n "$GEMINI_API_KEY_2"
+          flyctl secrets set GEMINI_API_KEY_2="$GEMINI_API_KEY_2" --app playwright-tg-mrphatom
+
       - name: Ensure public IPv4 for dashboard hostname
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

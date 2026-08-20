@@ -748,6 +748,7 @@ def test_multimodal_request_keeps_gemini_key_out_of_url(monkeypatch, tmp_path):
         return FakeResponse()
 
     monkeypatch.setattr(bot, "GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setattr(bot, "gemini_provider", bot.GeminiFailoverProvider("test-gemini-key", None, "test-model"))
     monkeypatch.setattr(bot.urllib.request, "urlopen", fake_urlopen)
 
     result = asyncio.run(bot.generate_multimodal_interpretation(str(media), "image/jpeg", "identify it"))
@@ -755,3 +756,43 @@ def test_multimodal_request_keeps_gemini_key_out_of_url(monkeypatch, tmp_path):
     assert result == "identified"
     assert "test-gemini-key" not in seen["url"]
     assert seen["headers"]["X-goog-api-key"] == "test-gemini-key"
+
+
+def test_gemini_failover_uses_secondary_after_retryable_primary_failure(monkeypatch):
+    import bot
+    from urllib.error import HTTPError
+
+    provider = bot.GeminiFailoverProvider("primary", "secondary", "test-model", cooldown_seconds=60)
+    calls = []
+
+    def fake_request(key, prompt, generation_config):
+        calls.append(key)
+        if key == "primary":
+            raise HTTPError("https://gemini", 429, "quota", {}, None)
+        return "secondary response"
+
+    monkeypatch.setattr(provider, "_request_text", fake_request)
+
+    result = asyncio.run(provider.generate_text("hello", {"max_output_tokens": 8}))
+
+    assert result == "secondary response"
+    assert calls == ["primary", "secondary"]
+
+
+def test_gemini_failover_does_not_retry_malformed_request(monkeypatch):
+    import bot
+    from urllib.error import HTTPError
+
+    provider = bot.GeminiFailoverProvider("primary", "secondary", "test-model")
+    calls = []
+
+    def fake_request(key, prompt, generation_config):
+        calls.append(key)
+        raise HTTPError("https://gemini", 400, "invalid request", {}, None)
+
+    monkeypatch.setattr(provider, "_request_text", fake_request)
+
+    with pytest.raises(HTTPError):
+        asyncio.run(provider.generate_text("hello", {"max_output_tokens": 8}))
+
+    assert calls == ["primary"]
