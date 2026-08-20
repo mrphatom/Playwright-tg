@@ -19,7 +19,7 @@ For example:
 What do you think about making a small app that helps me plan my week?
 ```
 
-When a message includes an explicit URL and a web action, it is routed into the browser automation pipeline. Include an explicit `http://` or `https://` URL and describe what you want to read or monitor.
+Every authorized non-command message is interpreted before it is treated as chat. A message with a clear supported command, URL, session operation, watcher operation, schedule, or login workflow is routed into the corresponding validated pipeline. Ordinary questions remain conversational. Include an explicit `http://` or `https://` URL for web actions; the interpreter will not invent a target.
 
 For a one-time check:
 
@@ -33,7 +33,7 @@ For a persistent watcher:
 Check https://example.com/store and tell me when Apple Pie is in stock
 ```
 
-The bot converts the message into a validated plan using Gemini, then reuses the same browser pipeline and persistent SQLite watcher engine as the structured commands. Existing slash commands continue to work unchanged. Plain-language requests are subject to the same authorized-user check, domain whitelist, concurrency limit, and timeout controls.
+The bot converts the message into a validated plan using Gemini and deterministic recovery rules, then reuses the same browser pipeline and persistent SQLite engines as the structured commands. Credential-bearing login messages are parsed locally and are never sent to Gemini. Existing slash commands continue to work unchanged. Plain-language requests are subject to the same authorized-user check, domain whitelist, concurrency limit, and timeout controls.
 
 For a recurring briefing, you can write:
 
@@ -42,6 +42,20 @@ Every weekday at 08:00 Europe/London, summarize https://example.com/news and htt
 ```
 
 Schedules are stored in SQLite and restored when the bot restarts. If you omit a timezone, the default is UTC; if you omit the day pattern, the default is weekdays. A schedule can deliver one combined message or one message per source.
+
+The same natural-language interpreter also covers the other command families:
+
+```text
+Show my saved sessions
+List active watchers
+Stop watcher abc123
+Cancel schedule qwe789
+Delete session x_login
+Open https://example.com/dashboard using the saved session x_login, wait 2 seconds, and extract .headline
+Create a session called x_login, then log in to https://x.com, Username = 'your_username' Password = 'your_password'
+```
+
+A named session in a login request is persisted as encrypted browser state after the login pipeline finishes. Sites requiring CAPTCHA or MFA may still require manual completion.
 
 ---
 
