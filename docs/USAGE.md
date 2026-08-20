@@ -27,6 +27,32 @@ Check https://example.com/store and tell me when Apple Pie is in stock
 
 The bot converts the message into a validated plan using Gemini, then reuses the same browser pipeline and persistent SQLite watcher engine as the structured commands. Existing slash commands continue to work unchanged. Plain-language requests are subject to the same authorized-user check, domain whitelist, concurrency limit, and timeout controls.
 
+For a recurring briefing, you can write:
+
+```text
+Every weekday at 08:00 Europe/London, summarize https://example.com/news and https://example.org/releases and send me one combined morning briefing
+```
+
+Schedules are stored in SQLite and restored when the bot restarts. If you omit a timezone, the default is UTC; if you omit the day pattern, the default is weekdays. A schedule can deliver one combined message or one message per source.
+
+---
+
+## ⏰ Scheduled Briefings
+
+The explicit schedule syntax is:
+
+```text
+/schedule <HH:MM> <IANA timezone> <daily|weekdays|weekends|days> <combined|separate> <url1,url2> | <summary prompt>
+```
+
+Example:
+
+```text
+/schedule 08:00 Europe/London weekdays combined https://example.com/news,https://example.org/releases | Summarize the important updates and mention anything that requires attention
+```
+
+Use `/schedules` to list active briefings and `/unschedule <ID>` to stop one. The scheduler runs inside the existing Fly.io bot process and uses the persistent `/data/telescout.db` volume.
+
 ---
 
 ## 🛠️ Action Glossary
@@ -113,6 +139,9 @@ Type these directly into your Telegram chat to manage your bot:
 - `/health` — Displays VPS Server CPU, RAM usage, and active browser pool status.
 - `/check <url> | <actions>` — Runs a one-off automation pipeline.
 - `/watch <url> | every:<sec> | <condition>` — Starts a persistent background watcher.
+- `/schedule <time> <timezone> <days> <delivery> <urls> | <prompt>` — Creates a recurring briefing.
+- `/schedules` — Lists active recurring briefings.
+- `/unschedule <ID>` — Stops a recurring briefing.
 - `/watchers` — Lists all currently running background watchers and their IDs.
 - `/stopwatch <ID>` — Manually stops a running watcher.
 - `/sessions` — Lists the names of your saved, encrypted browser sessions.

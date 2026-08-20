@@ -2,16 +2,17 @@
 
 ![CI/CD Pipeline](https://img.shields.io/badge/CI%2FCD-Pipeline-blue?logo=githubactions&logoColor=white)
 ![Playwright](https://img.shields.io/badge/Playwright-2EAD33?logo=playwright&logoColor=white)
-![Gemini AI](https://img.shields.io/badge/Google_Gemini-1.5_Flash-8E44AD?logo=googlegemini&logoColor=white)
+![Gemini AI](https://img.shields.io/badge/Google_Gemini-3.6_Flash-8E44AD?logo=googlegemini&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white)
 
-Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automation. It fuses Playwright's headless browsing with Google Gemini 1.5 Flash, allowing you to control browser sessions, extract structured data via AI, bypass CAPTCHAs, and run continuous background watchers—all via natural language commands in Telegram.
+Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automation. It fuses Playwright's headless browsing with Google Gemini 3.6 Flash, allowing you to control browser sessions, extract structured data via AI, schedule recurring web briefings, and run continuous background watchers—all via natural language messages or explicit commands in Telegram.
 
 ---
 
 ## ✨ Core Features
 
 - **👀 Continuous Watchers:** Monitor websites in the background. If a condition is met (e.g., "In Stock" or an AI evaluation), the bot alerts you and stops automatically. Watchers survive server reboots!
+- **⏰ Scheduled Briefings:** Deliver timezone-aware daily or weekday summaries from multiple URLs, with persistent schedules restored after restarts.
 - **🧠 AI-Powered Extraction:** Query webpages using conversational prompts instead of fragile CSS selectors.
 - **🔒 AES-Encrypted Sessions:** Login to sites once and save your session. Your cookies and tokens are encrypted at rest inside a local SQLite database.
 - **⚡ Persistent Browser Pooling:** Maintains a warm background Chromium instance. Commands launch isolated tabs in milliseconds.
@@ -33,6 +34,7 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
    ```env
    TELEGRAM_BOT_TOKEN=your_telegram_bot_token
    GEMINI_API_KEY=your_gemini_api_key
+   GEMINI_MODEL=gemini-3.6-flash
    ALLOWED_TELEGRAM_USERS=123456789,987654321
    SESSION_ENCRYPTION_KEY=your_aes_encryption_key
    ```
@@ -70,6 +72,23 @@ Tell the bot to check a page on an interval until a specific condition is met.
 ```bash
 /watch 300 [https://example.com/store](https://example.com/store) | condition_contains:In Stock
 ```
+
+---
+
+### Scheduled Morning Briefings (`/schedule`)
+Create a persistent recurring briefing from one or more pages:
+
+```bash
+/schedule 08:00 Europe/London weekdays combined https://example.com/news,https://example.org/releases | Summarize the important updates
+```
+
+You can also write the request naturally:
+
+```text
+Every weekday at 08:00 Europe/London, summarize https://example.com/news and https://example.org/releases and send me one morning briefing
+```
+
+Use `/schedules` to list active briefings and `/unschedule <ID>` to stop one.
 
 ---
 
