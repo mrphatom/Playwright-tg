@@ -4600,6 +4600,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send an ordinary message for fast chat. Send a voice note or screenshot for transcription and visual identification. Browser-like wording, named websites, schedules, watchers, and management requests enter agent mode.\n\n"
         "<b>Use GreyAI in shared chats</b>\n"
         "Private chat: enable inline mode with @BotFather using /setinline, then type <code>@GreyBrowserBot your question</code> in any private chat, group, or channel and choose the answer. Inline mode is for questions and read-only public-page explanations; full browser tasks stay in the private GreyAI chat.\n"
+        "Secretary Mode: in @BotFather open GreyAI → Bot Settings → Mode Settings and switch <b>Secretary Mode</b> on. Then open Telegram Settings → Chat Automation, select GreyAI, choose the chats it may access, and grant read/reply permissions. The original contact message remains visible and Grey replies separately.\n"
         "Groups: a group administrator first uses /enablegreyai. GreyAI then responds only to @GreyBrowserBot mentions, replies to GreyAI messages, and /ask requests. Ordinary group messages are ignored. Use /disablegreyai to turn it off.\n"
         "Channels: channel invocation is disabled by default and requires administrator configuration of CHANNEL_INVOCATION_ENABLED and ALLOWED_CHANNEL_IDS. Channel mode is read-only and requires a bot mention; forms, saved sessions, logins, and interactive actions are rejected.\n\n"
         "<b>Web agent</b>\n"
