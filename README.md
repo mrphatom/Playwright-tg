@@ -18,7 +18,8 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 - **🔒 AES-Encrypted Sessions:** Login to sites once and save your session. Your cookies and tokens are encrypted at rest inside a local SQLite database.
 - **⚡ Persistent Browser Pooling:** Maintains a warm background Chromium instance. Commands launch isolated tabs in milliseconds.
 - **🛡️ Enterprise Security:** Role-aware authorization, rate limiting, server-side quotas, SSRF-resistant URL validation, encrypted sessions, strict command timeouts, audit records, and a required domain allowlist in public mode.
-- **👥 Public User Lifecycle:** Persistent user records, user/admin roles, active/limited/suspended/banned states, administrator search, ban/unban, role management, reports, and appeals.
+- **👥 Public User Lifecycle:** Persistent user records, user/developer/admin roles, active/limited/suspended/banned states, administrator search, ban/unban, role management, reports, and appeals.
+- **🧩 Developer Mode:** Admin-granted developer access, Telegram approval requests, scoped one-time API keys, revocation, per-key rate limits, integration endpoints, and auditable developer activity.
 - **💳 Entitlements:** Telegram Stars Pro upgrade flow with pre-checkout validation, idempotent receipts, durable entitlements, and an optional external HTTPS crypto checkout adapter.
 - **🎁 Referrals:** Unique Telegram deep links, one-time attribution, self-referral and duplicate protection, verified-payment qualification, auditable quota rewards, user stats, and admin reporting.
 - **📊 Operations Dashboard:** One-time Telegram-issued dashboard links, secure cookie sessions, CSRF-protected admin actions, redacted execution logs, saved-session metadata, health data, and live polling/websocket updates.
@@ -115,13 +116,38 @@ Log in once and reuse the state safely.
 
 Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and replace the starter `ALLOWED_DOMAINS` list with the domains you are prepared to permit. Public mode rejects private and loopback IP targets and refuses to operate with an empty domain allowlist.
 
-Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, purchase Pro or Max access with `/upgrade pro` or `/upgrade max` using Telegram Stars, submit `/report` and `/appeal` tickets, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, and chat capabilities. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, and `/resolveappeal`.
+Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, purchase Pro or Max access with `/upgrade pro` or `/upgrade max` using Telegram Stars, submit `/report` and `/appeal` tickets, request developer access with `/devrequest`, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, chat, and developer-management capabilities. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, `/resolveappeal`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, and `/revokedeveloper`.
 
 The current plans are **Pro at 750 Stars for 30 days with 1,000 monthly execution units** and **Max at 1,000 Stars for 30 days with 5,000 monthly execution units**. Telegram payment validation checks the selected plan, amount, currency, invoice owner, and idempotent payment record before granting the matching entitlement.
 
 A referral is attributed through Telegram’s `/start` deep-link parameter and cannot be reassigned. It becomes qualified only after the invited user completes a verified Telegram Stars Pro purchase. The referrer and invited user then receive configurable one-time quota bonuses recorded in the referral reward ledger. Invalid codes, self-referrals, duplicate attribution, and referrals from banned accounts are rejected.
 
 Telegram Stars are the in-Telegram payment rail for digital access. Crypto checkout is intentionally provider-gated through `CRYPTO_CHECKOUT_URL`; do not accept wallet addresses, seed phrases, or client-provided payment claims as proof of payment.
+
+### Developer Mode and Telegram Integrations
+
+Developer access is granted only by an administrator. A user sends a direct request with `/devrequest <what you are building>`. The bot stores the request and notifies the configured administrator IDs. The administrator then approves with `/grantdeveloper <Telegram ID>` or denies it with `/denydeveloper <Telegram ID> [reason]`. Removing access with `/revokedeveloper <Telegram ID>` also revokes all active keys for that user.
+
+After approval, a developer can create a scoped integration key with `/newkey <name> check`, list metadata with `/devkeys`, revoke a key with `/revokekey <key_id>`, and view usage with `/developerstats`. The plaintext key is shown once only. The database stores a keyed digest, never the secret itself, and all key lifecycle and authorization events are audited. The initial release enables only the `check` scope; `watch`, `schedule`, and `sessions` remain reserved until their ownership and delivery semantics are reviewed.
+
+Other Telegram bots should send the key as a bearer credential to the versioned dashboard API:
+
+```http
+POST /api/v1/check
+Authorization: Bearer gai_live.key_...
+Content-Type: application/json
+```
+
+```json
+{
+  "url": "https://example.com",
+  "extract": "Return the current availability and price."
+}
+```
+
+The response contains an operation ID, page title, validated URL, and redacted extraction results. It does not contain browser cookies, saved sessions, credentials, screenshots, or internal stack traces. The API enforces the same public-mode domain allowlist, SSRF protections, platform quota, browser timeout, and concurrency controls as Telegram commands. Each key also has a configurable per-minute limit, defaulting to 30 requests and capped server-side at 120.
+
+Developers can manage keys through the authenticated dashboard at `GET /api/v1/keys`, `POST /api/v1/keys`, and `DELETE /api/v1/keys/{key_id}`. Usage is available at `GET /api/v1/developer/stats`. Dashboard mutations require the existing secure session and CSRF token; bearer keys do not grant dashboard privileges.
 
 ## 📂 Documentation
 

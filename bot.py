@@ -30,11 +30,14 @@ from dashboard import serve_dashboard
 from control_plane import (
     init_platform_db,
     public_mode,
+    admin_ids,
+    ROLE_DEVELOPER,
     create_dashboard_login_token,
     ensure_user,
     get_user,
     is_allowed_user,
     is_admin,
+    is_developer,
     consume_quota,
     set_user_status,
     set_user_role,
@@ -60,6 +63,14 @@ from control_plane import (
     get_referral_stats,
     qualify_referral,
     list_referrals,
+    create_developer_access_request,
+    list_developer_access_requests,
+    resolve_developer_access_request,
+    create_api_key,
+    list_api_keys,
+    revoke_api_key,
+    revoke_all_api_keys_for_user,
+    get_developer_stats,
 )
 
 # ==========================================
@@ -529,6 +540,24 @@ def _normalize_pipeline_actions(raw_actions: Any, mode: str) -> Optional[List[st
 def parse_deterministic_management_request(user_text: str) -> Optional[Dict[str, Any]]:
     """Interpret management requests without asking an LLM to invent identifiers."""
     text = str(user_text or "").strip().lower()
+    grant_match = re.search(r"\b(?:grant|give|approve)\b.*\bdeveloper\b.*\b(\d{3,20})\b", text)
+    if grant_match:
+        return {"mode": "admin_grant_developer", "target_user_id": int(grant_match.group(1))}
+    revoke_dev_match = re.search(r"\b(?:revoke|remove|disable)\b.*\bdeveloper\b.*\b(\d{3,20})\b", text)
+    if revoke_dev_match:
+        return {"mode": "admin_revoke_developer", "target_user_id": int(revoke_dev_match.group(1))}
+    if re.search(r"\b(?:request|ask)\b.*\bdeveloper\b(?:\s+access|\s+role)?\b", text) or re.search(r"\bdeveloper\s+access\s+request\b", text):
+        return {"mode": "developer_request", "message": text[:2000]}
+    if re.search(r"\b(?:show|list|view)\b.*\b(?:developer\s+)?(?:api\s+)?keys?\b", text):
+        return {"mode": "developer_keys"}
+    new_key_match = re.search(r"\b(?:create|make|generate)\b.*\b(?:api\s+)?key\b(?:\s+(?:named|called)\s+)?([a-z0-9_-]{1,80})?", text)
+    if new_key_match:
+        return {"mode": "developer_new_key", "name": new_key_match.group(1) or "telegram-integration", "scopes": ["check"]}
+    revoke_key_match = re.search(r"\b(?:revoke|disable|delete)\b.*\b(?:api\s+)?key\b\s+([a-z0-9_-]{3,100})\b", text)
+    if revoke_key_match:
+        return {"mode": "developer_revoke_key", "key_id": revoke_key_match.group(1)}
+    if re.search(r"\b(?:developer|api)\s+(?:usage|statistics|stats)\b", text):
+        return {"mode": "developer_stats"}
     if re.search(r"\b(?:health|status|system\s+health|server\s+status)\b", text):
         return {"mode": "health"}
     if re.search(r"\b(?:help|what\s+can\s+you\s+do|capabilities|commands)\b", text):
@@ -1731,11 +1760,134 @@ def _format_user_row(row) -> str:
     return f"ID={row['telegram_user_id']} username={username} name={display_name} role={row['role']} status={row['status']} plan={row['plan']} quota={row['quota_used']}/{row['quota_limit']} risk={row['risk_score']:.2f}"
 
 
+def developer_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        ensure_user(user.id, getattr(user, "username", None), getattr(user, "full_name", None))
+        if not is_developer(user.id):
+            log_audit(user.id, func.__name__, None, "DENIED_NOT_DEVELOPER")
+            if update.message:
+                await update.message.reply_text("⛔ An active developer role is required. Use /devrequest to ask an administrator for access.")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+@restricted
+async def devrequest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_admin(user.id) or is_developer(user.id):
+        return await update.message.reply_text("Your account already has elevated access.")
+    message = " ".join(context.args).strip()
+    if not message:
+        return await update.message.reply_text("Usage: /devrequest <what you want to build with the GreyAI API>\nDo not include passwords, API keys, cookies, or other secrets.")
+    request_id, created = create_developer_access_request(user.id, message)
+    if created:
+        notification = (
+            "Developer access request\n"
+            f"Request: {request_id}\n"
+            f"User ID: {user.id}\n"
+            f"Username: @{user.username if user.username else '-'}\n"
+            f"Name: {user.full_name or '-'}\n"
+            f"Request: {message[:1000]}\n\n"
+            f"Approve with /grantdeveloper {user.id} or deny with /denydeveloper {user.id}."
+        )
+        delivered = 0
+        for administrator_id in admin_ids():
+            try:
+                await context.bot.send_message(chat_id=administrator_id, text=notification)
+                delivered += 1
+            except TelegramError:
+                logger.warning("developer_request_notification_failed request_id=%s admin_id=%s", request_id, administrator_id)
+        suffix = " The administrator was notified." if delivered else " The request was saved, but no administrator notification could be delivered."
+        await update.message.reply_text(f"✅ Developer access request submitted: {request_id}.{suffix}")
+    else:
+        await update.message.reply_text(f"Your developer request is already open: {request_id}")
+
+
 @admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>"
+        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>"
     )
+
+
+@admin_only
+async def developer_requests_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = context.args[0].lower() if context.args and context.args[0].lower() in {"open", "approved", "denied", "all"} else "open"
+    rows = list_developer_access_requests(status)
+    if not rows:
+        return await update.message.reply_text(f"No {status} developer access requests.")
+    await update.message.reply_text(
+        "\n\n".join(
+            f"{row['request_id']} user={row['user_id']} [{row['status']}]\n{row['message'][:500]}"
+            for row in rows[:30]
+        )
+    )
+
+
+@admin_only
+async def deny_developer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Usage: /denydeveloper <Telegram ID> [reason]")
+    target_id = int(context.args[0])
+    reason = " ".join(context.args[1:]).strip()[:1000] or "developer access request denied"
+    requests = [row for row in list_developer_access_requests("open", 100) if row["user_id"] == target_id]
+    if not requests:
+        return await update.message.reply_text("No open developer access request found for that user.")
+    for request in requests:
+        resolve_developer_access_request(request["request_id"], update.effective_user.id, "denied", reason)
+    record_admin_action(update.effective_user.id, "deny_developer", target_id, reason)
+    try:
+        await context.bot.send_message(chat_id=target_id, text="Your developer access request was not approved. You may submit a new request later with /devrequest.")
+    except TelegramError:
+        logger.warning("developer_denial_notification_failed target_id=%s", target_id)
+    await update.message.reply_text(f"Developer access request denied for {target_id}.")
+
+
+@admin_only
+async def grant_developer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Usage: /grantdeveloper <Telegram ID>")
+    target_id = int(context.args[0])
+    target = ensure_user(target_id)
+    open_requests = [row for row in list_developer_access_requests("open", 100) if row["user_id"] == target_id]
+    if not open_requests:
+        return await update.message.reply_text("The user must submit /devrequest before an administrator can grant developer access.")
+    if target["status"] == "banned":
+        return await update.message.reply_text("Banned users must be unbanned before receiving developer access.")
+    if target["role"] == "admin":
+        return await update.message.reply_text("Administrators already have the highest platform role.")
+    set_user_role(target_id, ROLE_DEVELOPER)
+    open_requests = list_developer_access_requests("open", 100)
+    for request in open_requests:
+        if request["user_id"] == target_id:
+            resolve_developer_access_request(request["request_id"], update.effective_user.id, "approved", "developer role granted")
+    action_id = record_admin_action(update.effective_user.id, "grant_developer", target_id, "developer role granted")
+    try:
+        await context.bot.send_message(chat_id=target_id, text="✅ An administrator granted your developer role. Use /newkey <name> check to create a scoped integration key. Keep the key private; it will be shown only once.")
+    except TelegramError:
+        logger.warning("developer_grant_notification_failed target_id=%s", target_id)
+    await update.message.reply_text(f"Developer role granted to {target_id}. Admin action: {action_id}")
+
+
+@admin_only
+async def revoke_developer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Usage: /revokedeveloper <Telegram ID>")
+    target_id = int(context.args[0])
+    target = get_user(target_id)
+    if target and target["role"] == "admin":
+        return await update.message.reply_text("Administrator roles cannot be revoked through the developer command.")
+    ensure_user(target_id)
+    set_user_role(target_id, "user")
+    revoked = revoke_all_api_keys_for_user(target_id, update.effective_user.id)
+    action_id = record_admin_action(update.effective_user.id, "revoke_developer", target_id, "developer role revoked", {"revoked_keys": revoked})
+    try:
+        await context.bot.send_message(chat_id=target_id, text="Your developer role was revoked by an administrator. Any active integration keys were revoked as well.")
+    except TelegramError:
+        logger.warning("developer_revoke_notification_failed target_id=%s", target_id)
+    await update.message.reply_text(f"Developer role revoked for {target_id}; {revoked} API key(s) revoked. Admin action: {action_id}")
 
 
 @admin_only
@@ -1863,6 +2015,57 @@ async def resolve_appeal_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(f"Appeal {appeal_id} updated to {status}.")
 
 
+@developer_only
+async def devkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keys = list_api_keys(update.effective_user.id)
+    if not keys:
+        return await update.message.reply_text("You have no API keys. Create one with /newkey <name> check")
+    await update.message.reply_text(
+        "\n\n".join(
+            f"{item['key_id']} | {item['name']} | scopes={','.join(item['scopes'])} | status={item['status']} | last used={item['last_used_at'] or '-'}"
+            for item in keys
+        )
+    )
+
+
+@developer_only
+async def newkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /newkey <name> [scope,...]\nCurrently enabled scope: check")
+    name = context.args[0]
+    scopes = [scope.strip().lower() for scope in (" ".join(context.args[1:]) or "check").split(",") if scope.strip()]
+    try:
+        created = create_api_key(update.effective_user.id, name, scopes)
+    except (PermissionError, ValueError) as exc:
+        return await update.message.reply_text(f"Unable to create key: {exc}")
+    await update.message.reply_text(
+        "⚠️ This is the only time the secret will be shown. Copy it now and store it in your bot's secret manager. Never send it in chat again.\n\n"
+        f"Key ID: {created['key_id']}\n"
+        f"Scopes: {', '.join(created['scopes'])}\n"
+        f"Rate limit: {created['rate_limit_per_minute']} requests/minute\n\n"
+        f"{created['key']}"
+    )
+
+
+@developer_only
+async def revokekey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /revokekey <key_id>")
+    if not revoke_api_key(context.args[0], update.effective_user.id):
+        return await update.message.reply_text("Key not found or it belongs to another developer.")
+    await update.message.reply_text(f"API key {context.args[0]} revoked.")
+
+
+@developer_only
+async def developer_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = get_developer_stats(update.effective_user.id)
+    await update.message.reply_text(
+        f"Developer stats\nActive keys: {stats['active_keys']}\n"
+        f"API requests in last 24h: {stats['requests_last_24h']}\n"
+        f"Denied events in last 24h: {stats['denied_events_last_24h']}"
+    )
+
+
 @restricted
 @rate_limited
 async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1908,6 +2111,44 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
         update_operation(operation_id, "succeeded")
         return
 
+    if plan and plan.get("mode") == "developer_request":
+        if is_admin(user_id) or is_developer(user_id):
+            await status_msg.edit_text("Your account already has elevated access.")
+            return
+        request_id, created = create_developer_access_request(user_id, plan["message"])
+        if created:
+            for administrator_id in admin_ids():
+                try:
+                    await context.bot.send_message(chat_id=administrator_id, text=f"Developer access request {request_id} from Telegram user {user_id}. Approve with /grantdeveloper {user_id} or deny with /denydeveloper {user_id}.")
+                except TelegramError:
+                    logger.warning("natural_language_developer_request_notification_failed request_id=%s admin_id=%s", request_id, administrator_id)
+            await status_msg.edit_text(f"✅ Developer access request submitted: `{request_id}`.", parse_mode="Markdown")
+        else:
+            await status_msg.edit_text(f"Your developer request is already open: `{request_id}`.", parse_mode="Markdown")
+        return
+
+    if plan and plan.get("mode") in {"developer_keys", "developer_new_key", "developer_revoke_key", "developer_stats"}:
+        if not is_developer(user_id):
+            await status_msg.edit_text("⛔ An active developer role is required. Use /devrequest to ask an administrator for access.")
+            return
+        if plan["mode"] == "developer_keys":
+            keys = list_api_keys(user_id)
+            await status_msg.edit_text("No API keys found." if not keys else "\n".join(f"{key['key_id']} [{key['status']}] scopes={','.join(key['scopes'])}" for key in keys))
+            return
+        if plan["mode"] == "developer_stats":
+            stats = get_developer_stats(user_id)
+            await status_msg.edit_text(f"Active keys: {stats['active_keys']}\nRequests last 24h: {stats['requests_last_24h']}\nDenied events: {stats['denied_events_last_24h']}")
+            return
+        if plan["mode"] == "developer_revoke_key":
+            await status_msg.edit_text("API key revoked." if revoke_api_key(plan["key_id"], user_id) else "API key not found or not owned by you.")
+            return
+        try:
+            created = create_api_key(user_id, plan["name"], plan.get("scopes", ["check"]))
+            await status_msg.edit_text(f"⚠️ Copy this API key now; it will not be shown again:\n`{created['key']}`", parse_mode="Markdown")
+        except (PermissionError, ValueError) as exc:
+            await status_msg.edit_text(f"Unable to create API key: {exc}")
+        return
+
     if plan and plan.get("mode", "").startswith("admin_"):
         if not is_admin(user_id):
             await status_msg.edit_text("⛔ Administrator permission is required for that action.")
@@ -1940,6 +2181,32 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
             set_user_status(plan["target_user_id"], "active", "administrator unbanned user")
             record_admin_action(user_id, "unban_user", plan["target_user_id"], "administrator unbanned user")
             await status_msg.edit_text(f"User {plan['target_user_id']} unbanned.")
+            return
+        if mode == "admin_grant_developer":
+            target = ensure_user(plan["target_user_id"])
+            if target["role"] == "admin":
+                await status_msg.edit_text("Administrators already have the highest platform role.")
+                return
+            open_requests = [row for row in list_developer_access_requests("open", 100) if row["user_id"] == plan["target_user_id"]]
+            if not open_requests:
+                await status_msg.edit_text("The user must submit /devrequest before an administrator can grant developer access.")
+                return
+            set_user_role(plan["target_user_id"], ROLE_DEVELOPER)
+            for request in open_requests:
+                resolve_developer_access_request(request["request_id"], user_id, "approved", "developer role granted")
+            record_admin_action(user_id, "grant_developer", plan["target_user_id"], "developer role granted")
+            await status_msg.edit_text(f"Developer role granted to {plan['target_user_id']}.")
+            return
+        if mode == "admin_revoke_developer":
+            target = get_user(plan["target_user_id"])
+            if target and target["role"] == "admin":
+                await status_msg.edit_text("Administrator roles cannot be revoked through the developer command.")
+                return
+            ensure_user(plan["target_user_id"])
+            set_user_role(plan["target_user_id"], "user")
+            revoked = revoke_all_api_keys_for_user(plan["target_user_id"], user_id)
+            record_admin_action(user_id, "revoke_developer", plan["target_user_id"], "developer role revoked", {"revoked_keys": revoked})
+            await status_msg.edit_text(f"Developer role revoked for {plan['target_user_id']}; {revoked} key(s) revoked.")
             return
 
     if not plan:
@@ -2198,7 +2465,7 @@ def build_health_report() -> str:
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Commands: /check /watch /schedule /schedules /unschedule /watchers /stopwatch /sessions /deletesession /dashboard /upgrade /crypto /referral /report /appeal /support /paysupport /terms /health"
+        "Commands: /check /watch /schedule /schedules /unschedule /watchers /stopwatch /sessions /deletesession /dashboard /upgrade /crypto /referral /report /appeal /devrequest /support /paysupport /terms /health\nDeveloper access: after admin approval, /newkey <name> check, /devkeys, /revokekey <key_id>, /developerstats"
     )
 
 
@@ -2266,6 +2533,15 @@ def main():
     app.add_handler(CommandHandler("admin_user", admin_user_command))
     app.add_handler(CommandHandler("grantadmin", grant_admin_command))
     app.add_handler(CommandHandler("revokeadmin", revoke_admin_command))
+    app.add_handler(CommandHandler("devrequest", devrequest_command))
+    app.add_handler(CommandHandler("devrequests", developer_requests_command))
+    app.add_handler(CommandHandler("grantdeveloper", grant_developer_command))
+    app.add_handler(CommandHandler("denydeveloper", deny_developer_command))
+    app.add_handler(CommandHandler("revokedeveloper", revoke_developer_command))
+    app.add_handler(CommandHandler("devkeys", devkeys_command))
+    app.add_handler(CommandHandler("newkey", newkey_command))
+    app.add_handler(CommandHandler("revokekey", revokekey_command))
+    app.add_handler(CommandHandler("developerstats", developer_stats_command))
     app.add_handler(CommandHandler("ban", ban_user_command))
     app.add_handler(CommandHandler("unban", unban_user_command))
     app.add_handler(CommandHandler("reports", reports_command))

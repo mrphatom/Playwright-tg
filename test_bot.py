@@ -645,3 +645,30 @@ def test_domain_whitelist_filtering(monkeypatch):
     assert is_domain_allowed("https://amazon.com/dp/123") is True
     assert is_domain_allowed("https://malicious-site.com") is False
 
+
+
+def test_natural_language_developer_management_commands_are_interpreted():
+    import bot
+
+    assert bot.parse_deterministic_management_request("request developer access for my Telegram integration") == {
+        "mode": "developer_request",
+        "message": "request developer access for my telegram integration",
+    }
+    assert bot.parse_deterministic_management_request("show my API keys") == {"mode": "developer_keys"}
+    assert bot.parse_deterministic_management_request("create API key named relay_bot") == {
+        "mode": "developer_new_key",
+        "name": "relay_bot",
+        "scopes": ["check"],
+    }
+    assert bot.parse_deterministic_management_request("revoke API key key_abc123") == {
+        "mode": "developer_revoke_key",
+        "key_id": "key_abc123",
+    }
+    assert bot.parse_deterministic_management_request("grant developer role to 123456") == {
+        "mode": "admin_grant_developer",
+        "target_user_id": 123456,
+    }
+    assert bot.parse_deterministic_management_request("revoke developer role from 123456") == {
+        "mode": "admin_revoke_developer",
+        "target_user_id": 123456,
+    }

@@ -6,6 +6,8 @@ parameterized SQLite primitives that can be called from the bot and dashboard la
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -16,12 +18,18 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 ROLE_USER = "user"
+ROLE_DEVELOPER = "developer"
 ROLE_ADMIN = "admin"
 STATUS_ACTIVE = "active"
 STATUS_LIMITED = "limited"
 STATUS_SUSPENDED = "suspended"
 STATUS_BANNED = "banned"
-ALLOWED_ROLES = {ROLE_USER, ROLE_ADMIN}
+ALLOWED_ROLES = {ROLE_USER, ROLE_DEVELOPER, ROLE_ADMIN}
+API_KEY_SCOPES = {"check", "watch", "schedule", "sessions"}
+ENABLED_API_KEY_SCOPES = {"check"}
+DEFAULT_DEVELOPER_QUOTA = 250
+DEFAULT_API_KEY_RATE_LIMIT = 30
+MAX_API_KEY_RATE_LIMIT = 120
 ALLOWED_STATUSES = {STATUS_ACTIVE, STATUS_LIMITED, STATUS_SUSPENDED, STATUS_BANNED}
 
 
@@ -57,7 +65,7 @@ def init_platform_db() -> None:
                 telegram_user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 display_name TEXT,
-                role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+                role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'developer', 'admin')),
                 status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'limited', 'suspended', 'banned')),
                 plan TEXT NOT NULL DEFAULT 'free',
                 quota_limit INTEGER NOT NULL DEFAULT 20,
@@ -73,6 +81,55 @@ def init_platform_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
             CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+
+            CREATE TABLE IF NOT EXISTS developer_access_requests (
+                request_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'approved', 'denied')),
+                reviewed_by INTEGER,
+                decision TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_developer_requests_status ON developer_access_requests(status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_developer_requests_user ON developer_access_requests(user_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                key_id TEXT PRIMARY KEY,
+                key_hash TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                scopes_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+                rate_limit_per_minute INTEGER NOT NULL DEFAULT 30,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_keys_user_status ON api_keys(user_id, status, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS api_key_usage (
+                key_id TEXT NOT NULL,
+                bucket_start TEXT NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT NOT NULL,
+                PRIMARY KEY (key_id, bucket_start)
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_time ON api_key_usage(key_id, bucket_start DESC);
+
+            CREATE TABLE IF NOT EXISTS developer_audit_events (
+                event_id TEXT PRIMARY KEY,
+                actor_user_id INTEGER,
+                owner_user_id INTEGER,
+                key_id TEXT,
+                action TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_developer_audit_owner_time ON developer_audit_events(owner_user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_developer_audit_key_time ON developer_audit_events(key_id, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS operations (
                 operation_id TEXT PRIMARY KEY,
@@ -216,11 +273,56 @@ def init_platform_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_referral_rewards_recipient ON referral_rewards(recipient_user_id, created_at DESC);
             """
         )
+        _migrate_users_role_constraint(connection)
         try:
             connection.execute("ALTER TABLE dashboard_login_tokens ADD COLUMN session_secret TEXT")
         except sqlite3.OperationalError:
             pass
         connection.commit()
+
+
+def _migrate_users_role_constraint(connection: sqlite3.Connection) -> None:
+    """Expand the legacy users CHECK constraint without discarding existing rows."""
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'").fetchone()
+    schema = (row[0] if row else "").lower()
+    if "'developer'" in schema:
+        return
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN")
+        connection.execute(
+            """
+            CREATE TABLE users_migrating (
+                telegram_user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                display_name TEXT,
+                role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'developer', 'admin')),
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'limited', 'suspended', 'banned')),
+                plan TEXT NOT NULL DEFAULT 'free',
+                quota_limit INTEGER NOT NULL DEFAULT 20,
+                quota_used INTEGER NOT NULL DEFAULT 0,
+                quota_reset_at TEXT,
+                risk_score REAL NOT NULL DEFAULT 0,
+                strike_count INTEGER NOT NULL DEFAULT 0,
+                banned_until TEXT,
+                status_reason TEXT,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("INSERT INTO users_migrating SELECT telegram_user_id, username, display_name, role, status, plan, quota_limit, quota_used, quota_reset_at, risk_score, strike_count, banned_until, status_reason, created_at, last_seen_at, updated_at FROM users")
+        connection.execute("DROP TABLE users")
+        connection.execute("ALTER TABLE users_migrating RENAME TO users")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _dashboard_cipher() -> Fernet:
@@ -240,14 +342,19 @@ def _unprotect_dashboard_session(value: str) -> Optional[str]:
         return None
 
 
+def developer_quota_limit() -> int:
+    return max(1, int(os.getenv("DEVELOPER_QUOTA_LIMIT", str(DEFAULT_DEVELOPER_QUOTA))))
+
+
 def ensure_user(user_id: int, username: Optional[str] = None, display_name: Optional[str] = None) -> sqlite3.Row:
     now = utc_now()
     role = ROLE_ADMIN if user_id in admin_ids() else ROLE_USER
+    quota_limit = developer_quota_limit() if role == ROLE_DEVELOPER else 20
     with _connect() as connection:
         connection.execute(
             """
-            INSERT INTO users (telegram_user_id, username, display_name, role, created_at, last_seen_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (telegram_user_id, username, display_name, role, quota_limit, created_at, last_seen_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(telegram_user_id) DO UPDATE SET
                 username = COALESCE(excluded.username, users.username),
                 display_name = COALESCE(excluded.display_name, users.display_name),
@@ -255,7 +362,7 @@ def ensure_user(user_id: int, username: Optional[str] = None, display_name: Opti
                 last_seen_at = excluded.last_seen_at,
                 updated_at = excluded.updated_at
             """,
-            (user_id, username, display_name, role, now, now, now),
+            (user_id, username, display_name, role, quota_limit, now, now, now),
         )
         connection.commit()
         row = connection.execute("SELECT * FROM users WHERE telegram_user_id = ?", (user_id,)).fetchone()
@@ -272,6 +379,11 @@ def get_user(user_id: int) -> Optional[sqlite3.Row]:
 def is_admin(user_id: int) -> bool:
     user = get_user(user_id)
     return bool(user and user["role"] == ROLE_ADMIN and user["status"] != STATUS_BANNED)
+
+
+def is_developer(user_id: int) -> bool:
+    user = get_user(user_id)
+    return bool(user and user["role"] == ROLE_DEVELOPER and user["status"] == STATUS_ACTIVE)
 
 
 def is_allowed_user(user_id: int) -> bool:
@@ -306,10 +418,193 @@ def set_user_status(user_id: int, status: str, reason: str = "", until: Optional
 def set_user_role(user_id: int, role: str) -> bool:
     if role not in ALLOWED_ROLES:
         raise ValueError("invalid user role")
+    now = utc_now()
     with _connect() as connection:
-        cursor = connection.execute("UPDATE users SET role = ?, updated_at = ? WHERE telegram_user_id = ?", (role, utc_now(), user_id))
+        if role == ROLE_DEVELOPER:
+            cursor = connection.execute("UPDATE users SET role = ?, quota_limit = CASE WHEN quota_limit < ? THEN ? ELSE quota_limit END, updated_at = ? WHERE telegram_user_id = ?", (role, developer_quota_limit(), developer_quota_limit(), now, user_id))
+        else:
+            cursor = connection.execute("UPDATE users SET role = ?, updated_at = ? WHERE telegram_user_id = ?", (role, now, user_id))
         connection.commit()
         return cursor.rowcount == 1
+
+
+def create_developer_access_request(user_id: int, message: str) -> tuple[str, bool]:
+    ensure_user(user_id)
+    bounded_message = str(message or "").strip()[:2000]
+    if not bounded_message:
+        raise ValueError("developer request message is required")
+    now = utc_now()
+    with _connect() as connection:
+        existing = connection.execute("SELECT request_id FROM developer_access_requests WHERE user_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 1", (user_id,)).fetchone()
+        if existing:
+            return existing["request_id"], False
+        request_id = "devreq_" + secrets.token_urlsafe(8)
+        connection.execute("INSERT INTO developer_access_requests (request_id, user_id, message, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", (request_id, user_id, bounded_message, now, now))
+        connection.commit()
+    record_developer_audit(None, user_id, None, "developer_request", "created", {"request_id": request_id})
+    return request_id, True
+
+
+def list_developer_access_requests(status: str = "open", limit: int = 100) -> List[sqlite3.Row]:
+    if status not in {"open", "approved", "denied", "all"}:
+        raise ValueError("invalid developer request status")
+    with _connect() as connection:
+        if status == "all":
+            return connection.execute("SELECT request_id, user_id, message, status, reviewed_by, decision, created_at, updated_at FROM developer_access_requests ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall()
+        return connection.execute("SELECT request_id, user_id, message, status, reviewed_by, decision, created_at, updated_at FROM developer_access_requests WHERE status = ? ORDER BY created_at DESC LIMIT ?", (status, max(1, min(limit, 500)))).fetchall()
+
+
+def resolve_developer_access_request(request_id: str, admin_user_id: int, status: str, decision: str = "") -> bool:
+    if status not in {"approved", "denied"}:
+        raise ValueError("invalid developer request decision")
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE developer_access_requests SET status = ?, reviewed_by = ?, decision = ?, updated_at = ? WHERE request_id = ? AND status = 'open'", (status, admin_user_id, str(decision or "")[:1000], utc_now(), str(request_id)[:100]))
+        connection.commit()
+        changed = cursor.rowcount == 1
+    if changed:
+        record_developer_audit(admin_user_id, None, None, "developer_request_review", status, {"request_id": request_id})
+    return changed
+
+
+def _api_key_hash_secret() -> bytes:
+    configured = os.getenv("API_KEY_HASH_SECRET")
+    if public_mode() and not configured:
+        raise RuntimeError("API_KEY_HASH_SECRET is required when PUBLIC_MODE is enabled")
+    raw = configured or os.getenv("SESSION_ENCRYPTION_KEY") or os.getenv("TELEGRAM_BOT_TOKEN") or "developer-local-secret"
+    return raw.encode("utf-8")
+
+
+def _api_key_hash(raw_key: str) -> str:
+    return hmac.new(_api_key_hash_secret(), raw_key.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _api_key_scopes(row: sqlite3.Row) -> List[str]:
+    try:
+        scopes = json.loads(row["scopes_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        scopes = []
+    return sorted({str(scope) for scope in scopes if str(scope) in API_KEY_SCOPES})
+
+
+def record_developer_audit(actor_user_id: Optional[int], owner_user_id: Optional[int], key_id: Optional[str], action: str, outcome: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+    event_id = "dev_audit_" + secrets.token_urlsafe(8)
+    with _connect() as connection:
+        connection.execute("INSERT INTO developer_audit_events (event_id, actor_user_id, owner_user_id, key_id, action, outcome, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (event_id, actor_user_id, owner_user_id, key_id, str(action)[:80], str(outcome)[:80], json.dumps(metadata or {}, separators=(",", ":")), utc_now()))
+        connection.commit()
+    return event_id
+
+
+def create_api_key(user_id: int, name: str, scopes: Iterable[str], rate_limit_per_minute: int = DEFAULT_API_KEY_RATE_LIMIT) -> Dict[str, Any]:
+    user = get_user(user_id)
+    if not user or user["role"] != ROLE_DEVELOPER or user["status"] != STATUS_ACTIVE:
+        raise PermissionError("active developer role required")
+    clean_name = str(name or "").strip()[:80]
+    if not clean_name:
+        raise ValueError("API key name is required")
+    clean_scopes = sorted({str(scope).strip().lower() for scope in scopes if str(scope).strip()})
+    if not clean_scopes or not set(clean_scopes).issubset(ENABLED_API_KEY_SCOPES):
+        raise ValueError("unsupported API key scope")
+    limit = max(1, min(int(rate_limit_per_minute), MAX_API_KEY_RATE_LIMIT))
+    key_id = "key_" + secrets.token_urlsafe(8)
+    raw_key = f"gai_live.{key_id}.{secrets.token_urlsafe(32)}"
+    now = utc_now()
+    with _connect() as connection:
+        connection.execute("INSERT INTO api_keys (key_id, key_hash, user_id, name, scopes_json, rate_limit_per_minute, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (key_id, _api_key_hash(raw_key), user_id, clean_name, json.dumps(clean_scopes, separators=(",", ":")), limit, now))
+        connection.commit()
+    record_developer_audit(user_id, user_id, key_id, "api_key_created", "success", {"name": clean_name, "scopes": clean_scopes, "rate_limit_per_minute": limit})
+    return {"key_id": key_id, "key": raw_key, "name": clean_name, "scopes": clean_scopes, "rate_limit_per_minute": limit, "created_at": now}
+
+
+def list_api_keys(user_id: int) -> List[Dict[str, Any]]:
+    with _connect() as connection:
+        rows = connection.execute("SELECT key_id, user_id, name, scopes_json, status, rate_limit_per_minute, last_used_at, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC LIMIT 100", (user_id,)).fetchall()
+    return [{"key_id": row["key_id"], "user_id": row["user_id"], "name": row["name"], "scopes": _api_key_scopes(row), "status": row["status"], "rate_limit_per_minute": row["rate_limit_per_minute"], "last_used_at": row["last_used_at"], "created_at": row["created_at"], "revoked_at": row["revoked_at"]} for row in rows]
+
+
+def revoke_all_api_keys_for_user(user_id: int, actor_user_id: int) -> int:
+    now = utc_now()
+    with _connect() as connection:
+        rows = connection.execute("SELECT key_id FROM api_keys WHERE user_id = ? AND status = 'active'", (user_id,)).fetchall()
+        if rows:
+            connection.execute("UPDATE api_keys SET status = 'revoked', revoked_at = ? WHERE user_id = ? AND status = 'active'", (now, user_id))
+        connection.commit()
+    for row in rows:
+        record_developer_audit(actor_user_id, user_id, row["key_id"], "api_key_revoked", "developer_role_revoked", {})
+    return len(rows)
+
+
+def revoke_api_key(key_id: str, requester_user_id: int, is_requester_admin: bool = False) -> bool:
+    with _connect() as connection:
+        row = connection.execute("SELECT user_id, status FROM api_keys WHERE key_id = ?", (str(key_id)[:100],)).fetchone()
+        if not row or (row["user_id"] != requester_user_id and not is_requester_admin):
+            record_developer_audit(requester_user_id, row["user_id"] if row else None, key_id, "api_key_revoke", "denied", {})
+            return False
+        if row["status"] == "revoked":
+            return True
+        now = utc_now()
+        connection.execute("UPDATE api_keys SET status = 'revoked', revoked_at = ? WHERE key_id = ?", (now, key_id))
+        connection.commit()
+    record_developer_audit(requester_user_id, row["user_id"], key_id, "api_key_revoked", "success", {})
+    return True
+
+
+def authenticate_api_key(raw_key: str, required_scope: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    raw_key = str(raw_key or "")
+    parts = raw_key.split(".")
+    if len(parts) != 3 or parts[0] != "gai_live" or len(raw_key) > 300:
+        return None
+    key_id = parts[1]
+    with _connect() as connection:
+        row = connection.execute("SELECT * FROM api_keys WHERE key_id = ?", (key_id,)).fetchone()
+    try:
+        expected_hash = _api_key_hash(raw_key)
+    except RuntimeError:
+        return None
+    if not row or row["status"] != "active" or not hmac.compare_digest(row["key_hash"], expected_hash):
+        if row:
+            record_developer_audit(None, row["user_id"], row["key_id"], "api_key_authentication", "denied", {"reason": "invalid_or_revoked"})
+        return None
+    user = get_user(row["user_id"])
+    scopes = _api_key_scopes(row)
+    if not user or user["role"] != ROLE_DEVELOPER or user["status"] != STATUS_ACTIVE:
+        record_developer_audit(None, row["user_id"], row["key_id"], "api_key_authentication", "denied", {"reason": "developer_inactive"})
+        return None
+    if required_scope and required_scope not in scopes:
+        record_developer_audit(None, row["user_id"], row["key_id"], "api_scope_check", "denied", {"scope": required_scope})
+        return None
+    return {"key_id": row["key_id"], "user_id": row["user_id"], "name": row["name"], "scopes": scopes, "rate_limit_per_minute": row["rate_limit_per_minute"]}
+
+
+def check_api_key_rate_limit(key_id: str, user_id: int, limit: int) -> tuple[bool, int, int]:
+    now = utc_now()
+    bucket = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+    bounded_limit = max(1, min(int(limit), MAX_API_KEY_RATE_LIMIT))
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT request_count FROM api_key_usage WHERE key_id = ? AND bucket_start = ?", (key_id, bucket)).fetchone()
+        current = int(row["request_count"] if row else 0)
+        if current >= bounded_limit:
+            connection.commit()
+            record_developer_audit(None, user_id, key_id, "api_key_rate_limit", "denied", {"limit": bounded_limit, "used": current})
+            return False, current, bounded_limit
+        if row:
+            connection.execute("UPDATE api_key_usage SET request_count = request_count + 1, last_used_at = ? WHERE key_id = ? AND bucket_start = ?", (now, key_id, bucket))
+        else:
+            connection.execute("INSERT INTO api_key_usage (key_id, bucket_start, request_count, last_used_at) VALUES (?, ?, 1, ?)", (key_id, bucket, now))
+        connection.execute("UPDATE api_keys SET last_used_at = ? WHERE key_id = ? AND status = 'active'", (now, key_id))
+        connection.execute("DELETE FROM api_key_usage WHERE key_id = ? AND bucket_start < ?", (key_id, (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M")))
+        connection.commit()
+    record_developer_audit(None, user_id, key_id, "api_key_use", "allowed", {"limit": bounded_limit, "used": current + 1})
+    return True, current + 1, bounded_limit
+
+
+def get_developer_stats(user_id: int) -> Dict[str, Any]:
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M")
+    with _connect() as connection:
+        active = connection.execute("SELECT COUNT(*) AS count FROM api_keys WHERE user_id = ? AND status = 'active'", (user_id,)).fetchone()["count"]
+        total = connection.execute("SELECT COUNT(*) AS count FROM developer_audit_events WHERE owner_user_id = ? AND action = 'api_key_use' AND created_at >= ?", (user_id, since)).fetchone()["count"]
+        denied = connection.execute("SELECT COUNT(*) AS count FROM developer_audit_events WHERE owner_user_id = ? AND outcome = 'denied' AND created_at >= ?", (user_id, since)).fetchone()["count"]
+    return {"active_keys": int(active), "requests_last_24h": int(total), "denied_events_last_24h": int(denied)}
 
 
 def search_users(query: str, limit: int = 25) -> List[sqlite3.Row]:
