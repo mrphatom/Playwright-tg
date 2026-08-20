@@ -129,6 +129,41 @@ def test_natural_language_plan_rejects_invalid_or_disallowed_urls(monkeypatch):
     }) is None
 
 
+def test_natural_language_login_request_builds_masked_browser_actions(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = bot.parse_deterministic_login_request(
+        "I want you to login https://x.com, my username is 'mrphatom' "
+        "and password is 'secret-password'"
+    )
+
+    assert plan["mode"] == "login"
+    assert plan["url"] == "https://x.com"
+    assert any(action.startswith("type_username:") for action in plan["actions"])
+    assert any(action.startswith("click_login_") for action in plan["actions"])
+    assert any(action.startswith("wait:") for action in plan["actions"])
+    assert all("secret-password" not in bot.mask_sensitive_action(action) for action in plan["actions"])
+
+
+def test_natural_language_parser_handles_login_without_calling_gemini(monkeypatch):
+    import bot
+
+    class FailingModel:
+        def generate_content(self, *args, **kwargs):
+            raise AssertionError("login credentials must not be sent to Gemini")
+
+    monkeypatch.setattr(bot, "ai_model", FailingModel())
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = asyncio.run(bot.parse_natural_language_intent(
+        "Login to https://x.com with username 'mrphatom' and password 'secret-password'"
+    ))
+
+    assert plan["mode"] == "login"
+    assert plan["url"] == "https://x.com"
+
+
 def test_natural_language_parser_falls_back_for_unknown_schedule_output(monkeypatch):
     import bot
 
@@ -334,6 +369,12 @@ def test_plain_conversation_is_not_routed_to_web_automation():
     assert is_web_automation_request("Help me plan a productive morning") is False
     assert is_web_automation_request("Check https://example.com and summarize it") is True
     assert is_web_automation_request("Every weekday at 08:00 summarize https://example.com") is True
+
+
+def test_login_is_web_automation_request():
+    assert is_web_automation_request(
+        "Login to https://x.com with username 'mrphatom' and password 'secret-password'"
+    ) is True
 
 
 def test_scheme_less_schedule_is_web_automation_request():

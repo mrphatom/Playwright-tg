@@ -517,11 +517,12 @@ def _contains_url_like_text(text: str) -> bool:
 
 
 def is_web_automation_request(user_text: str) -> bool:
-    """Detect web requests, including recurring schedules without URL schemes."""
+    """Detect web requests, including login and recurring schedules."""
     text = str(user_text or "").lower()
     web_markers = (
         "check", "browse", "open", "visit", "scrape", "extract", "summarize",
         "monitor", "watch", "alert", "notify", "tell me when", "schedule",
+        "login", "log in", "sign in",
     )
     if not any(marker in text for marker in web_markers) or not _contains_url_like_text(text):
         return False
@@ -566,6 +567,56 @@ async def generate_chat_reply(chat_id: int, user_text: str) -> str:
     except Exception:
         logger.exception("Conversational reply failed")
         return "I couldn't generate a reply right now. Please try again in a moment."
+
+
+def parse_deterministic_login_request(user_text: str) -> Optional[Dict[str, Any]]:
+    """Build a login pipeline without sending credentials to an LLM."""
+    text = str(user_text or "").strip()
+    lowered = text.lower()
+    if not re.search(r"\b(?:login|log\s+in|sign\s+in)\b", lowered):
+        return None
+
+    url_match = re.search(r"https?://[^\s,]+", text, flags=re.IGNORECASE)
+    username_match = re.search(
+        r"\b(?:username|user\s*name|email|e-mail)\s*(?:is|:|=)?\s*[\"'‘’“”]?([^\s,\"'‘’“”]+)[\"'‘’“”]?\s+and\s+(?:the\s+)?password\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    password_match = re.search(
+        r"\b(?:password|passcode)\s*(?:is|:|=)?\s*[\"'‘’“”]?(.+?)[\"'‘’“”]?\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not url_match or not username_match or not password_match:
+        return None
+
+    url = url_match.group(0).rstrip(".,;!?)")
+    username = username_match.group(1).strip().rstrip(".,;!?)")
+    password = password_match.group(1).strip().rstrip(".,;!?)").strip("\"'‘’“”")
+    if not username or not password or not is_valid_url(url) or not is_domain_allowed(url):
+        return None
+
+    domain = urlparse(url).hostname or "site"
+    session_name = sanitize_session_name(domain.removeprefix("www."))[:80]
+    actions = ["type_username:" + username]
+    if any(host in domain.lower() for host in ("x.com", "twitter.com")):
+        actions.extend([
+            "click_login_next:",
+            "wait:1",
+            "type_password:" + password,
+            "click_login_submit:",
+            "wait:5",
+        ])
+    else:
+        actions.extend([
+            "type_password:" + password,
+            "click_login_submit:",
+            "wait:5",
+        ])
+    if re.search(r"\b(?:save|remember|keep\s+me\s+logged\s+in)\b", lowered):
+        actions.append("save_session:" + session_name)
+
+    return {"mode": "login", "url": url, "actions": actions, "session_name": session_name}
 
 
 def parse_deterministic_schedule_request(user_text: str) -> Optional[Dict[str, Any]]:
@@ -633,7 +684,11 @@ def parse_deterministic_schedule_request(user_text: str) -> Optional[Dict[str, A
 
 
 async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, Any]]:
-    """Ask Gemini for a JSON intent, then validate it before execution."""
+    """Ask Gemini for a JSON intent, keeping credentialed login requests deterministic."""
+    login_plan = parse_deterministic_login_request(user_text)
+    if re.search(r"\b(?:login|log\s+in|sign\s+in)\b", str(user_text or ""), flags=re.IGNORECASE):
+        return login_plan
+
     fallback = lambda: parse_deterministic_schedule_request(user_text)
     if not ai_model:
         return fallback()
@@ -663,9 +718,9 @@ def truncate_text(text: str, max_length: int = 4000) -> str:
     return text if len(text) <= max_length else text[:max_length - 15] + "\n...[Truncated]"
 
 def mask_sensitive_action(action: str) -> str:
-    if action.startswith("type:"):
-        parts = action.split("=", 1)
-        if len(parts) == 2: return f"{parts[0]}=***MASKED***"
+    if action.startswith(("type:", "type_username:", "type_password:")):
+        parts = action.split("=", 1) if action.startswith("type:") else action.split(":", 1)
+        if len(parts) == 2: return f"{parts[0]}" + ("=***MASKED***" if action.startswith("type:") else ":***MASKED***")
     if action.startswith(("ai_extract:", "condition_ai:", "condition_contains:")):
         return action.split(":", 1)[0] + ":***REDACTED***"
     return action
@@ -853,11 +908,28 @@ async def execute_pipeline(page, browser_context, actions: List[str], user_id: i
         logger.info(f"Pipeline Action: {safe_log}")
         
         try:
-            if action.startswith("type:"):
+            if action.startswith("type_username:"):
+                username = action.replace("type_username:", "", 1).strip()
+                await page.locator(
+                    "input[autocomplete='username'], input[name='text'], input[type='email'], input[name='username']"
+                ).first.fill(username)
+            elif action.startswith("type_password:"):
+                password = action.replace("type_password:", "", 1).strip()
+                await page.locator("input[type='password']").first.fill(password)
+            elif action.startswith("click_login_next:"):
+                await page.locator(
+                    "[data-testid='ocfEnterTextButton'], button:has-text('Next'), div[role='button']:has-text('Next')"
+                ).first.click(timeout=10000)
+            elif action.startswith("click_login_submit:"):
+                await page.locator(
+                    "[data-testid='LoginForm_Login_Button'], button[type='submit'], "
+                    "button:has-text('Log in'), button:has-text('Sign in'), div[role='button']:has-text('Log in')"
+                ).first.click(timeout=10000)
+            elif action.startswith("type:"):
                 selector, text = action.replace("type:", "", 1).split("=", 1)
                 await page.locator(selector.strip()).fill(text.strip())
-                
             elif action.startswith("click:"):
+
                 await page.locator(action.replace("click:", "", 1).strip()).click(timeout=10000)
                 
             elif action.startswith("wait:"):
@@ -1199,6 +1271,41 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
             "http:// or https:// URL and describe what to check."
         )
         log_audit(user_id, "natural_language", None, "INVALID_INTENT")
+        return
+
+    if plan["mode"] == "login":
+        await status_msg.edit_text(f"🔐 Logging in to `{plan['url']}`...", parse_mode="Markdown")
+        try:
+            async with task_semaphore:
+                result = await asyncio.wait_for(
+                    run_browser_task(plan["url"], plan["actions"], user_id, status_msg),
+                    timeout=COMMAND_TIMEOUT,
+                )
+
+            caption = truncate_text(
+                f"📄 *Login flow finished*\n🔗 *URL:* {plan['url']}",
+                1024,
+            )
+            with open(result["screenshot"], "rb") as photo:
+                await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode="Markdown")
+            if result["extracted"]:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=truncate_text("\n\n".join(result["extracted"]), 4000),
+                    parse_mode="Markdown",
+                )
+            os.remove(result["screenshot"])
+            await status_msg.delete()
+            log_audit(user_id, "natural_language_login", plan["url"], "SUCCESS")
+        except asyncio.TimeoutError:
+            log_audit(user_id, "natural_language_login", plan["url"], "TIMEOUT")
+            await status_msg.edit_text(f"❌ The login flow exceeded the {COMMAND_TIMEOUT}-second timeout.")
+        except Exception:
+            logger.exception("Natural-language login failed")
+            log_audit(user_id, "natural_language_login", plan["url"], "ERROR")
+            await status_msg.edit_text(
+                "❌ The login flow failed. If the site requires a CAPTCHA or MFA, complete that step manually."
+            )
         return
 
     if plan["mode"] == "schedule":
