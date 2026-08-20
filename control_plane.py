@@ -178,6 +178,40 @@ def init_platform_db() -> None:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_admin_actions_time ON admin_actions(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS referral_codes (
+                code TEXT PRIMARY KEY,
+                referrer_user_id INTEGER NOT NULL UNIQUE,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_referral_codes_referrer ON referral_codes(referrer_user_id);
+
+            CREATE TABLE IF NOT EXISTS referrals (
+                referral_id TEXT PRIMARY KEY,
+                code TEXT NOT NULL,
+                referrer_user_id INTEGER NOT NULL,
+                referred_user_id INTEGER NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'qualified', 'rejected')),
+                source TEXT NOT NULL DEFAULT 'telegram_start',
+                qualified_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_referrals_status ON referrals(status, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS referral_rewards (
+                reward_id TEXT PRIMARY KEY,
+                referral_id TEXT NOT NULL,
+                recipient_user_id INTEGER NOT NULL,
+                reward_type TEXT NOT NULL,
+                reward_units INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'granted',
+                created_at TEXT NOT NULL,
+                UNIQUE(referral_id, recipient_user_id, reward_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_referral_rewards_recipient ON referral_rewards(recipient_user_id, created_at DESC);
             """
         )
         connection.commit()
@@ -442,6 +476,82 @@ def revoke_dashboard_session(raw_session: str) -> None:
     with _connect() as connection:
         connection.execute("DELETE FROM dashboard_sessions WHERE session_hash = ?", (_token_hash(raw_session),))
         connection.commit()
+
+
+def get_or_create_referral_code(user_id: int) -> str:
+    ensure_user(user_id)
+    with _connect() as connection:
+        row = connection.execute("SELECT code FROM referral_codes WHERE referrer_user_id = ? AND active = 1", (user_id,)).fetchone()
+        if row:
+            return row["code"]
+        code = "ref_" + secrets.token_urlsafe(9)
+        connection.execute("INSERT INTO referral_codes (code, referrer_user_id, created_at) VALUES (?, ?, ?)", (code, user_id, utc_now()))
+        connection.commit()
+        return code
+
+
+def attribute_referral(referred_user_id: int, code: str, source: str = "telegram_start") -> str:
+    """Attribute once, reject self-referrals and never overwrite an existing attribution."""
+    code = str(code or "").strip()[:120]
+    if not code:
+        return "invalid"
+    ensure_user(referred_user_id)
+    with _connect() as connection:
+        referrer = connection.execute("SELECT referrer_user_id, active FROM referral_codes WHERE code = ?", (code,)).fetchone()
+        if not referrer or not referrer["active"]:
+            return "invalid"
+        if referrer["referrer_user_id"] == referred_user_id:
+            return "self"
+        existing = connection.execute("SELECT status FROM referrals WHERE referred_user_id = ?", (referred_user_id,)).fetchone()
+        if existing:
+            return "already_attributed"
+        referrer_user = connection.execute("SELECT status FROM users WHERE telegram_user_id = ?", (referrer["referrer_user_id"],)).fetchone()
+        if not referrer_user or referrer_user["status"] == STATUS_BANNED:
+            return "referrer_unavailable"
+        now = utc_now()
+        referral_id = "rfl_" + secrets.token_urlsafe(8)
+        connection.execute("INSERT INTO referrals (referral_id, code, referrer_user_id, referred_user_id, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (referral_id, code, referrer["referrer_user_id"], referred_user_id, source[:80], now, now))
+        connection.commit()
+        return "attributed"
+
+
+def get_referral_stats(user_id: int) -> Dict[str, Any]:
+    with _connect() as connection:
+        code = connection.execute("SELECT code FROM referral_codes WHERE referrer_user_id = ? AND active = 1", (user_id,)).fetchone()
+        counts = connection.execute("SELECT status, COUNT(*) AS count FROM referrals WHERE referrer_user_id = ? GROUP BY status", (user_id,)).fetchall()
+        rewards = connection.execute("SELECT COALESCE(SUM(reward_units), 0) AS total FROM referral_rewards WHERE recipient_user_id = ? AND status = 'granted'", (user_id,)).fetchone()
+    return {"code": code["code"] if code else None, "counts": {row["status"]: row["count"] for row in counts}, "reward_units": int(rewards["total"] if rewards else 0)}
+
+
+def qualify_referral(referred_user_id: int, source_event: str = "qualified_payment") -> Optional[str]:
+    """Qualify exactly once and grant auditable quota bonuses to both participants."""
+    bonus = max(1, int(os.getenv("REFERRER_BONUS_UNITS", "20")))
+    referred_bonus = max(1, bonus // 2)
+    with _connect() as connection:
+        referral = connection.execute("SELECT * FROM referrals WHERE referred_user_id = ? AND status = 'pending'", (referred_user_id,)).fetchone()
+        if not referral:
+            return None
+        now = utc_now()
+        cursor = connection.execute("UPDATE referrals SET status = 'qualified', qualified_at = ?, updated_at = ? WHERE referral_id = ? AND status = 'pending'", (now, now, referral["referral_id"]))
+        if cursor.rowcount != 1:
+            return None
+        rewards = [
+            ("referrer_quota_bonus", referral["referrer_user_id"], bonus),
+            ("referred_quota_bonus", referral["referred_user_id"], referred_bonus),
+        ]
+        for reward_type, recipient, units in rewards:
+            reward_id = "rrw_" + secrets.token_urlsafe(8)
+            connection.execute("INSERT OR IGNORE INTO referral_rewards (reward_id, referral_id, recipient_user_id, reward_type, reward_units, created_at) VALUES (?, ?, ?, ?, ?, ?)", (reward_id, referral["referral_id"], recipient, reward_type, units, now))
+            connection.execute("UPDATE users SET quota_limit = quota_limit + ?, updated_at = ? WHERE telegram_user_id = ?", (units, now, recipient))
+        connection.commit()
+        return referral["referral_id"]
+
+
+def list_referrals(status: Optional[str] = None, limit: int = 100) -> List[sqlite3.Row]:
+    with _connect() as connection:
+        if status:
+            return connection.execute("SELECT referral_id, code, referrer_user_id, referred_user_id, status, source, qualified_at, created_at, updated_at FROM referrals WHERE status = ? ORDER BY created_at DESC LIMIT ?", (status, max(1, min(limit, 500)))).fetchall()
+        return connection.execute("SELECT referral_id, code, referrer_user_id, referred_user_id, status, source, qualified_at, created_at, updated_at FROM referrals ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall()
 
 
 def record_admin_action(admin_user_id: int, action: str, target_user_id: Optional[int], reason: str = "", metadata: Optional[Dict[str, Any]] = None) -> str:

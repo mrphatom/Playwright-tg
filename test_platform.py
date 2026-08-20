@@ -79,6 +79,25 @@ def test_dashboard_login_tokens_are_single_use_and_revocable(platform_db):
     assert cp.get_dashboard_session(session["session"]) is None
 
 
+def test_referrals_attribute_once_and_qualify_with_audited_rewards(platform_db, monkeypatch):
+    monkeypatch.setenv("REFERRER_BONUS_UNITS", "20")
+    cp.ensure_user(100, "referrer", "Referrer")
+    cp.ensure_user(200, "referred", "Referred")
+    code = cp.get_or_create_referral_code(100)
+    assert code == cp.get_or_create_referral_code(100)
+    assert cp.attribute_referral(100, code) == "self"
+    assert cp.attribute_referral(200, code) == "attributed"
+    assert cp.attribute_referral(200, code) == "already_attributed"
+    referral_id = cp.qualify_referral(200, "test_payment")
+    assert referral_id is not None
+    assert cp.qualify_referral(200, "test_payment") is None
+    stats = cp.get_referral_stats(100)
+    assert stats["counts"]["qualified"] == 1
+    assert stats["reward_units"] == 20
+    assert cp.get_referral_stats(200)["reward_units"] == 10
+    assert cp.list_referrals("qualified")[0]["referral_id"] == referral_id
+
+
 def test_payment_order_is_idempotent_and_grants_entitlement(platform_db):
     cp.ensure_user(42)
     first_id, first_created = cp.record_payment_order(42, "telegram_stars", "charge_1", 100, "XTR", {"plan": "pro"})

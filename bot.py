@@ -55,6 +55,11 @@ from control_plane import (
     list_operations,
     create_operation,
     update_operation,
+    get_or_create_referral_code,
+    attribute_referral,
+    get_referral_stats,
+    qualify_referral,
+    list_referrals,
 )
 
 # ==========================================
@@ -1658,6 +1663,9 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         return await update.message.reply_text("⚠️ Payment receipt could not be matched. Support has been notified.")
     attach_payment_charge(order["order_id"], payment.telegram_payment_charge_id)
     if mark_payment_success(order["order_id"], "pro", (datetime.utcnow() + timedelta(days=30)).isoformat()):
+        referral_id = qualify_referral(user_id, "telegram_stars_pro")
+        if referral_id:
+            log_audit(user_id, "referral", None, f"QUALIFIED_{referral_id}")
         log_audit(user_id, "successful_payment", None, f"GRANTED_PRO_{order['order_id']}")
         await update.message.reply_text("✅ Pro access activated for 30 days. Your quota has been increased.")
     else:
@@ -2172,15 +2180,51 @@ def build_health_report() -> str:
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Commands: /check /watch /schedule /schedules /unschedule /watchers /stopwatch /sessions /deletesession /dashboard /upgrade /crypto /report /appeal /support /paysupport /terms /health"
+        "Commands: /check /watch /schedule /schedules /unschedule /watchers /stopwatch /sessions /deletesession /dashboard /upgrade /crypto /referral /report /appeal /support /paysupport /terms /health"
+    )
+
+
+@restricted
+async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    code = get_or_create_referral_code(user_id)
+    me = await context.bot.get_me()
+    stats = get_referral_stats(user_id)
+    counts = stats["counts"]
+    await update.message.reply_text(
+        f"🎁 Your referral link:\nhttps://t.me/{me.username}?start={code}\n\n"
+        f"Pending: {counts.get('pending', 0)} | Qualified: {counts.get('qualified', 0)}\n"
+        f"Reward quota units: {stats['reward_units']}\n\n"
+        "A referral qualifies after the invited user completes a verified Pro purchase."
+    )
+
+
+@admin_only
+async def referrals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = list_referrals(context.args[0] if context.args and context.args[0] in {"pending", "qualified", "rejected"} else None)
+    if not rows:
+        return await update.message.reply_text("No referrals found.")
+    await update.message.reply_text(
+        "\n\n".join(
+            f"{row['referral_id']} [{row['status']}] referrer={row['referrer_user_id']} referred={row['referred_user_id']}"
+            for row in rows[:30]
+        )
     )
 
 
 @restricted
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "GreyAI is online. Send a natural-language request, or use /help for the command list."
-    )
+    user_id = update.effective_user.id
+    attribution = None
+    if context.args:
+        attribution = attribute_referral(user_id, context.args[0], "telegram_start")
+    code = get_or_create_referral_code(user_id)
+    me = await context.bot.get_me()
+    message = "GreyAI is online. Send a natural-language request, or use /help for the command list."
+    if attribution == "attributed":
+        message += "\n\n✅ Referral recorded. Both accounts become eligible for referral rewards after your verified Pro purchase."
+    message += f"\n\nInvite friends with /referral.\nYour link: https://t.me/{me.username}?start={code}"
+    await update.message.reply_text(message)
 
 
 @restricted
@@ -2198,6 +2242,8 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("referral", referral_command))
+    app.add_handler(CommandHandler("referrals", referrals_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("admin_user", admin_user_command))
     app.add_handler(CommandHandler("grantadmin", grant_admin_command))
