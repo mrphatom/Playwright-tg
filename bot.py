@@ -73,7 +73,14 @@ pool = BrowserPool()
 active_watchers: Dict[int, Dict[str, asyncio.Task]] = {}
 active_schedules: Dict[str, asyncio.Task] = {}
 chat_histories: Dict[int, List[Dict[str, str]]] = {}
+active_session_by_chat: Dict[int, str] = {}
 user_cooldowns: Dict[int, float] = {}
+runtime_metrics = {
+    "commands_total": 0,
+    "browser_tasks_total": 0,
+    "scheduled_runs_total": 0,
+    "failures_total": 0,
+}
 
 # ==========================================
 # DATABASE ENGINE (SQLITE)
@@ -459,6 +466,10 @@ def _normalize_pipeline_actions(raw_actions: Any, mode: str) -> Optional[List[st
 def parse_deterministic_management_request(user_text: str) -> Optional[Dict[str, Any]]:
     """Interpret management requests without asking an LLM to invent identifiers."""
     text = str(user_text or "").strip().lower()
+    if re.search(r"\b(?:health|status|system\s+health|server\s+status)\b", text):
+        return {"mode": "health"}
+    if re.search(r"\b(?:help|what\s+can\s+you\s+do|capabilities|commands)\b", text):
+        return {"mode": "help"}
     if re.search(r"\b(?:show|list|view|display)\b.*\b(?:saved\s+)?sessions?\b", text):
         return {"mode": "list_sessions"}
     if re.search(r"\b(?:show|list|view|display)\b.*\b(?:active\s+)?watchers?\b", text):
@@ -469,6 +480,12 @@ def parse_deterministic_management_request(user_text: str) -> Optional[Dict[str,
     schedule_match = re.search(r"\b(?:stop|cancel|remove|delete|disable)\b.*?\b(?:schedule|briefing)\b\s*(?:id\s*)?([a-z0-9_-]{3,80})\b", text)
     if schedule_match:
         return {"mode": "unschedule", "schedule_id": schedule_match.group(1)}
+    load_session_match = re.search(
+        r"\b(?:load|use|select|switch\s+to)\b\s+(?:the\s+)?(?:saved\s+)?session\s*(?:called|named)?\s*[\"'‘’“”]?([a-z0-9_-]{1,80})[\"'‘’“”]?\b",
+        text,
+    )
+    if load_session_match:
+        return {"mode": "load_session", "session_name": sanitize_session_name(load_session_match.group(1))}
     session_match = re.search(r"\b(?:delete|remove|forget)\b.*?\bsession\b\s*(?:called|named|id)?\s*([a-z0-9_-]{1,80})\b", text)
     if session_match:
         return {"mode": "delete_session", "session_name": sanitize_session_name(session_match.group(1))}
@@ -607,8 +624,6 @@ def is_web_automation_request(user_text: str) -> bool:
         "monitor", "watch", "alert", "notify", "tell me when", "schedule",
         "login", "log in", "sign in",
     )
-    if parse_deterministic_management_request(user_text):
-        return True
     if not any(marker in text for marker in web_markers) or not _contains_url_like_text(text):
         return False
     if re.search(r"https?://\S+", text):
@@ -775,7 +790,7 @@ def parse_deterministic_schedule_request(user_text: str) -> Optional[Dict[str, A
     })
 
 
-def parse_deterministic_web_request(user_text: str) -> Optional[Dict[str, Any]]:
+def parse_deterministic_web_request(user_text: str, default_session_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Recover common check/watch requests when structured interpretation is unavailable."""
     text = str(user_text or "").strip()
     lowered = text.lower()
@@ -830,11 +845,13 @@ def parse_deterministic_web_request(user_text: str) -> Optional[Dict[str, Any]]:
     )
     if session_match:
         actions.append("load_session:" + sanitize_session_name(session_match.group(1)))
+    elif default_session_name:
+        actions.append("load_session:" + sanitize_session_name(default_session_name))
     actions.append("ai_extract:" + request[:500])
     return {"mode": "check", "url": url, "actions": actions, "request": request}
 
 
-async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, Any]]:
+async def parse_natural_language_intent(user_text: str, default_session_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Interpret every authorized message before falling back to conversational chat."""
     management_plan = parse_deterministic_management_request(user_text)
     if management_plan:
@@ -844,7 +861,7 @@ async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, An
     if re.search(r"\b(?:login|log\s+in|sign\s+in)\b", str(user_text or ""), flags=re.IGNORECASE):
         return login_plan
 
-    fallback = lambda: parse_deterministic_schedule_request(user_text) or parse_deterministic_web_request(user_text)
+    fallback = lambda: parse_deterministic_schedule_request(user_text) or parse_deterministic_web_request(user_text, default_session_name)
     if not ai_model:
         return fallback()
 
@@ -860,6 +877,8 @@ async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, An
         if plan and plan.get("mode") in {"check", "watch"}:
             if plan["url"].rstrip("/") not in user_text and plan["url"] not in user_text:
                 return fallback()
+            if default_session_name and not any(action.startswith("load_session:") for action in plan["actions"]):
+                plan["actions"].insert(0, "load_session:" + sanitize_session_name(default_session_name))
         return plan or fallback()
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         logger.warning("Natural-language intent parsing failed: %s", exc)
@@ -943,26 +962,57 @@ async def restore_watchers_from_db(context_bot):
     except Exception as e:
         logger.error(f"Failed to restore watchers from DB: {e}")
 
+async def run_browser_task_with_retry(url: str, actions: List[str], user_id: int, operation_id: str, status_msg=None, attempts: int = 2) -> Dict[str, Any]:
+    """Retry transient browser work with a bounded attempt count and correlation ID."""
+    last_error = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            runtime_metrics["browser_tasks_total"] += 1
+            logger.info("browser_task_start operation_id=%s attempt=%s", operation_id, attempt)
+            return await asyncio.wait_for(
+                run_browser_task(url, actions, user_id, status_msg),
+                timeout=COMMAND_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "browser_task_failure operation_id=%s attempt=%s error_type=%s",
+                operation_id,
+                attempt,
+                type(exc).__name__,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(min(2 ** (attempt - 1), 4))
+    raise last_error or RuntimeError("browser task failed")
+
+
 async def run_scheduled_briefing(schedule: Dict[str, Any], context_bot):
     config = schedule["config"]
+    operation_id = uuid.uuid4().hex[:12]
+    runtime_metrics["scheduled_runs_total"] += 1
     sections = []
     for url in config["urls"]:
         screenshot_path = None
         try:
             async with task_semaphore:
-                result = await asyncio.wait_for(
-                    run_browser_task(
-                        url,
-                        [f"ai_extract:{config['summary_prompt']}"],
-                        schedule["user_id"],
-                    ),
-                    timeout=COMMAND_TIMEOUT,
+                result = await run_browser_task_with_retry(
+                    url,
+                    [f"ai_extract:{config['summary_prompt']}"],
+                    schedule["user_id"],
+                    operation_id,
                 )
             screenshot_path = result.get("screenshot")
             extracted = "\n\n".join(result.get("extracted", [])) or "No summary was extracted."
             sections.append(f"*{result.get('title', 'Web page')}*\n🔗 {url}\n{extracted}")
         except Exception as exc:
-            logger.warning("Scheduled briefing failed for %s: %s", url, exc)
+            runtime_metrics["failures_total"] += 1
+            logger.warning(
+                "scheduled_briefing_failure operation_id=%s error_type=%s",
+                operation_id,
+                type(exc).__name__,
+            )
             sections.append(f"⚠️ Could not summarize {url}.")
         finally:
             if screenshot_path and os.path.exists(screenshot_path):
@@ -1409,18 +1459,53 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
     if not update.message or not update.message.text:
         return
 
-    status_msg = await update.message.reply_text("🧠 Thinking...")
+    runtime_metrics["commands_total"] += 1
+    operation_id = uuid.uuid4().hex[:12]
+    status_msg = await update.message.reply_text(f"🧠 Thinking...\nRef: `{operation_id}`", parse_mode="Markdown")
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     request_text = update.message.text.strip()
 
-    plan = await parse_natural_language_intent(request_text)
+    plan = await parse_natural_language_intent(request_text, active_session_by_chat.get(chat_id))
 
     if not plan:
         reply = await generate_chat_reply(chat_id, request_text)
         remember_chat_turn(chat_id, request_text, reply)
         await status_msg.edit_text(reply)
         log_audit(user_id, "chat", None, "SUCCESS")
+        return
+
+    if plan["mode"] == "health":
+        await status_msg.edit_text(build_health_report(), parse_mode="Markdown")
+        log_audit(user_id, "natural_language_health", None, "SUCCESS")
+        return
+
+    if plan["mode"] == "help":
+        await status_msg.edit_text(
+            "*I can help with:*\n"
+            "• Web checks, screenshots, extraction, clicks, typing, and waits\n"
+            "• Persistent watchers and scheduled briefings\n"
+            "• Login flows and encrypted browser sessions\n"
+            "• Session loading, watcher/schedule management, and system health\n"
+            "• General conversation and coding help\n\n"
+            "Send a natural-language request with a URL for web work, or use the existing slash commands.",
+            parse_mode="Markdown",
+        )
+        log_audit(user_id, "natural_language_help", None, "SUCCESS")
+        return
+
+    if plan["mode"] == "load_session":
+        session_name = plan["session_name"]
+        if session_name not in list_user_sessions(user_id):
+            await status_msg.edit_text(f"⚠️ Session `{session_name}` was not found.", parse_mode="Markdown")
+            log_audit(user_id, "natural_language_load_session", None, "NOT_FOUND")
+            return
+        active_session_by_chat[chat_id] = session_name
+        await status_msg.edit_text(
+            f"✅ Session `{session_name}` is selected for the next browser command.",
+            parse_mode="Markdown",
+        )
+        log_audit(user_id, "natural_language_load_session", None, "SELECTED")
         return
 
     if plan["mode"] == "list_sessions":
@@ -1463,6 +1548,8 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
     if plan["mode"] == "delete_session":
         session_name = plan["session_name"]
         if delete_user_session(user_id, session_name):
+            if active_session_by_chat.get(chat_id) == session_name:
+                active_session_by_chat.pop(chat_id, None)
             await status_msg.edit_text(f"🗑️ Encrypted session `{session_name}` deleted.", parse_mode="Markdown")
             log_audit(user_id, "natural_language_delete_session", None, f"DELETED_SESSION_{session_name}")
         else:
@@ -1473,9 +1560,8 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
         await status_msg.edit_text(f"🔐 Logging in to `{plan['url']}`...", parse_mode="Markdown")
         try:
             async with task_semaphore:
-                result = await asyncio.wait_for(
-                    run_browser_task(plan["url"], plan["actions"], user_id, status_msg),
-                    timeout=COMMAND_TIMEOUT,
+                result = await run_browser_task_with_retry(
+                    plan["url"], plan["actions"], user_id, operation_id, status_msg=status_msg
                 )
 
             caption = truncate_text(
@@ -1497,7 +1583,8 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
             log_audit(user_id, "natural_language_login", plan["url"], "TIMEOUT")
             await status_msg.edit_text(f"❌ The login flow exceeded the {COMMAND_TIMEOUT}-second timeout.")
         except Exception:
-            logger.exception("Natural-language login failed")
+            runtime_metrics["failures_total"] += 1
+            logger.exception("Natural-language login failed operation_id=%s", operation_id)
             log_audit(user_id, "natural_language_login", plan["url"], "ERROR")
             await status_msg.edit_text(
                 "❌ The login flow failed. If the site requires a CAPTCHA or MFA, complete that step manually."
@@ -1519,9 +1606,8 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
         await status_msg.edit_text(f"🌐 Checking `{plan['url']}`...", parse_mode="Markdown")
         try:
             async with task_semaphore:
-                result = await asyncio.wait_for(
-                    run_browser_task(plan["url"], plan["actions"], user_id, status_msg),
-                    timeout=COMMAND_TIMEOUT,
+                result = await run_browser_task_with_retry(
+                    plan["url"], plan["actions"], user_id, operation_id, status_msg=status_msg
                 )
 
             caption = truncate_text(
@@ -1545,7 +1631,8 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
                 f"❌ The request exceeded the {COMMAND_TIMEOUT}-second timeout."
             )
         except Exception:
-            logger.exception("Natural-language check failed")
+            runtime_metrics["failures_total"] += 1
+            logger.exception("Natural-language check failed operation_id=%s", operation_id)
             log_audit(user_id, "natural_language", plan["url"], "ERROR")
             await status_msg.edit_text("❌ The web check failed. No unsafe action was executed.")
         return
@@ -1618,6 +1705,33 @@ async def delete_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ Session not found.")
 
+def build_health_report() -> str:
+    memory = psutil.virtual_memory()
+    browser_state = "ready" if pool.browser else "offline"
+    return (
+        "*GreyAI health*\n"
+        f"Browser: `{browser_state}`\n"
+        f"CPU: `{psutil.cpu_percent(interval=None):.1f}%`\n"
+        f"Memory: `{memory.percent:.1f}%`\n"
+        f"Active watchers: `{sum(len(items) for items in active_watchers.values())}`\n"
+        f"Active schedules: `{len(active_schedules)}`\n"
+        f"Commands: `{runtime_metrics['commands_total']}` | Browser attempts: `{runtime_metrics['browser_tasks_total']}`\n"
+        f"Failures: `{runtime_metrics['failures_total']}`"
+    )
+
+
+@restricted
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "GreyAI is online. Send a natural-language request, or use /help for the command list."
+    )
+
+
+@restricted
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_health_report(), parse_mode="Markdown")
+
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is missing!")
@@ -1625,6 +1739,8 @@ def main():
         
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(start_browser_pool).post_stop(stop_browser_pool).build()
     
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("check", check_url))
     app.add_handler(CommandHandler("watch", watch_url))
     app.add_handler(CommandHandler("schedule", schedule_briefing))

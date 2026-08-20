@@ -28,6 +28,10 @@ All existing slash commands remain registered and retain their current behavior.
 
 Use pytest unit tests for each normalized intent, action allowlist, exact screenshot wording, combined login/session wording, scheme-less URLs, malformed model output, credential non-disclosure, unknown action rejection, and plain conversational fallback. Run `pytest test_bot.py -q`, `python3 -m py_compile bot.py`, and `git diff --check` before release.
 
+## Enterprise operating foundations
+
+Session-only commands such as `Load session x_login` select an existing encrypted session for the next browser command and fail closed when the session does not exist. Natural-language operations receive a short correlation reference in progress messages. Browser work uses a bounded retry policy for transient failures, runtime counters for commands, browser attempts, scheduled runs, and failures, and an operator health report exposed through `/health` and natural language. Credentials remain outside Gemini prompts and sensitive action values stay masked in logs.
+
 ## Success criteria
 
-The exact screenshot request produces a login plan rather than the safe-web-request error. Natural language can express every documented command family, including management operations and action pipelines. Plain chat remains conversational. Invalid or ambiguous commands fail with a useful clarification. The complete test suite passes and the deployed Fly.io machine remains healthy.
+The exact screenshot request produces a login plan rather than the safe-web-request error. Session-only loading produces a confirmed selected session and applies it to a subsequent URL command. Natural language can express every documented command family, including management operations and action pipelines. Plain chat remains conversational. Invalid or ambiguous commands fail with a useful clarification. Transient browser failures are retried a bounded number of times. The complete test suite passes and the deployed Fly.io machine remains healthy.
