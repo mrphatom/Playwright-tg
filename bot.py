@@ -193,6 +193,12 @@ class GeminiFailoverProvider:
 
     async def generate_text(self, prompt: str, generation_config: Optional[Dict[str, Any]] = None) -> str:
         keys = self._candidate_keys()
+        if not keys and ai_model is not None:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(ai_model.generate_content, prompt, generation_config=generation_config or {}),
+                timeout=CHAT_TIMEOUT_SECONDS,
+            )
+            return str(getattr(response, "text", "") or "").strip()
         if not keys:
             raise RuntimeError("Gemini is not configured")
         last_error = None
@@ -231,6 +237,10 @@ class GeminiFailoverProvider:
 
 
 gemini_provider = GeminiFailoverProvider(GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_MODEL)
+
+
+def gemini_configured() -> bool:
+    return bool(GEMINI_API_KEY or GEMINI_API_KEY_2 or ai_model)
 
 
 def get_db_path() -> str:
@@ -909,7 +919,7 @@ def remember_chat_turn(chat_id: int, user_text: str, reply_text: str):
 
 
 async def generate_chat_reply(chat_id: int, user_text: str) -> str:
-    if not (GEMINI_API_KEY or GEMINI_API_KEY_2):
+    if not gemini_configured():
         return "Chat mode is not configured yet. Please set GEMINI_API_KEY or GEMINI_API_KEY_2."
     prompt = build_chat_prompt(user_text, chat_histories.get(chat_id, []))
     try:
@@ -928,7 +938,7 @@ async def generate_chat_reply(chat_id: int, user_text: str) -> str:
 
 async def review_recent_activity_with_ai(user_id: int, operation_id: str) -> None:
     """Run a conservative advisory review; it can create review work, never sanctions."""
-    if not (GEMINI_API_KEY or GEMINI_API_KEY_2):
+    if not gemini_configured():
         return
     try:
         recent = [
@@ -1155,7 +1165,7 @@ async def parse_natural_language_intent(user_text: str, default_session_name: Op
         return login_plan
 
     fallback = lambda: parse_deterministic_schedule_request(user_text) or parse_deterministic_web_request(user_text, default_session_name)
-    if not (GEMINI_API_KEY or GEMINI_API_KEY_2):
+    if not gemini_configured():
         return fallback()
 
     prompt = f"{NATURAL_LANGUAGE_SYSTEM_PROMPT}\n\nUser request:\n{user_text[:2000]}"
@@ -1400,7 +1410,7 @@ async def stop_browser_pool(application: Application):
     if pool.playwright: await pool.playwright.stop()
 
 async def evaluate_ai_condition(prompt: str, page_text: str) -> bool:
-    if not (GEMINI_API_KEY or GEMINI_API_KEY_2): return False
+    if not gemini_configured(): return False
     try:
         query = f"Evaluate this condition: '{prompt}'. Return EXACTLY 'TRUE' if met, or 'FALSE' if not.\n\nData:\n{page_text[:30000]}"
         response = await gemini_provider.generate_text(query, {})
@@ -1459,7 +1469,7 @@ async def execute_pipeline(page, browser_context, actions: List[str], user_id: i
 
             elif action.startswith("ai_extract:"):
                 prompt = action.replace("ai_extract:", "", 1).strip()
-                if not (GEMINI_API_KEY or GEMINI_API_KEY_2):
+                if not gemini_configured():
                     result["extracted"].append("⚠️ Gemini is not configured for AI extraction.")
                 else:
                     page_text = await page.evaluate("document.body.innerText")
@@ -2212,7 +2222,7 @@ async def developer_stats_command(update: Update, context: ContextTypes.DEFAULT_
 
 async def generate_multimodal_interpretation(path: str, mime_type: str, instruction: str) -> str:
     """Interpret a bounded local image/audio file through the failover provider."""
-    if not (GEMINI_API_KEY or GEMINI_API_KEY_2):
+    if not gemini_configured():
         return "Multimodal Gemini support is not configured."
     if os.path.getsize(path) > MEDIA_MAX_BYTES:
         raise ValueError("media exceeds the configured size limit")
