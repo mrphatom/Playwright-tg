@@ -27,6 +27,8 @@ from control_plane import (
     list_session_metadata,
     record_admin_action,
     revoke_dashboard_session,
+    get_referral_stats,
+    list_referrals,
     search_users,
     set_user_status,
     resolve_report,
@@ -129,6 +131,16 @@ async def health_handler(request: web.Request):
     return web.json_response({"status": "ok", "role": user["role"], "operations": len(operations), "process": {"pid": os.getpid()}})
 
 
+async def referrals_handler(request: web.Request):
+    _, user = _require_session(request)
+    return web.json_response(get_referral_stats(user["telegram_user_id"]))
+
+
+async def admin_referrals_handler(request: web.Request):
+    _require_admin(request)
+    return web.json_response({"referrals": _json_rows(list_referrals(request.query.get("status"), 100))})
+
+
 async def admin_users_handler(request: web.Request):
     _require_admin(request)
     query = request.query.get("q", "")
@@ -219,11 +231,11 @@ async def websocket_handler(request: web.Request):
 HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GreyAI Operations</title>
 <style>body{font-family:system-ui;background:#0b1020;color:#e7ecff;margin:0}main{max-width:1100px;margin:auto;padding:28px}section{background:#131b32;border:1px solid #2d3b63;border-radius:14px;padding:18px;margin:14px 0}h1{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.metric{background:#0e1630;border-radius:10px;padding:14px}.muted{color:#9aa8cd}code{color:#9bd4ff}button{background:#5c7cfa;color:white;border:0;border-radius:8px;padding:8px 12px;cursor:pointer}input{background:#0e1630;color:white;border:1px solid #3b4c7c;border-radius:8px;padding:8px;margin-right:6px}pre{white-space:pre-wrap;overflow:auto;max-height:420px}</style></head>
-<body><main><h1>GreyAI Operations</h1><p class="muted">Live execution, account, and safety control plane</p><div class="grid"><div class="metric">Status<br><strong id="status">connecting</strong></div><div class="metric">Role<br><strong id="role">-</strong></div><div class="metric">Operations<br><strong id="count">0</strong></div></div><section><h2>Execution log</h2><pre id="ops">Loading…</pre></section><section id="admin" hidden><h2>Administrator console</h2><p><input id="userq" placeholder="Telegram ID or username"><button onclick="searchUsers()">Search user</button></p><pre id="users">Search results appear here.</pre><p><input id="banid" placeholder="User ID"><input id="reason" placeholder="Reason"><button onclick="banUser()">Ban</button><button onclick="unbanUser()">Unban</button></p><h3>Open reports</h3><pre id="reports">Loading…</pre><p><input id="reportid" placeholder="Report ID"><input id="reportresolution" placeholder="Resolution"><button onclick="resolveReport()">Resolve report</button></p><h3>Open appeals</h3><pre id="appeals">Loading…</pre><p><input id="appealid" placeholder="Appeal ID"><input id="appealresolution" placeholder="Resolution"><button onclick="resolveAppeal()">Resolve appeal</button></p></section><p><a href="/logout" style="color:#9bd4ff">Sign out</a></p></main>
+<body><main><h1>GreyAI Operations</h1><p class="muted">Live execution, account, and safety control plane</p><div class="grid"><div class="metric">Status<br><strong id="status">connecting</strong></div><div class="metric">Role<br><strong id="role">-</strong></div><div class="metric">Operations<br><strong id="count">0</strong></div></div><section><h2>Execution log</h2><pre id="ops">Loading…</pre></section><section><h2>Referrals</h2><pre id="referrals">Loading…</pre></section><section id="admin" hidden><h2>Administrator console</h2><p><input id="userq" placeholder="Telegram ID or username"><button onclick="searchUsers()">Search user</button></p><pre id="users">Search results appear here.</pre><p><input id="banid" placeholder="User ID"><input id="reason" placeholder="Reason"><button onclick="banUser()">Ban</button><button onclick="unbanUser()">Unban</button></p><h3>Referral activity</h3><pre id="adminreferrals">Loading…</pre><h3>Open reports</h3><pre id="reports">Loading…</pre><p><input id="reportid" placeholder="Report ID"><input id="reportresolution" placeholder="Resolution"><button onclick="resolveReport()">Resolve report</button></p><h3>Open appeals</h3><pre id="appeals">Loading…</pre><p><input id="appealid" placeholder="Appeal ID"><input id="appealresolution" placeholder="Resolution"><button onclick="resolveAppeal()">Resolve appeal</button></p></section><p><a href="/logout" style="color:#9bd4ff">Sign out</a></p></main>
 <script>
 const csrf=decodeURIComponent(document.cookie.split('; ').find(x=>x.startsWith('greyai_csrf='))?.split('=')[1]||'');
 async function me(){const r=await fetch('/api/me');if(!r.ok){location.href='/';return}const u=await r.json();document.querySelector('#role').textContent=u.role;document.querySelector('#admin').hidden=u.role!=='admin'}
-async function refresh(){const r=await fetch('/api/operations'+(document.querySelector('#role').textContent==='admin'?'?scope=all':''));if(!r.ok)return;const d=await r.json();document.querySelector('#count').textContent=d.operations.length;document.querySelector('#ops').textContent=JSON.stringify(d.operations,null,2);document.querySelector('#status').textContent='healthy'}
+async function refresh(){const r=await fetch('/api/operations'+(document.querySelector('#role').textContent==='admin'?'?scope=all':''));if(!r.ok)return;const d=await r.json();document.querySelector('#count').textContent=d.operations.length;document.querySelector('#ops').textContent=JSON.stringify(d.operations,null,2);document.querySelector('#status').textContent='healthy';const ref=await (await fetch('/api/referrals')).json();document.querySelector('#referrals').textContent=JSON.stringify(ref,null,2);if(document.querySelector('#role').textContent==='admin'){const ar=await (await fetch('/api/admin/referrals')).json();document.querySelector('#adminreferrals').textContent=JSON.stringify(ar.referrals,null,2)}}
 async function searchUsers(){const q=encodeURIComponent(document.querySelector('#userq').value);const d=await (await fetch('/api/admin/users?q='+q)).json();document.querySelector('#users').textContent=JSON.stringify(d.users,null,2)}
 async function adminAction(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});if(!r.ok)alert('Action failed');await refresh()}
 function banUser(){adminAction('/api/admin/ban',{user_id:document.querySelector('#banid').value,reason:document.querySelector('#reason').value})}function unbanUser(){adminAction('/api/admin/unban',{user_id:document.querySelector('#banid').value})}function resolveReport(){adminAction('/api/admin/reports/'+encodeURIComponent(document.querySelector('#reportid').value),{status:'resolved',resolution:document.querySelector('#reportresolution').value})}function resolveAppeal(){adminAction('/api/admin/appeals/'+encodeURIComponent(document.querySelector('#appealid').value),{status:'resolved',resolution:document.querySelector('#appealresolution').value})}
@@ -247,7 +259,9 @@ def create_dashboard_app() -> web.Application:
         web.get("/api/me", me_handler),
         web.get("/api/health", health_handler),
         web.get("/api/operations", operations_handler),
+        web.get("/api/referrals", referrals_handler),
         web.get("/api/admin/users", admin_users_handler),
+        web.get("/api/admin/referrals", admin_referrals_handler),
         web.get("/api/admin/reports", admin_reports_handler),
         web.get("/api/admin/appeals", admin_appeals_handler),
         web.post("/api/admin/ban", admin_ban_handler),

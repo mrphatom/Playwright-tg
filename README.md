@@ -20,6 +20,7 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 - **🛡️ Enterprise Security:** Role-aware authorization, rate limiting, server-side quotas, SSRF-resistant URL validation, encrypted sessions, strict command timeouts, audit records, and a required domain allowlist in public mode.
 - **👥 Public User Lifecycle:** Persistent user records, user/admin roles, active/limited/suspended/banned states, administrator search, ban/unban, role management, reports, and appeals.
 - **💳 Entitlements:** Telegram Stars Pro upgrade flow with pre-checkout validation, idempotent receipts, durable entitlements, and an optional external HTTPS crypto checkout adapter.
+- **🎁 Referrals:** Unique Telegram deep links, one-time attribution, self-referral and duplicate protection, verified-payment qualification, auditable quota rewards, user stats, and admin reporting.
 - **📊 Operations Dashboard:** One-time Telegram-issued dashboard links, secure cookie sessions, CSRF-protected admin actions, redacted execution logs, saved-session metadata, health data, and live polling/websocket updates.
 - **🧪 Cautious Activity Review:** Advisory AI risk review with confidence calibration. Strong signals create human-review work; the model never automatically bans, suspends, or limits an account.
 - **🐳 Production Docker Ready:** Built-in volume mapping and memory limits for 24/7 VPS hosting.
@@ -114,7 +115,9 @@ Log in once and reuse the state safely.
 
 Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and replace the starter `ALLOWED_DOMAINS` list with the domains you are prepared to permit. Public mode rejects private and loopback IP targets and refuses to operate with an empty domain allowlist.
 
-Users can request a one-time dashboard link with `/dashboard`, purchase the Pro entitlement with `/upgrade` using Telegram Stars, submit `/report` and `/appeal` tickets, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, and chat capabilities. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/review`, and `/resolveappeal`.
+Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, purchase the Pro entitlement with `/upgrade` using Telegram Stars, submit `/report` and `/appeal` tickets, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, and chat capabilities. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, and `/resolveappeal`.
+
+A referral is attributed through Telegram’s `/start` deep-link parameter and cannot be reassigned. It becomes qualified only after the invited user completes a verified Telegram Stars Pro purchase. The referrer and invited user then receive configurable one-time quota bonuses recorded in the referral reward ledger. Invalid codes, self-referrals, duplicate attribution, and referrals from banned accounts are rejected.
 
 Telegram Stars are the in-Telegram payment rail for digital access. Crypto checkout is intentionally provider-gated through `CRYPTO_CHECKOUT_URL`; do not accept wallet addresses, seed phrases, or client-provided payment claims as proof of payment.
 
