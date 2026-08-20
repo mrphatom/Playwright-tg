@@ -5,10 +5,12 @@ parameterized SQLite primitives that can be called from the bot and dashboard la
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sqlite3
 import secrets
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -214,7 +216,28 @@ def init_platform_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_referral_rewards_recipient ON referral_rewards(recipient_user_id, created_at DESC);
             """
         )
+        try:
+            connection.execute("ALTER TABLE dashboard_login_tokens ADD COLUMN session_secret TEXT")
+        except sqlite3.OperationalError:
+            pass
         connection.commit()
+
+
+def _dashboard_cipher() -> Fernet:
+    seed = (os.getenv("SESSION_ENCRYPTION_KEY") or os.getenv("TELEGRAM_BOT_TOKEN") or "dashboard-development-seed").encode("utf-8")
+    key = base64.urlsafe_b64encode(seed.ljust(32, b"0")[:32])
+    return Fernet(key)
+
+
+def _protect_dashboard_session(value: str) -> str:
+    return _dashboard_cipher().encrypt(value.encode("utf-8")).decode("utf-8")
+
+
+def _unprotect_dashboard_session(value: str) -> Optional[str]:
+    try:
+        return _dashboard_cipher().decrypt(value.encode("utf-8"), ttl=259200).decode("utf-8")
+    except (InvalidToken, ValueError, TypeError):
+        return None
 
 
 def ensure_user(user_id: int, username: Optional[str] = None, display_name: Optional[str] = None) -> sqlite3.Row:
@@ -436,7 +459,7 @@ def _token_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def create_dashboard_login_token(user_id: int, ttl_minutes: int = 10) -> str:
+def create_dashboard_login_token(user_id: int, ttl_minutes: int = 30) -> str:
     raw = secrets.token_urlsafe(32)
     expires = (datetime.now(timezone.utc) + timedelta(minutes=max(1, min(ttl_minutes, 30)))).replace(microsecond=0).isoformat()
     with _connect() as connection:
@@ -450,13 +473,20 @@ def exchange_dashboard_login_token(raw_token: str, ttl_hours: int = 24) -> Optio
         return None
     now = utc_now()
     with _connect() as connection:
-        row = connection.execute("SELECT user_id, expires_at, used_at FROM dashboard_login_tokens WHERE token_hash = ?", (_token_hash(raw_token),)).fetchone()
-        if not row or row["used_at"] or row["expires_at"] <= now:
+        row = connection.execute("SELECT user_id, expires_at, used_at, session_secret FROM dashboard_login_tokens WHERE token_hash = ?", (_token_hash(raw_token),)).fetchone()
+        if not row or row["expires_at"] <= now:
+            return None
+        if row["used_at"] and row["session_secret"]:
+            session_raw = _unprotect_dashboard_session(row["session_secret"])
+            if session_raw:
+                existing = connection.execute("SELECT user_id, csrf_token, expires_at FROM dashboard_sessions WHERE session_hash = ? AND expires_at > ?", (_token_hash(session_raw), now)).fetchone()
+                if existing:
+                    return {"session": session_raw, "csrf": existing["csrf_token"], "user_id": str(existing["user_id"]), "expires_at": existing["expires_at"]}
             return None
         session_raw = secrets.token_urlsafe(32)
         csrf_raw = secrets.token_urlsafe(24)
         expires = (datetime.now(timezone.utc) + timedelta(hours=max(1, min(ttl_hours, 72)))).replace(microsecond=0).isoformat()
-        connection.execute("UPDATE dashboard_login_tokens SET used_at = ? WHERE token_hash = ?", (now, _token_hash(raw_token)))
+        connection.execute("UPDATE dashboard_login_tokens SET used_at = ?, session_secret = ? WHERE token_hash = ?", (now, _protect_dashboard_session(session_raw), _token_hash(raw_token)))
         connection.execute("INSERT INTO dashboard_sessions (session_hash, user_id, csrf_token, expires_at, created_at) VALUES (?, ?, ?, ?, ?)", (_token_hash(session_raw), row["user_id"], csrf_raw, expires, now))
         connection.commit()
         return {"session": session_raw, "csrf": csrf_raw, "user_id": str(row["user_id"]), "expires_at": expires}
@@ -590,6 +620,9 @@ def attach_payment_charge(order_id: str, charge_id: str) -> bool:
 
 
 def mark_payment_success(order_id: str, plan: str, expires_at: Optional[str] = None) -> bool:
+    if plan not in {"pro", "max"}:
+        raise ValueError("invalid entitlement plan")
+    quota_limit = int(os.getenv("PRO_PLAN_QUOTA", "1000")) if plan == "pro" else int(os.getenv("MAX_PLAN_QUOTA", "5000"))
     now = utc_now()
     with _connect() as connection:
         row = connection.execute("SELECT user_id, status FROM payment_orders WHERE order_id = ?", (order_id,)).fetchone()
@@ -597,6 +630,6 @@ def mark_payment_success(order_id: str, plan: str, expires_at: Optional[str] = N
             return False
         connection.execute("UPDATE payment_orders SET status = 'paid', updated_at = ? WHERE order_id = ?", (now, order_id))
         connection.execute("INSERT INTO entitlements (user_id, plan, expires_at, source_order_id, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET plan = excluded.plan, expires_at = excluded.expires_at, source_order_id = excluded.source_order_id, updated_at = excluded.updated_at", (row["user_id"], plan, expires_at, order_id, now))
-        connection.execute("UPDATE users SET plan = ?, quota_limit = CASE WHEN ? = 'pro' THEN 1000 ELSE quota_limit END, updated_at = ? WHERE telegram_user_id = ?", (plan, plan, now, row["user_id"]))
+        connection.execute("UPDATE users SET plan = ?, quota_limit = ?, updated_at = ? WHERE telegram_user_id = ?", (plan, quota_limit, now, row["user_id"]))
         connection.commit()
         return True
