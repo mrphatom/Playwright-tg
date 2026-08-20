@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 ALLOWED_USERS = set(int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_USERS", "").split(",") if uid.strip().isdigit())
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
@@ -53,7 +54,7 @@ cipher_suite = Fernet(ENCRYPTION_KEY.encode("utf-8"))
 # AI Setup
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    ai_model = genai.GenerativeModel('gemini-1.5-flash')
+    ai_model = genai.GenerativeModel(GEMINI_MODEL)
 else:
     ai_model = None
 
@@ -218,6 +219,7 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
         return None
 
     mode = str(raw_plan.get("mode", "")).strip().lower()
+    mode = {"monitor": "watch", "poll": "watch", "track": "watch"}.get(mode, mode)
     url = str(raw_plan.get("url", "")).strip()
     if mode not in {"check", "watch"} or not is_valid_url(url) or not is_domain_allowed(url):
         return None
@@ -302,7 +304,7 @@ async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, An
         response = await asyncio.to_thread(
             ai_model.generate_content,
             prompt,
-            generation_config={"temperature": 0.1, "max_output_tokens": 512},
+            generation_config={"temperature": 0.0, "max_output_tokens": 2048},
         )
         raw_plan = parse_json_object(response.text or "")
         return normalize_natural_language_plan(raw_plan)
@@ -324,6 +326,8 @@ def mask_sensitive_action(action: str) -> str:
     if action.startswith("type:"):
         parts = action.split("=", 1)
         if len(parts) == 2: return f"{parts[0]}=***MASKED***"
+    if action.startswith(("ai_extract:", "condition_ai:", "condition_contains:")):
+        return action.split(":", 1)[0] + ":***REDACTED***"
     return action
 
 # ==========================================

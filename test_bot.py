@@ -16,7 +16,8 @@ from bot import (
     save_encrypted_session,
     load_encrypted_session,
     init_db,
-    normalize_natural_language_plan
+    normalize_natural_language_plan,
+    mask_sensitive_action
 )
 
 @pytest.fixture(autouse=True)
@@ -137,6 +138,12 @@ def test_natural_language_parser_accepts_fenced_json(monkeypatch):
 
     assert plan["mode"] == "watch"
     assert plan["actions"] == ["condition_contains:Apple Pie is in stock"]
+
+
+def test_sensitive_natural_language_actions_are_redacted():
+    assert mask_sensitive_action("ai_extract:read my private account") == "ai_extract:***REDACTED***"
+    assert mask_sensitive_action("condition_ai:alert me about my order") == "condition_ai:***REDACTED***"
+    assert mask_sensitive_action("condition_contains:secret phrase") == "condition_contains:***REDACTED***"
 
 
 def test_restricted_handler_fails_closed_without_allowlist(monkeypatch):
