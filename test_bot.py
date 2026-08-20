@@ -672,3 +672,86 @@ def test_natural_language_developer_management_commands_are_interpreted():
         "mode": "admin_revoke_developer",
         "target_user_id": 123456,
     }
+
+
+def test_fast_route_classifies_chat_without_invoking_task_planner():
+    import bot
+
+    assert bot.classify_message_route("Hello, how are you today?") == "chat"
+    assert bot.classify_message_route("Explain recursion with a short example") == "chat"
+    assert bot.classify_message_route("Go to Google News and summarize the headlines") == "task"
+    assert bot.classify_message_route("Tell me when Apple Pie is in stock") == "task"
+
+
+def test_ai_discovered_allowlisted_url_is_accepted(monkeypatch):
+    import bot
+
+    class FakeResponse:
+        text = '{"mode":"check","url":"https://news.google.com","discover_url":true,"request":"summarize the headlines"}'
+
+    class FakeModel:
+        def generate_content(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(bot, "ai_model", FakeModel())
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["google.com"])
+
+    plan = asyncio.run(bot.parse_natural_language_intent("Go to Google News and summarize the headlines"))
+
+    assert plan["mode"] == "check"
+    assert plan["url"] == "https://news.google.com"
+
+
+def test_media_context_is_bounded_and_marked_as_untrusted():
+    import bot
+
+    context = bot.build_media_context("a" * 10000, "voice")
+
+    assert len(context) <= bot.MAX_MEDIA_CONTEXT_CHARS
+    assert "untrusted" in context.lower()
+    assert "voice" in context.lower()
+
+
+def test_fast_route_keeps_ordinary_summary_question_in_chat_mode():
+    import bot
+
+    assert bot.classify_message_route("Summarize the paragraph I pasted above") == "chat"
+    assert bot.classify_message_route("What is the difference between TCP and UDP?") == "chat"
+
+
+def test_multimodal_handlers_exist_for_voice_and_photo_updates():
+    import bot
+
+    assert callable(bot.voice_message_handler)
+    assert callable(bot.photo_message_handler)
+    assert callable(bot.generate_multimodal_interpretation)
+
+
+def test_multimodal_request_keeps_gemini_key_out_of_url(monkeypatch, tmp_path):
+    import bot
+
+    media = tmp_path / "sample.jpg"
+    media.write_bytes(b"image-bytes")
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self):
+            return b'{"candidates":[{"content":{"parts":[{"text":"identified"}]}}]}'
+
+    def fake_urlopen(request, timeout):
+        seen["url"] = request.full_url
+        seen["headers"] = dict(request.headers)
+        return FakeResponse()
+
+    monkeypatch.setattr(bot, "GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setattr(bot.urllib.request, "urlopen", fake_urlopen)
+
+    result = asyncio.run(bot.generate_multimodal_interpretation(str(media), "image/jpeg", "identify it"))
+
+    assert result == "identified"
+    assert "test-gemini-key" not in seen["url"]
+    assert seen["headers"]["X-goog-api-key"] == "test-gemini-key"

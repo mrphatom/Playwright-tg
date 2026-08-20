@@ -41,3 +41,11 @@ def test_api_key_boundary_rejects_non_developer_after_role_revocation(dashboard_
     with pytest.raises(web.HTTPUnauthorized) as error:
         dashboard._require_api_key(request, "check")
     assert "invalid_api_key" in error.value.text
+
+
+def test_dashboard_client_has_bounded_bootstrap_and_recovery_states():
+    assert "AbortController" in dashboard.HTML
+    assert "FETCH_TIMEOUT_MS" in dashboard.HTML
+    assert "Promise.allSettled" in dashboard.HTML
+    assert "Dashboard data could not be loaded" in dashboard.HTML
+    assert "setInterval(()=>refresh().catch(()=>{}),3000)" in dashboard.HTML
