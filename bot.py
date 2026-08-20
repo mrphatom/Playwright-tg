@@ -113,7 +113,20 @@ PRO_PLAN_STARS = int(os.getenv("PRO_PLAN_STARS", "750"))
 MAX_PLAN_STARS = int(os.getenv("MAX_PLAN_STARS", "1000"))
 PRO_PLAN_QUOTA = int(os.getenv("PRO_PLAN_QUOTA", "1000"))
 MAX_PLAN_QUOTA = int(os.getenv("MAX_PLAN_QUOTA", "5000"))
+PROVIDER_ALERTS_ENABLED = os.getenv("PROVIDER_ALERTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+PROVIDER_ALERT_COOLDOWN_SECONDS = max(60, min(86400, int(os.getenv("PROVIDER_ALERT_COOLDOWN_SECONDS", "900"))))
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+provider_metrics = {
+    "text_attempts": 0,
+    "media_attempts": 0,
+    "quota_failures": 0,
+    "model_failures": 0,
+    "fallback_successes": 0,
+    "provider_unavailable": 0,
+    "alerts_sent": 0,
+    "alerts_suppressed": 0,
+    "recoveries_sent": 0,
+}
 
 
 def format_api_key_listing(keys: List[Dict[str, Any]]) -> str:
@@ -244,6 +257,99 @@ class MediaProviderTimeout(TimeoutError):
     """Media-specific timeout that does not imply the input is too large."""
 
 
+class ProviderAlertManager:
+    """Best-effort, rate-limited administrator notifications for provider incidents."""
+
+    def __init__(self, cooldown_seconds: int = PROVIDER_ALERT_COOLDOWN_SECONDS):
+        self.cooldown_seconds = cooldown_seconds
+        self._bot = None
+        self._last_sent_at: Dict[str, float] = {}
+        self._active_incidents: set[str] = set()
+        self._tasks: set[asyncio.Task] = set()
+        self._lock = asyncio.Lock()
+
+    def attach_bot(self, bot) -> None:
+        self._bot = bot
+
+    def schedule(self, coroutine) -> None:
+        if not PROVIDER_ALERTS_ENABLED or self._bot is None:
+            coroutine.close()
+            return
+        task = asyncio.create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    @staticmethod
+    def _category_label(category: str) -> str:
+        return "quota exhaustion" if category == "quota_exhaustion" else "model failure"
+
+    async def notify_failure(self, category: str, model: str, fallback_succeeded: bool) -> None:
+        if not PROVIDER_ALERTS_ENABLED or self._bot is None:
+            return
+        incident_key = f"{category}:{model}"
+        now = time.monotonic()
+        async with self._lock:
+            self._active_incidents.add(incident_key)
+            last_sent = self._last_sent_at.get(incident_key, float("-inf"))
+            if now - last_sent < self.cooldown_seconds:
+                provider_metrics["alerts_suppressed"] += 1
+                return
+            recipients = sorted(admin_ids())
+            if not recipients:
+                return
+            self._last_sent_at[incident_key] = now
+            message = (
+                "⚠️ <b>GreyAI provider alert</b>\n\n"
+                f"<b>Type:</b> {html_escape(self._category_label(category))}\n"
+                f"<b>Model:</b> <code>{html_escape(model)}</code>\n"
+                f"<b>Impact:</b> {'fallback succeeded; service is degraded' if fallback_succeeded else 'all configured attempts failed'}\n"
+                "<b>Action:</b> Check Gemini AI Studio quota, billing, and model availability."
+            )
+            sent = 0
+            for recipient in recipients:
+                try:
+                    await self._bot.send_message(chat_id=recipient, text=message, parse_mode="HTML")
+                    sent += 1
+                except TelegramError:
+                    logger.warning("provider_alert_delivery_failed category=%s model=%s", category, model)
+            if sent:
+                provider_metrics["alerts_sent"] += sent
+
+    async def notify_recovery(self, model: str) -> None:
+        if not PROVIDER_ALERTS_ENABLED or self._bot is None:
+            return
+        async with self._lock:
+            incident_keys = [key for key in self._active_incidents if key.endswith(f":{model}")]
+            if not incident_keys:
+                return
+            recipients = sorted(admin_ids())
+            self._active_incidents.difference_update(incident_keys)
+            if not recipients:
+                return
+            message = (
+                "✅ <b>GreyAI provider recovered</b>\n\n"
+                f"<b>Model:</b> <code>{html_escape(model)}</code>\n"
+                "New requests are succeeding again."
+            )
+            sent = 0
+            for recipient in recipients:
+                try:
+                    await self._bot.send_message(chat_id=recipient, text=message, parse_mode="HTML")
+                    sent += 1
+                except TelegramError:
+                    logger.warning("provider_recovery_delivery_failed model=%s", model)
+            if sent:
+                provider_metrics["recoveries_sent"] += sent
+
+    def shutdown(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        self._tasks.clear()
+
+
+provider_alerts = ProviderAlertManager()
+
+
 class GeminiFailoverProvider:
     """Use one of two Gemini keys per request without restarting caller workflows."""
 
@@ -308,29 +414,59 @@ class GeminiFailoverProvider:
         parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
         return "\n".join(str(part.get("text", "")) for part in parts if part.get("text")).strip()
 
+    @staticmethod
+    def _error_category(error: Exception) -> str:
+        code = getattr(error, "code", None)
+        text = str(error).lower()
+        if code == 429 or any(marker in text for marker in ("quota", "rate limit", "resource exhausted")):
+            return "quota_exhaustion"
+        return "model_failure"
+
+    def _record_provider_error(self, error: Exception) -> str:
+        category = self._error_category(error)
+        provider_metrics["quota_failures" if category == "quota_exhaustion" else "model_failures"] += 1
+        return category
+
+    def _schedule_failure_alert(self, category: str, model: str, fallback_succeeded: bool) -> None:
+        provider_alerts.schedule(provider_alerts.notify_failure(category, model, fallback_succeeded))
+
+    def _schedule_recovery_alert(self, model: str) -> None:
+        provider_alerts.schedule(provider_alerts.notify_recovery(model))
+
     async def generate_text(self, prompt: str, generation_config: Optional[Dict[str, Any]] = None) -> str:
         keys = self._candidate_keys()
         if not keys and ai_model is not None:
+            provider_metrics["text_attempts"] += 1
             response = await asyncio.wait_for(
                 asyncio.to_thread(ai_model.generate_content, prompt, generation_config=generation_config or {}),
                 timeout=CHAT_TIMEOUT_SECONDS,
             )
             text = str(getattr(response, "text", "") or "").strip()
             if not text:
-                raise TextProviderUnavailable("Gemini returned an empty text response")
+                error = TextProviderUnavailable("Gemini returned an empty text response")
+                category = self._record_provider_error(error)
+                self._schedule_failure_alert(category, self.model, False)
+                raise error
+            self._schedule_recovery_alert(self.model)
             return text
         if not keys:
-            raise RuntimeError("Gemini is not configured")
+            error = TextProviderUnavailable("Gemini is not configured")
+            self._record_provider_error(error)
+            self._schedule_failure_alert("model_failure", self.model, False)
+            raise error
 
         models = [self.model]
         if self.text_fallback_model and self.text_fallback_model not in models:
             models.append(self.text_fallback_model)
         last_error = None
+        failure_categories: set[str] = set()
+        first_failure_model = self.model
         for key_index, key in enumerate(keys):
             if key_index < len(keys) - 1 and self._is_cooling_down(key):
                 continue
             key_had_retryable_failure = False
             for model_index, model in enumerate(models):
+                provider_metrics["text_attempts"] += 1
                 try:
                     text = await asyncio.wait_for(
                         asyncio.to_thread(self._request_text, key, prompt, generation_config or {}, model),
@@ -339,10 +475,19 @@ class GeminiFailoverProvider:
                     text = str(text or "").strip()
                     if not text:
                         raise TextProviderUnavailable("Gemini returned an empty text response")
+                    if failure_categories:
+                        provider_metrics["fallback_successes"] += 1
+                        category = "quota_exhaustion" if "quota_exhaustion" in failure_categories else "model_failure"
+                        self._schedule_failure_alert(category, first_failure_model, True)
+                    else:
+                        self._schedule_recovery_alert(model)
                     return text
                 except Exception as error:
                     last_error = error
+                    category = self._record_provider_error(error)
+                    failure_categories.add(category)
                     if not self._is_retryable(error):
+                        self._schedule_failure_alert(category, model, False)
                         raise
                     key_had_retryable_failure = True
                     if model_index < len(models) - 1:
@@ -350,6 +495,9 @@ class GeminiFailoverProvider:
                     self._mark_cooldown(key)
             if key_had_retryable_failure:
                 continue
+        provider_metrics["provider_unavailable"] += 1
+        category = "quota_exhaustion" if "quota_exhaustion" in failure_categories else "model_failure"
+        self._schedule_failure_alert(category, first_failure_model, False)
         if last_error:
             raise TextProviderUnavailable("Gemini text capacity is unavailable") from last_error
         raise TextProviderUnavailable("No healthy Gemini text provider is available")
@@ -357,23 +505,42 @@ class GeminiFailoverProvider:
     async def generate_media(self, path: str, mime_type: str, instruction: str) -> str:
         keys = self._candidate_keys()
         if not keys:
-            raise RuntimeError("Gemini is not configured")
+            error = MediaProviderUnavailable("Gemini is not configured")
+            self._record_provider_error(error)
+            self._schedule_failure_alert("model_failure", self.media_model, False)
+            raise error
         last_error = None
         retryable_errors = []
+        failure_categories: set[str] = set()
         for index, key in enumerate(keys):
             if index < len(keys) - 1 and self._is_cooling_down(key):
                 continue
+            provider_metrics["media_attempts"] += 1
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     asyncio.to_thread(self._request_media, key, path, mime_type, instruction),
                     timeout=MEDIA_TIMEOUT_SECONDS,
                 )
+                if not str(result or "").strip():
+                    raise MediaProviderUnavailable("Gemini returned an empty media response")
+                if failure_categories:
+                    provider_metrics["fallback_successes"] += 1
+                    category = "quota_exhaustion" if "quota_exhaustion" in failure_categories else "model_failure"
+                    self._schedule_failure_alert(category, self.media_model, True)
+                else:
+                    self._schedule_recovery_alert(self.media_model)
+                return result
             except Exception as error:
                 last_error = error
+                category = self._record_provider_error(error)
+                failure_categories.add(category)
                 if not self._is_retryable(error) or index == len(keys) - 1:
                     break
                 retryable_errors.append(error)
                 self._mark_cooldown(key)
+        provider_metrics["provider_unavailable"] += 1
+        category = "quota_exhaustion" if "quota_exhaustion" in failure_categories else "model_failure"
+        self._schedule_failure_alert(category, self.media_model, False)
         if isinstance(last_error, (asyncio.TimeoutError, TimeoutError)):
             raise MediaProviderTimeout("Gemini media interpretation timed out") from last_error
         if any(getattr(error, "code", None) == 429 for error in retryable_errors + ([last_error] if last_error else [])):
@@ -1560,11 +1727,13 @@ async def restore_schedules_from_db(context_bot):
 
 
 async def post_init(application: Application):
+    provider_alerts.attach_bot(application.bot)
     await start_browser_pool(application)
     await configure_bot_profile(application.bot)
 
 
 async def stop_browser_pool(application: Application):
+    provider_alerts.shutdown()
     for task in application.bot_data.get("ephemeral_message_tasks", set()):
         task.cancel()
     dashboard_task = application.bot_data.get("dashboard_task")
@@ -2888,7 +3057,10 @@ def build_health_report() -> str:
         f"Active watchers: `{sum(len(items) for items in active_watchers.values())}`\n"
         f"Active schedules: `{len(active_schedules)}`\n"
         f"Commands: `{runtime_metrics['commands_total']}` | Browser attempts: `{runtime_metrics['browser_tasks_total']}`\n"
-        f"Failures: `{runtime_metrics['failures_total']}`"
+        f"Failures: `{runtime_metrics['failures_total']}`\n"
+        f"Gemini attempts: `{provider_metrics['text_attempts'] + provider_metrics['media_attempts']}` | Quota failures: `{provider_metrics['quota_failures']}`\n"
+        f"Model failures: `{provider_metrics['model_failures']}` | Fallback successes: `{provider_metrics['fallback_successes']}`\n"
+        f"Alerts sent: `{provider_metrics['alerts_sent']}` | Suppressed: `{provider_metrics['alerts_suppressed']}` | Recoveries: `{provider_metrics['recoveries_sent']}`"
     )
 
 
