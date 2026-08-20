@@ -25,7 +25,9 @@ from bot import (
     save_schedule_to_db,
     list_schedules_for_chat,
     deactivate_schedule_in_db,
-    restore_schedules_from_db
+    restore_schedules_from_db,
+    is_web_automation_request,
+    build_chat_prompt
 )
 
 @pytest.fixture(autouse=True)
@@ -270,6 +272,48 @@ def test_next_schedule_run_uses_timezone_and_skips_weekends():
     next_run = calculate_next_schedule_run(config, now)
 
     assert next_run == datetime(2026, 8, 24, 8, 0, tzinfo=ZoneInfo("Europe/London"))
+
+
+def test_plain_conversation_is_not_routed_to_web_automation():
+    assert is_web_automation_request("What do you think about this idea?") is False
+    assert is_web_automation_request("Help me plan a productive morning") is False
+    assert is_web_automation_request("Check https://example.com and summarize it") is True
+    assert is_web_automation_request("Every weekday at 08:00 summarize https://example.com") is True
+
+
+def test_chat_prompt_keeps_bounded_history_and_current_message():
+    history = [
+        {"role": "user", "text": f"old-{index}"}
+        for index in range(20)
+    ]
+    prompt = build_chat_prompt("What should I do next?", history)
+
+    assert "What should I do next?" in prompt
+    assert "old-19" in prompt
+    assert "old-0" not in prompt
+    assert len(prompt) < 12000
+
+
+def test_conversational_reply_uses_gemini_and_remembers_turn(monkeypatch):
+    import bot
+
+    class FakeResponse:
+        text = "That sounds like a strong idea."
+
+    class FakeModel:
+        def generate_content(self, prompt, generation_config=None):
+            assert "What do you think?" in prompt
+            assert generation_config["temperature"] == 0.7
+            return FakeResponse()
+
+    monkeypatch.setattr(bot, "ai_model", FakeModel())
+    bot.chat_histories.clear()
+
+    reply = asyncio.run(bot.generate_chat_reply(123, "What do you think?"))
+    bot.remember_chat_turn(123, "What do you think?", reply)
+
+    assert reply == "That sounds like a strong idea."
+    assert bot.chat_histories[123][-1]["text"] == reply
 
 
 def test_sensitive_natural_language_actions_are_redacted():

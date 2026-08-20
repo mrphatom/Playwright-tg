@@ -9,9 +9,17 @@ Playwright-tg operates using a pipeline syntax. You start with a base command (l
 
 ---
 
-## 💬 Plain-Language Requests
+## 💬 Conversational and Plain-Language Requests
 
-You can send an ordinary sentence instead of a slash command. Include an explicit `http://` or `https://` URL and describe what you want to read or monitor.
+You can send ordinary sentences instead of slash commands. Messages without an explicit URL-based web request are answered as normal conversation, so you can ask questions, brainstorm, discuss code, plan your day, or role-play naturally.
+
+For example:
+
+```text
+What do you think about making a small app that helps me plan my week?
+```
+
+When a message includes an explicit URL and a web action, it is routed into the browser automation pipeline. Include an explicit `http://` or `https://` URL and describe what you want to read or monitor.
 
 For a one-time check:
 

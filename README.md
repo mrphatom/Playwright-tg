@@ -13,6 +13,7 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 
 - **👀 Continuous Watchers:** Monitor websites in the background. If a condition is met (e.g., "In Stock" or an AI evaluation), the bot alerts you and stops automatically. Watchers survive server reboots!
 - **⏰ Scheduled Briefings:** Deliver timezone-aware daily or weekday summaries from multiple URLs, with persistent schedules restored after restarts.
+- **💬 Conversational Chat:** Ask ordinary questions, brainstorm, discuss code, plan, or role-play without a command.
 - **🧠 AI-Powered Extraction:** Query webpages using conversational prompts instead of fragile CSS selectors.
 - **🔒 AES-Encrypted Sessions:** Login to sites once and save your session. Your cookies and tokens are encrypted at rest inside a local SQLite database.
 - **⚡ Persistent Browser Pooling:** Maintains a warm background Chromium instance. Commands launch isolated tabs in milliseconds.
