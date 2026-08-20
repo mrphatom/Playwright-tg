@@ -7,8 +7,10 @@ import uuid
 import json
 import sqlite3
 import base64
+from datetime import datetime, timedelta, time as datetime_time
 from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -69,6 +71,7 @@ class BrowserPool:
 
 pool = BrowserPool()
 active_watchers: Dict[int, Dict[str, asyncio.Task]] = {}
+active_schedules: Dict[str, asyncio.Task] = {}
 user_cooldowns: Dict[int, float] = {}
 
 # ==========================================
@@ -104,6 +107,19 @@ def init_db():
             )
         """)
         
+        # Scheduled briefings table (persistent across restarts)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schedules (
+                schedule_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                next_run_at TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Audit Logs table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS audit_logs (
@@ -193,6 +209,74 @@ def deactivate_watcher_in_db(watcher_id: str):
         cursor.execute("UPDATE watchers SET is_active = 0 WHERE watcher_id = ?", (watcher_id,))
         conn.commit()
 
+
+def save_schedule_to_db(schedule_id: str, user_id: int, chat_id: int, config: Dict[str, Any], next_run: datetime):
+    with sqlite3.connect(get_db_path()) as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO schedules
+               (schedule_id, user_id, chat_id, config_json, next_run_at, is_active)
+               VALUES (?, ?, ?, ?, ?, 1)""",
+            (schedule_id, user_id, chat_id, json.dumps(config), next_run.isoformat()),
+        )
+        conn.commit()
+
+
+def list_schedules_for_chat(chat_id: int) -> List[Dict[str, Any]]:
+    with sqlite3.connect(get_db_path()) as conn:
+        rows = conn.execute(
+            """SELECT schedule_id, user_id, chat_id, config_json, next_run_at
+               FROM schedules WHERE chat_id = ? AND is_active = 1
+               ORDER BY next_run_at""",
+            (chat_id,),
+        ).fetchall()
+    return [
+        {
+            "schedule_id": row[0],
+            "user_id": row[1],
+            "chat_id": row[2],
+            "config": json.loads(row[3]),
+            "next_run_at": datetime.fromisoformat(row[4]),
+        }
+        for row in rows
+    ]
+
+
+def list_active_schedules() -> List[Dict[str, Any]]:
+    with sqlite3.connect(get_db_path()) as conn:
+        rows = conn.execute(
+            """SELECT schedule_id, user_id, chat_id, config_json, next_run_at
+               FROM schedules WHERE is_active = 1 ORDER BY next_run_at"""
+        ).fetchall()
+    return [
+        {
+            "schedule_id": row[0],
+            "user_id": row[1],
+            "chat_id": row[2],
+            "config": json.loads(row[3]),
+            "next_run_at": datetime.fromisoformat(row[4]),
+        }
+        for row in rows
+    ]
+
+
+def update_schedule_next_run(schedule_id: str, next_run: datetime):
+    with sqlite3.connect(get_db_path()) as conn:
+        conn.execute(
+            "UPDATE schedules SET next_run_at = ? WHERE schedule_id = ? AND is_active = 1",
+            (next_run.isoformat(), schedule_id),
+        )
+        conn.commit()
+
+
+def deactivate_schedule_in_db(schedule_id: str, chat_id: int) -> bool:
+    with sqlite3.connect(get_db_path()) as conn:
+        cursor = conn.execute(
+            "UPDATE schedules SET is_active = 0 WHERE schedule_id = ? AND chat_id = ?",
+            (schedule_id, chat_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
 # ==========================================
 # UTILITIES & SECURITY
 # ==========================================
@@ -213,6 +297,103 @@ def is_domain_allowed(url: str) -> bool:
         return False
 
 
+def _normalize_schedule_days(raw_days: Any) -> Optional[List[int]]:
+    if isinstance(raw_days, list):
+        try:
+            days = sorted({int(day) for day in raw_days})
+        except (TypeError, ValueError):
+            return None
+        return days if days and all(0 <= day <= 6 for day in days) else None
+
+    value = str(raw_days or "daily").strip().lower()
+    if value in {"daily", "every day", "everyday"}:
+        return list(range(7))
+    if value in {"weekdays", "weekday", "workdays"}:
+        return [0, 1, 2, 3, 4]
+    if value in {"weekends", "weekend"}:
+        return [5, 6]
+
+    names = {"mon": 0, "monday": 0, "tue": 1, "tues": 1, "tuesday": 1,
+             "wed": 2, "wednesday": 2, "thu": 3, "thur": 3, "thurs": 3,
+             "thursday": 3, "fri": 4, "friday": 4, "sat": 5, "saturday": 5,
+             "sun": 6, "sunday": 6}
+    tokens = [token.strip() for token in value.split(",") if token.strip()]
+    if not tokens or any(token not in names for token in tokens):
+        return None
+    return sorted({names[token] for token in tokens})
+
+
+def normalize_schedule_config(raw_config: Any) -> Optional[Dict[str, Any]]:
+    """Validate a schedule before it is persisted or executed."""
+    if not isinstance(raw_config, dict):
+        return None
+
+    try:
+        schedule_time = datetime.strptime(str(raw_config.get("schedule_time", "")), "%H:%M").strftime("%H:%M")
+    except (TypeError, ValueError):
+        return None
+
+    timezone_name = str(raw_config.get("timezone", "UTC")).strip()
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+    days = _normalize_schedule_days(raw_config.get("days", "daily"))
+    if not days:
+        return None
+
+    raw_urls = raw_config.get("urls", [])
+    if isinstance(raw_urls, str):
+        raw_urls = [url.strip() for url in raw_urls.split(",") if url.strip()]
+    if not isinstance(raw_urls, list):
+        return None
+
+    urls = []
+    for raw_url in raw_urls[:10]:
+        url = str(raw_url).strip()
+        if not is_valid_url(url) or not is_domain_allowed(url):
+            return None
+        if url not in urls:
+            urls.append(url)
+    if not urls:
+        return None
+
+    delivery_mode = str(raw_config.get("delivery_mode", "combined")).strip().lower()
+    if delivery_mode not in {"combined", "separate"}:
+        delivery_mode = "combined"
+
+    summary_prompt = str(raw_config.get("summary_prompt", "Summarize the latest important updates from these pages.")).strip()[:500]
+    if not summary_prompt:
+        return None
+
+    return {
+        "schedule_time": schedule_time,
+        "timezone": timezone_name,
+        "days": days,
+        "urls": urls,
+        "delivery_mode": delivery_mode,
+        "summary_prompt": summary_prompt,
+    }
+
+
+def calculate_next_schedule_run(config: Dict[str, Any], now: Optional[datetime] = None) -> datetime:
+    """Return the next timezone-aware run strictly after `now`."""
+    timezone = ZoneInfo(config["timezone"])
+    current = now or datetime.now(timezone)
+    current = current.replace(tzinfo=timezone) if current.tzinfo is None else current.astimezone(timezone)
+    hour, minute = (int(part) for part in config["schedule_time"].split(":"))
+    candidate_date = current.date()
+
+    for _ in range(8):
+        candidate = datetime.combine(candidate_date, datetime_time(hour, minute), tzinfo=timezone)
+        if candidate > current and candidate.weekday() in config["days"]:
+            return candidate
+        candidate_date += timedelta(days=1)
+
+    raise ValueError("Schedule has no runnable day")
+
+
 def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
     """Validate and convert an AI-produced intent into allowlisted pipeline actions."""
     if not isinstance(raw_plan, dict):
@@ -220,6 +401,10 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
 
     mode = str(raw_plan.get("mode", "")).strip().lower()
     mode = {"monitor": "watch", "poll": "watch", "track": "watch"}.get(mode, mode)
+    if mode == "schedule":
+        schedule_config = normalize_schedule_config(raw_plan)
+        return {"mode": "schedule", "schedule": schedule_config} if schedule_config else None
+
     url = str(raw_plan.get("url", "")).strip()
     if mode not in {"check", "watch"} or not is_valid_url(url) or not is_domain_allowed(url):
         return None
@@ -258,20 +443,28 @@ NATURAL_LANGUAGE_SYSTEM_PROMPT = """
 You translate a user's plain-language web automation request into JSON only.
 Never return Markdown, code, or extra keys. Use exactly this object shape:
 {
-  "mode": "check" | "watch" | "unknown",
-  "url": "http or https URL, or empty string",
+  "mode": "check" | "watch" | "schedule" | "unknown",
+  "url": "http or https URL for check/watch, or empty string",
   "request": "information to extract for a one-time check",
   "condition": "condition to monitor for a watcher",
   "condition_type": "ai" | "contains",
   "interval_seconds": integer,
+  "schedule_time": "HH:MM for a schedule",
+  "timezone": "IANA timezone for a schedule",
+  "days": "daily, weekdays, weekends, or comma-separated weekday names",
+  "urls": ["http or https URLs for a schedule"],
+  "delivery_mode": "combined" | "separate",
+  "summary_prompt": "summary instructions for a schedule",
   "reply_summary": "short confirmation"
 }
 Rules:
 - Extract only an explicit http:// or https:// URL from the user message.
 - Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
 - Use mode check for a one-time lookup, extraction, summary, or screenshot.
+- Use mode schedule for a recurring briefing at a time of day; put every source URL in urls.
 - Use condition_type contains only when a literal text match is clearly requested; otherwise use ai.
 - Default interval_seconds to 60 and never choose less than 30.
+- Default schedule timezone to UTC, schedule days to weekdays, and delivery_mode to combined.
 - If there is no valid URL or no clear web request, use mode unknown.
 """.strip()
 
@@ -367,6 +560,7 @@ async def start_browser_pool(application: Application):
     logger.info("Browser Pool Ready.")
     
     await restore_watchers_from_db(application.bot)
+    await restore_schedules_from_db(application.bot)
 
 async def restore_watchers_from_db(context_bot):
     try:
@@ -389,11 +583,102 @@ async def restore_watchers_from_db(context_bot):
     except Exception as e:
         logger.error(f"Failed to restore watchers from DB: {e}")
 
+async def run_scheduled_briefing(schedule: Dict[str, Any], context_bot):
+    config = schedule["config"]
+    sections = []
+    for url in config["urls"]:
+        screenshot_path = None
+        try:
+            async with task_semaphore:
+                result = await asyncio.wait_for(
+                    run_browser_task(
+                        url,
+                        [f"ai_extract:{config['summary_prompt']}"],
+                        schedule["user_id"],
+                    ),
+                    timeout=COMMAND_TIMEOUT,
+                )
+            screenshot_path = result.get("screenshot")
+            extracted = "\n\n".join(result.get("extracted", [])) or "No summary was extracted."
+            sections.append(f"*{result.get('title', 'Web page')}*\n🔗 {url}\n{extracted}")
+        except Exception as exc:
+            logger.warning("Scheduled briefing failed for %s: %s", url, exc)
+            sections.append(f"⚠️ Could not summarize {url}.")
+        finally:
+            if screenshot_path and os.path.exists(screenshot_path):
+                os.remove(screenshot_path)
+
+    if not sections:
+        return
+    if config["delivery_mode"] == "separate":
+        for section in sections:
+            await context_bot.send_message(
+                chat_id=schedule["chat_id"],
+                text=truncate_text("☀️ *Scheduled briefing*\n\n" + section, 4000),
+                parse_mode="Markdown",
+            )
+    else:
+        await context_bot.send_message(
+            chat_id=schedule["chat_id"],
+            text=truncate_text(
+                "☀️ *Scheduled morning briefing*\n\n" + "\n\n".join(sections),
+                4000,
+            ),
+            parse_mode="Markdown",
+        )
+
+
+async def scheduled_schedule_worker(schedule: Dict[str, Any], context_bot):
+    schedule_id = schedule["schedule_id"]
+    config = schedule["config"]
+    timezone = ZoneInfo(config["timezone"])
+    try:
+        while True:
+            now = datetime.now(timezone)
+            next_run = schedule["next_run_at"].astimezone(timezone)
+            delay = max(0, (next_run - now).total_seconds())
+            await asyncio.sleep(delay)
+            try:
+                await run_scheduled_briefing(schedule, context_bot)
+            except Exception:
+                logger.exception("Scheduled briefing %s delivery failed; retaining schedule", schedule_id)
+            next_run = calculate_next_schedule_run(config, datetime.now(timezone))
+            schedule["next_run_at"] = next_run
+            update_schedule_next_run(schedule_id, next_run)
+    except asyncio.CancelledError:
+        logger.info("Schedule %s was cancelled.", schedule_id)
+    except Exception:
+        logger.exception("Schedule %s stopped unexpectedly", schedule_id)
+    finally:
+        active_schedules.pop(schedule_id, None)
+
+
+def start_schedule_task(schedule: Dict[str, Any], context_bot):
+    schedule_id = schedule["schedule_id"]
+    current_task = active_schedules.get(schedule_id)
+    if current_task and not current_task.done():
+        return
+    active_schedules[schedule_id] = asyncio.create_task(
+        scheduled_schedule_worker(schedule, context_bot)
+    )
+
+
+async def restore_schedules_from_db(context_bot):
+    restored_count = 0
+    for schedule in list_active_schedules():
+        start_schedule_task(schedule, context_bot)
+        restored_count += 1
+    if restored_count:
+        logger.info("Restored %s scheduled briefing(s) from SQLite.", restored_count)
+
+
 async def stop_browser_pool(application: Application):
     logger.info("Shutting down Browser Pool...")
     for user_watchers in active_watchers.values():
         for task in user_watchers.values():
             task.cancel()
+    for task in list(active_schedules.values()):
+        task.cancel()
     if pool.browser: await pool.browser.close()
     if pool.playwright: await pool.playwright.stop()
 
@@ -565,6 +850,102 @@ async def watcher_loop(chat_id: int, url: str, actions: List[str], interval: int
 # ==========================================
 # TELEGRAM HANDLERS
 # ==========================================
+def create_schedule(user_id: int, chat_id: int, config: Dict[str, Any], context_bot) -> tuple[str, datetime]:
+    schedule_id = uuid.uuid4().hex[:6]
+    next_run = calculate_next_schedule_run(config)
+    save_schedule_to_db(schedule_id, user_id, chat_id, config, next_run)
+    schedule = {
+        "schedule_id": schedule_id,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "config": config,
+        "next_run_at": next_run,
+    }
+    start_schedule_task(schedule, context_bot)
+    return schedule_id, next_run
+
+
+def format_schedule(schedule: Dict[str, Any]) -> str:
+    config = schedule["config"]
+    next_run = schedule["next_run_at"].astimezone(ZoneInfo(config["timezone"]))
+    return (
+        f"`{schedule['schedule_id']}` — {config['schedule_time']} {config['timezone']} — "
+        f"next: {next_run.strftime('%Y-%m-%d %H:%M %Z')} — {len(config['urls'])} URL(s)"
+    )
+
+
+@restricted
+@rate_limited
+async def schedule_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a schedule with: time timezone days delivery urls | summary prompt."""
+    raw = " ".join(context.args).strip()
+    if not raw or "|" not in raw:
+        return await update.message.reply_text(
+            "Usage: `/schedule 08:00 Europe/London weekdays combined "
+            "https://example.com/news,https://example.org/releases | Summarize the updates`",
+            parse_mode="Markdown",
+        )
+
+    header, summary_prompt = [part.strip() for part in raw.split("|", 1)]
+    header_parts = header.split(maxsplit=4)
+    if len(header_parts) != 5:
+        return await update.message.reply_text(
+            "⚠️ Provide: time timezone days combined|separate url1,url2 | summary prompt",
+            parse_mode="Markdown",
+        )
+
+    schedule_time, timezone_name, days, delivery_mode, urls = header_parts
+    config = normalize_schedule_config({
+        "schedule_time": schedule_time,
+        "timezone": timezone_name,
+        "days": days,
+        "delivery_mode": delivery_mode,
+        "urls": urls,
+        "summary_prompt": summary_prompt,
+    })
+    if not config:
+        return await update.message.reply_text(
+            "⚠️ Invalid schedule. Check the time, IANA timezone, days, URLs, and domain whitelist."
+        )
+
+    schedule_id, next_run = create_schedule(
+        update.effective_user.id,
+        update.effective_chat.id,
+        config,
+        context.bot,
+    )
+    log_audit(update.effective_user.id, "/schedule", None, f"CREATED_SCHEDULE_{schedule_id}")
+    await update.message.reply_text(
+        f"✅ Scheduled briefing `{schedule_id}` created.\nNext run: "
+        f"{next_run.astimezone(ZoneInfo(config['timezone'])).strftime('%Y-%m-%d %H:%M %Z')}",
+        parse_mode="Markdown",
+    )
+
+
+@restricted
+async def list_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    schedules = list_schedules_for_chat(update.effective_chat.id)
+    if not schedules:
+        return await update.message.reply_text("You have no active scheduled briefings.")
+    message = "*Scheduled briefings:*\n" + "\n".join(format_schedule(schedule) for schedule in schedules)
+    await update.message.reply_text(truncate_text(message, 4000), parse_mode="Markdown")
+
+
+@restricted
+async def unschedule_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("⚠️ Provide a schedule ID. Use `/schedules` to list them.", parse_mode="Markdown")
+    schedule_id = context.args[0].strip()
+    task = active_schedules.get(schedule_id)
+    if task:
+        task.cancel()
+    deleted = deactivate_schedule_in_db(schedule_id, update.effective_chat.id)
+    if not deleted:
+        return await update.message.reply_text("⚠️ Schedule not found.")
+    log_audit(update.effective_user.id, "/unschedule", None, f"STOPPED_SCHEDULE_{schedule_id}")
+    await update.message.reply_text(f"✅ Schedule `{schedule_id}` stopped.", parse_mode="Markdown")
+
+
 @restricted
 @rate_limited
 async def check_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -662,6 +1043,17 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
             "http:// or https:// URL and describe what to check."
         )
         log_audit(user_id, "natural_language", None, "INVALID_INTENT")
+        return
+
+    if plan["mode"] == "schedule":
+        config = plan["schedule"]
+        schedule_id, next_run = create_schedule(user_id, chat_id, config, context.bot)
+        log_audit(user_id, "natural_language_schedule", None, f"CREATED_SCHEDULE_{schedule_id}")
+        await status_msg.edit_text(
+            f"✅ Scheduled briefing `{schedule_id}` created.\nNext run: "
+            f"{next_run.astimezone(ZoneInfo(config['timezone'])).strftime('%Y-%m-%d %H:%M %Z')}",
+            parse_mode="Markdown",
+        )
         return
 
     if plan["mode"] == "check":
@@ -776,6 +1168,9 @@ def main():
     
     app.add_handler(CommandHandler("check", check_url))
     app.add_handler(CommandHandler("watch", watch_url))
+    app.add_handler(CommandHandler("schedule", schedule_briefing))
+    app.add_handler(CommandHandler("schedules", list_schedules))
+    app.add_handler(CommandHandler("unschedule", unschedule_briefing))
     app.add_handler(CommandHandler("watchers", list_watchers))
     app.add_handler(CommandHandler("stopwatch", stop_watch))
     app.add_handler(CommandHandler("sessions", list_sessions))

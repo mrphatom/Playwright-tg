@@ -3,7 +3,9 @@ import os
 import sqlite3
 import json
 import asyncio
+from datetime import datetime, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 # Set environment variable BEFORE importing bot module so bot uses test_telescout.db
 os.environ["DB_PATH"] = "test_telescout.db"
@@ -17,7 +19,13 @@ from bot import (
     load_encrypted_session,
     init_db,
     normalize_natural_language_plan,
-    mask_sensitive_action
+    mask_sensitive_action,
+    normalize_schedule_config,
+    calculate_next_schedule_run,
+    save_schedule_to_db,
+    list_schedules_for_chat,
+    deactivate_schedule_in_db,
+    restore_schedules_from_db
 )
 
 @pytest.fixture(autouse=True)
@@ -138,6 +146,130 @@ def test_natural_language_parser_accepts_fenced_json(monkeypatch):
 
     assert plan["mode"] == "watch"
     assert plan["actions"] == ["condition_contains:Apple Pie is in stock"]
+
+
+def test_schedule_config_normalizes_timezone_days_urls_and_delivery(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    config = normalize_schedule_config({
+        "schedule_time": "08:00",
+        "timezone": "Europe/London",
+        "days": "weekdays",
+        "urls": ["https://example.com/news", "https://example.org/releases"],
+        "delivery_mode": "combined",
+        "summary_prompt": "Summarize the important updates",
+    })
+
+    assert config == {
+        "schedule_time": "08:00",
+        "timezone": "Europe/London",
+        "days": [0, 1, 2, 3, 4],
+        "urls": ["https://example.com/news", "https://example.org/releases"],
+        "delivery_mode": "combined",
+        "summary_prompt": "Summarize the important updates",
+    }
+
+
+def test_schedule_config_rejects_invalid_timezone_or_url(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    assert normalize_schedule_config({
+        "schedule_time": "08:00",
+        "timezone": "Not/AZone",
+        "days": "daily",
+        "urls": ["https://example.com"],
+        "delivery_mode": "combined",
+        "summary_prompt": "Summarize it",
+    }) is None
+    assert normalize_schedule_config({
+        "schedule_time": "08:00",
+        "timezone": "UTC",
+        "days": "daily",
+        "urls": ["javascript:alert(1)"],
+        "delivery_mode": "combined",
+        "summary_prompt": "Summarize it",
+    }) is None
+
+
+def test_natural_language_schedule_plan_normalizes_to_schedule(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = normalize_natural_language_plan({
+        "mode": "schedule",
+        "schedule_time": "08:00",
+        "timezone": "UTC",
+        "days": "weekdays",
+        "urls": ["https://example.com/news"],
+        "delivery_mode": "separate",
+        "summary_prompt": "Summarize the latest updates",
+    })
+
+    assert plan["mode"] == "schedule"
+    assert plan["schedule"]["delivery_mode"] == "separate"
+    assert plan["schedule"]["days"] == [0, 1, 2, 3, 4]
+
+
+def test_schedule_crud_persists_and_deactivates(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    config = normalize_schedule_config({
+        "schedule_time": "08:00",
+        "timezone": "UTC",
+        "days": "daily",
+        "urls": ["https://example.com"],
+        "delivery_mode": "combined",
+        "summary_prompt": "Summarize it",
+    })
+    next_run = calculate_next_schedule_run(config, datetime(2026, 8, 20, 7, 0, tzinfo=ZoneInfo("UTC")))
+
+    save_schedule_to_db("abc123", 7, 99, config, next_run)
+    rows = list_schedules_for_chat(99)
+
+    assert len(rows) == 1
+    assert rows[0]["schedule_id"] == "abc123"
+    assert rows[0]["config"] == config
+    assert deactivate_schedule_in_db("abc123", 99) is True
+    assert list_schedules_for_chat(99) == []
+
+
+def test_restore_schedules_recreates_active_task_and_cancels_cleanly():
+    import bot
+    config = {
+        "schedule_time": "08:00",
+        "timezone": "UTC",
+        "days": list(range(7)),
+        "urls": ["https://example.com"],
+        "delivery_mode": "combined",
+        "summary_prompt": "Summarize it",
+    }
+    next_run = datetime.now(ZoneInfo("UTC")) + timedelta(hours=1)
+    save_schedule_to_db("restore1", 7, 99, config, next_run)
+
+    async def exercise_restore():
+        bot.active_schedules.clear()
+        await restore_schedules_from_db(SimpleNamespace())
+        assert "restore1" in bot.active_schedules
+        task = bot.active_schedules["restore1"]
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise_restore())
+
+
+def test_next_schedule_run_uses_timezone_and_skips_weekends():
+    config = {
+        "schedule_time": "08:00",
+        "timezone": "Europe/London",
+        "days": [0, 1, 2, 3, 4],
+    }
+    now = datetime(2026, 8, 21, 8, 30, tzinfo=ZoneInfo("Europe/London"))
+
+    next_run = calculate_next_schedule_run(config, now)
+
+    assert next_run == datetime(2026, 8, 24, 8, 0, tzinfo=ZoneInfo("Europe/London"))
 
 
 def test_sensitive_natural_language_actions_are_redacted():
