@@ -99,6 +99,32 @@ def test_url_validation_strictness():
     assert is_valid_url("http://localhost:8080") is False
 
 
+def test_domain_policy_supports_exact_and_wildcard_patterns(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["example.com"])
+    assert bot.is_domain_allowed("https://example.com") is True
+    assert bot.is_domain_allowed("https://docs.example.com") is True
+    assert bot.is_domain_allowed("https://other.example.net") is False
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    bot.set_domain_policy("*.widgets.example", "allow", 6411860985)
+    assert bot.is_domain_allowed("https://shop.widgets.example") is True
+    assert bot.is_domain_allowed("https://widgets.example") is False
+    bot.set_domain_policy("widgets.example", "deny", 6411860985)
+    assert bot.is_domain_allowed("https://shop.widgets.example") is False
+    bot.remove_domain_policy("widgets.example")
+    assert bot.is_domain_allowed("https://shop.widgets.example") is True
+
+
+def test_domain_policy_rejects_unsafe_patterns():
+    import bot
+
+    for pattern in ("https://example.com", "example.com/path", "127.0.0.1", "*.*.example.com", "user@example.com"):
+        with pytest.raises(ValueError):
+            bot.normalize_domain_pattern(pattern)
+
+
 def test_public_mode_requires_domain_allowlist(monkeypatch):
     import bot
     monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
