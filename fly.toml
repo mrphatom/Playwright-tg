@@ -18,7 +18,10 @@ primary_region = "iad"
   
   COMMAND_TIMEOUT = "90"
   
-  ALLOWED_DOMAINS = ""
+  PUBLIC_MODE = "true"
+  ALLOWED_DOMAINS = "github.com,amazon.com,news.ycombinator.com,google.com,x.com"
+  DASHBOARD_BASE_URL = "https://playwright-tg-mrphatom.fly.dev"
+  PORT = "8080"
   
 
 
@@ -43,6 +46,28 @@ primary_region = "iad"
 [[restart]]
 
   policy = "always"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.http_checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/"
   
 
 

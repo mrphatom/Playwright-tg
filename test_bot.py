@@ -41,6 +41,17 @@ def test_url_validation_strictness():
     assert is_valid_url("https://example.com") is True
     assert is_valid_url("http://example.com/path?args=1") is True
     assert is_valid_url("ftp://server.com") is False
+    assert is_valid_url("http://127.0.0.1/admin") is False
+    assert is_valid_url("http://localhost:8080") is False
+
+
+def test_public_mode_requires_domain_allowlist(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    monkeypatch.setenv("PUBLIC_MODE", "true")
+    assert is_domain_allowed("https://example.com") is False
+    monkeypatch.setenv("PUBLIC_MODE", "false")
+    assert is_domain_allowed("https://example.com") is True
 
 def test_path_traversal_prevention():
     assert sanitize_session_name("my_twitter_login") == "my_twitter_login"

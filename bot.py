@@ -7,6 +7,8 @@ import uuid
 import json
 import sqlite3
 import base64
+import secrets
+import ipaddress
 from datetime import datetime, timedelta, time as datetime_time
 from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse
@@ -20,6 +22,40 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 import google.generativeai as genai
 from cryptography.fernet import Fernet
 import psutil
+from telegram import LabeledPrice
+from telegram.ext import PreCheckoutQueryHandler
+
+from dashboard import serve_dashboard
+
+from control_plane import (
+    init_platform_db,
+    public_mode,
+    create_dashboard_login_token,
+    ensure_user,
+    get_user,
+    is_allowed_user,
+    is_admin,
+    consume_quota,
+    set_user_status,
+    set_user_role,
+    search_users,
+    list_reports,
+    list_appeals,
+    create_report,
+    create_appeal,
+    resolve_report,
+    resolve_appeal,
+    record_admin_action,
+    record_payment_order,
+    get_payment_order_by_external_id,
+    attach_payment_charge,
+    mark_payment_success,
+    calibrate_risk_decision,
+    record_risk_event,
+    list_operations,
+    create_operation,
+    update_operation,
+)
 
 # ==========================================
 # CONFIGURATION & LOGGING
@@ -35,6 +71,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 ALLOWED_USERS = set(int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_USERS", "").split(",") if uid.strip().isdigit())
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "90"))
+CRYPTO_CHECKOUT_URL = os.getenv("CRYPTO_CHECKOUT_URL")
+DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "")
+PRO_PLAN_STARS = int(os.getenv("PRO_PLAN_STARS", "100"))
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 # Domain Whitelist (Comma separated domains, e.g. "github.com,amazon.com". Leave empty to allow all)
@@ -48,6 +87,8 @@ PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
 # Encryption Key for Sessions at Rest
 ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY")
 if not ENCRYPTION_KEY:
+    if os.getenv("PUBLIC_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        raise RuntimeError("SESSION_ENCRYPTION_KEY is required when PUBLIC_MODE is enabled")
     token_seed = (TELEGRAM_BOT_TOKEN or "default_secret_seed").encode("utf-8")
     ENCRYPTION_KEY = base64.urlsafe_b64encode(token_seed.ljust(32)[:32]).decode("utf-8")
 
@@ -140,6 +181,7 @@ def init_db():
             )
         """)
         conn.commit()
+    init_platform_db()
     logger.info("Database initialized successfully.")
 
 def log_audit(user_id: int, command: str, target_url: Optional[str], status: str):
@@ -291,11 +333,24 @@ def deactivate_schedule_in_db(schedule_id: str, chat_id: int) -> bool:
 def is_valid_url(url: str) -> bool:
     try:
         result = urlparse(url)
-        return all([result.scheme in ['http', 'https'], result.netloc])
+        if result.scheme not in {"http", "https"} or not result.hostname:
+            return False
+        hostname = result.hostname.rstrip(".").lower()
+        if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local"):
+            return False
+        try:
+            address = ipaddress.ip_address(hostname)
+            if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved or address.is_multicast or address.is_unspecified:
+                return False
+        except ValueError:
+            pass
+        return True
     except Exception:
         return False
 
 def is_domain_allowed(url: str) -> bool:
+    if public_mode() and not ALLOWED_DOMAINS:
+        return False
     if not ALLOWED_DOMAINS:
         return True
     try:
@@ -470,6 +525,23 @@ def parse_deterministic_management_request(user_text: str) -> Optional[Dict[str,
         return {"mode": "health"}
     if re.search(r"\b(?:help|what\s+can\s+you\s+do|capabilities|commands)\b", text):
         return {"mode": "help"}
+    if re.search(r"\b(?:review|show|list)\b.*\breports?\b", text):
+        return {"mode": "admin_reports"}
+    if re.search(r"\b(?:review|show|list)\b.*\bappeals?|tickets?\b", text):
+        return {"mode": "admin_appeals"}
+    search_match = re.search(r"\b(?:search|find|look\s+up)\s+(?:for\s+)?user\s+(.+)$", text)
+    if search_match:
+        return {"mode": "admin_search_user", "query": search_match.group(1).strip()[:100]}
+    ban_match = re.search(r"\bban\s+user\s+(\d+)\s*(.*)$", text)
+    if ban_match:
+        return {"mode": "admin_ban", "target_user_id": int(ban_match.group(1)), "reason": ban_match.group(2).strip()[:500] or "admin action"}
+    unban_match = re.search(r"\bunban\s+user\s+(\d+)\b", text)
+    if unban_match:
+        return {"mode": "admin_unban", "target_user_id": int(unban_match.group(1))}
+    if re.search(r"\b(?:appeal|open\s+(?:a\s+)?ticket)\b", text):
+        return {"mode": "create_appeal", "message": text[:4000]}
+    if re.search(r"\breport\b", text):
+        return {"mode": "create_report", "message": text[:4000]}
     if re.search(r"\b(?:show|list|view|display)\b.*\b(?:saved\s+)?sessions?\b", text):
         return {"mode": "list_sessions"}
     if re.search(r"\b(?:show|list|view|display)\b.*\b(?:active\s+)?watchers?\b", text):
@@ -667,6 +739,44 @@ async def generate_chat_reply(chat_id: int, user_text: str) -> str:
     except Exception:
         logger.exception("Conversational reply failed")
         return "I couldn't generate a reply right now. Please try again in a moment."
+
+
+async def review_recent_activity_with_ai(user_id: int, operation_id: str) -> None:
+    """Run a conservative advisory review; it can create review work, never sanctions."""
+    if not ai_model:
+        return
+    try:
+        recent = [
+            {
+                "kind": row["kind"],
+                "status": row["status"],
+                "target_url": row["target_url"],
+                "attempts": row["attempt_count"],
+            }
+            for row in list_operations(user_id, 20)
+        ]
+        prompt = (
+            "You are a conservative abuse-triage reviewer. Analyze only the redacted execution metadata below. "
+            'Return JSON exactly: {"score":0.0,"confidence":0.0,"evidence":["short evidence"],"reason":"short reason"}. '
+            "Do not infer identity, intent, or wrongdoing from a single normal failure. Low-confidence or ambiguous activity must score low. "
+            "Never recommend a ban, suspension, or access limit; a strong signal may only request human review.\n"
+            + json.dumps(recent, separators=(",", ":"))
+        )
+        response = await asyncio.to_thread(
+            ai_model.generate_content,
+            prompt,
+            generation_config={"temperature": 0.0, "max_output_tokens": 512},
+        )
+        result = parse_json_object(response.text or "")
+        score = float(result.get("score", 0.0))
+        confidence = float(result.get("confidence", 0.0))
+        decision = calibrate_risk_decision(score, confidence)
+        evidence = {"items": result.get("evidence", [])[:5], "reason": str(result.get("reason", ""))[:500]}
+        risk_id = record_risk_event(user_id, operation_id, score, confidence, decision, evidence, GEMINI_MODEL, decision == "human_review")
+        if decision == "human_review":
+            create_report(user_id, "automated_safety_review", f"Advisory risk event {risk_id} requires human review. No automatic account action was taken.")
+    except Exception:
+        logger.exception("advisory_activity_review_failed operation_id=%s", operation_id)
 
 
 def parse_deterministic_login_request(user_text: str) -> Optional[Dict[str, Any]]:
@@ -907,10 +1017,14 @@ def mask_sensitive_action(action: str) -> str:
 # ==========================================
 def restricted(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id
-        if not ALLOWED_USERS or user_id not in ALLOWED_USERS:
-            logger.warning(f"Unauthorized access by ID {user_id}")
-            log_audit(user_id, func.__name__, None, "DENIED_UNAUTHORIZED")
+        user = update.effective_user
+        user_id = user.id
+        ensure_user(user_id, getattr(user, "username", None), getattr(user, "full_name", None))
+        if not is_allowed_user(user_id):
+            logger.warning("authorization_denied user_id=%s handler=%s", user_id, func.__name__)
+            log_audit(user_id, func.__name__, None, "DENIED_UNAUTHORIZED_OR_ACCOUNT_STATE")
+            if update.message:
+                await update.message.reply_text("⛔ Your account is not currently allowed to use this bot. Use /appeal to contact support.")
             return
         return await func(update, context, *args, **kwargs)
     return wrapper
@@ -931,6 +1045,7 @@ def rate_limited(func):
 # ==========================================
 async def start_browser_pool(application: Application):
     init_db()
+    application.bot_data["dashboard_task"] = asyncio.create_task(serve_dashboard())
     logger.info("Initializing Global Browser Pool...")
     pool.playwright = await async_playwright().start()
     pool.browser = await pool.playwright.chromium.launch(
@@ -967,12 +1082,16 @@ async def run_browser_task_with_retry(url: str, actions: List[str], user_id: int
     last_error = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
+            update_operation(operation_id, "running", attempt)
             runtime_metrics["browser_tasks_total"] += 1
             logger.info("browser_task_start operation_id=%s attempt=%s", operation_id, attempt)
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 run_browser_task(url, actions, user_id, status_msg),
                 timeout=COMMAND_TIMEOUT,
             )
+            update_operation(operation_id, "succeeded", attempt)
+            asyncio.create_task(review_recent_activity_with_ai(user_id, operation_id))
+            return result
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -984,13 +1103,17 @@ async def run_browser_task_with_retry(url: str, actions: List[str], user_id: int
                 type(exc).__name__,
             )
             if attempt < attempts:
+                update_operation(operation_id, "retrying", attempt)
                 await asyncio.sleep(min(2 ** (attempt - 1), 4))
+    update_operation(operation_id, "failed", max(1, attempts))
+    asyncio.create_task(review_recent_activity_with_ai(user_id, operation_id))
     raise last_error or RuntimeError("browser task failed")
 
 
 async def run_scheduled_briefing(schedule: Dict[str, Any], context_bot):
     config = schedule["config"]
     operation_id = uuid.uuid4().hex[:12]
+    create_operation(operation_id, schedule["user_id"], schedule["chat_id"], "scheduled_briefing")
     runtime_metrics["scheduled_runs_total"] += 1
     sections = []
     for url in config["urls"]:
@@ -1083,6 +1206,9 @@ async def restore_schedules_from_db(context_bot):
 
 
 async def stop_browser_pool(application: Application):
+    dashboard_task = application.bot_data.get("dashboard_task")
+    if dashboard_task:
+        dashboard_task.cancel()
     logger.info("Shutting down Browser Pool...")
     for user_watchers in active_watchers.values():
         for task in user_watchers.values():
@@ -1305,6 +1431,9 @@ def format_schedule(schedule: Dict[str, Any]) -> str:
 @rate_limited
 async def schedule_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Create a schedule with: time timezone days delivery urls | summary prompt."""
+    allowed, used, limit = consume_quota(update.effective_user.id)
+    if not allowed:
+        return await update.message.reply_text(f"⏳ Free-plan limit reached ({used}/{limit}). Use /upgrade.")
     raw = " ".join(context.args).strip()
     if not raw or "|" not in raw:
         return await update.message.reply_text(
@@ -1378,6 +1507,9 @@ async def unschedule_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def check_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    allowed, used, limit = consume_quota(user_id)
+    if not allowed:
+        return await update.message.reply_text(f"⏳ Free-plan limit reached ({used}/{limit}). Use /upgrade.")
     cmd_str = " ".join(context.args)
     if not cmd_str: return await update.message.reply_text("⚠️ Provide a URL.")
 
@@ -1420,6 +1552,9 @@ async def check_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def watch_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    allowed, used, limit = consume_quota(user_id)
+    if not allowed:
+        return await update.message.reply_text(f"⏳ Free-plan limit reached ({used}/{limit}). Use /upgrade.")
     cmd_str = " ".join(context.args)
     
     if not cmd_str: return await update.message.reply_text("⚠️ Usage: `/watch https://site.com | every:60 | condition_contains:Stock`", parse_mode='Markdown')
@@ -1453,6 +1588,256 @@ async def watch_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👀 *Watcher Started & Persisted*\nID: `{watcher_id}`\nInterval: `{interval}s`\nTarget: {url}", parse_mode='Markdown')
 
 @restricted
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not DASHBOARD_BASE_URL:
+        return await update.message.reply_text("The dashboard URL is not configured yet.")
+    token = create_dashboard_login_token(update.effective_user.id)
+    base = DASHBOARD_BASE_URL.rstrip("/")
+    await update.message.reply_text(f"🔐 One-time dashboard link (expires soon):\n{base}/login?token={token}")
+
+
+@restricted
+async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    payload = "pro:" + secrets.token_urlsafe(16)
+    order_id, created = record_payment_order(
+        user_id,
+        "telegram_stars",
+        payload,
+        PRO_PLAN_STARS,
+        "XTR",
+        {"plan": "pro", "telegram_user_id": user_id},
+    )
+    if not created:
+        order = get_payment_order_by_external_id("telegram_stars", payload)
+        order_id = order["order_id"] if order else order_id
+    await update.message.reply_invoice(
+        title="GreyAI Pro",
+        description="Higher execution limits and priority access for 30 days.",
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice("GreyAI Pro — 30 days", PRO_PLAN_STARS)],
+        start_parameter="greyai-pro",
+    )
+    log_audit(user_id, "/upgrade", None, f"INVOICE_{order_id}")
+
+
+async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    user_id = query.from_user.id
+    ensure_user(user_id, getattr(query.from_user, "username", None), getattr(query.from_user, "full_name", None))
+    order = get_payment_order_by_external_id("telegram_stars", query.invoice_payload)
+    valid = bool(
+        order
+        and order["user_id"] == user_id
+        and order["status"] == "pending"
+        and order["amount"] == query.total_amount
+        and order["currency"] == query.currency == "XTR"
+    )
+    if valid:
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="This invoice is no longer valid. Please create a new one with /upgrade.")
+
+
+@restricted
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment = update.message.successful_payment
+    user_id = update.effective_user.id
+    order = get_payment_order_by_external_id("telegram_stars", payment.invoice_payload)
+    valid = bool(
+        order
+        and order["user_id"] == user_id
+        and order["status"] == "pending"
+        and order["amount"] == payment.total_amount
+        and order["currency"] == payment.currency == "XTR"
+    )
+    if not valid:
+        log_audit(user_id, "successful_payment", None, "REJECTED_UNMATCHED_RECEIPT")
+        return await update.message.reply_text("⚠️ Payment receipt could not be matched. Support has been notified.")
+    attach_payment_charge(order["order_id"], payment.telegram_payment_charge_id)
+    if mark_payment_success(order["order_id"], "pro", (datetime.utcnow() + timedelta(days=30)).isoformat()):
+        log_audit(user_id, "successful_payment", None, f"GRANTED_PRO_{order['order_id']}")
+        await update.message.reply_text("✅ Pro access activated for 30 days. Your quota has been increased.")
+    else:
+        await update.message.reply_text("✅ This payment was already processed.")
+
+
+@restricted
+async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Terms: paid access grants software usage entitlements, not guaranteed results from third-party websites. Use /paysupport for payment support. Replace this text with your reviewed legal terms before public launch.")
+
+
+@restricted
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Support: use /report for an issue, /appeal for an account review, or /paysupport for a payment issue.")
+
+
+@restricted
+async def paysupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Payment support: include the invoice date, Telegram payment receipt, and a short description. Do not send passwords, API keys, or card details.")
+
+
+@restricted
+async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not CRYPTO_CHECKOUT_URL:
+        return await update.message.reply_text("Crypto checkout is not enabled yet. Use /upgrade for Telegram Stars, or contact the administrator to configure a compliant external provider.")
+    await update.message.reply_text(f"External crypto checkout: {CRYPTO_CHECKOUT_URL}\nOnly complete payment on the configured HTTPS provider page. Do not send a wallet seed phrase or private key.")
+
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        ensure_user(user_id, getattr(update.effective_user, "username", None), getattr(update.effective_user, "full_name", None))
+        if not is_admin(user_id):
+            log_audit(user_id, func.__name__, None, "DENIED_NOT_ADMIN")
+            if update.message:
+                await update.message.reply_text("⛔ Administrator permission is required for this action.")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+def _format_user_row(row) -> str:
+    username = row["username"] or "-"
+    display_name = row["display_name"] or "-"
+    return f"ID={row['telegram_user_id']} username={username} name={display_name} role={row['role']} status={row['status']} plan={row['plan']} quota={row['quota_used']}/{row['quota_limit']} risk={row['risk_score']:.2f}"
+
+
+@admin_only
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>"
+    )
+
+
+@admin_only
+async def grant_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Usage: /grantadmin <Telegram ID>")
+    target_id = int(context.args[0])
+    ensure_user(target_id)
+    set_user_role(target_id, "admin")
+    record_admin_action(update.effective_user.id, "grant_admin", target_id, "administrator role granted")
+    await update.message.reply_text(f"Administrator role granted to {target_id}.")
+
+
+@admin_only
+async def revoke_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Usage: /revokeadmin <Telegram ID>")
+    target_id = int(context.args[0])
+    if target_id == update.effective_user.id:
+        return await update.message.reply_text("You cannot revoke your own administrator role.")
+    set_user_role(target_id, "user")
+    record_admin_action(update.effective_user.id, "revoke_admin", target_id, "administrator role revoked")
+    await update.message.reply_text(f"Administrator role revoked for {target_id}.")
+
+
+@admin_only
+async def admin_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args).strip()
+    if not query:
+        return await update.message.reply_text("Usage: /admin_user <Telegram ID or username>")
+    rows = search_users(query)
+    await update.message.reply_text("No matching users." if not rows else "\n".join(_format_user_row(row) for row in rows))
+
+
+@admin_only
+async def ban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Usage: /ban <Telegram ID> <reason>")
+    target_id = int(context.args[0])
+    target = get_user(target_id)
+    if target and target["role"] == "admin":
+        return await update.message.reply_text("Admin accounts cannot be banned through this command.")
+    reason = " ".join(context.args[1:]).strip()[:500] or "administrator action"
+    ensure_user(target_id)
+    set_user_status(target_id, "banned", reason)
+    record_admin_action(update.effective_user.id, "ban_user", target_id, reason)
+    log_audit(update.effective_user.id, "/ban", None, f"BANNED_{target_id}")
+    await update.message.reply_text(f"User {target_id} banned.")
+
+
+@admin_only
+async def unban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("Usage: /unban <Telegram ID>")
+    target_id = int(context.args[0])
+    set_user_status(target_id, "active", "administrator unbanned user")
+    record_admin_action(update.effective_user.id, "unban_user", target_id, "administrator unbanned user")
+    log_audit(update.effective_user.id, "/unban", None, f"UNBANNED_{target_id}")
+    await update.message.reply_text(f"User {target_id} unbanned.")
+
+
+@admin_only
+async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reports = list_reports()
+    if not reports:
+        return await update.message.reply_text("No open reports.")
+    await update.message.reply_text("\n\n".join(f"{row['report_id']} from {row['reporter_user_id']} [{row['category']}]\n{row['description'][:500]}" for row in reports))
+
+
+@admin_only
+async def appeals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    appeals = list_appeals()
+    if not appeals:
+        return await update.message.reply_text("No open appeals.")
+    await update.message.reply_text("\n\n".join(f"{row['appeal_id']} from {row['user_id']}\n{row['message'][:500]}" for row in appeals))
+
+
+@restricted
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = " ".join(context.args).strip()
+    if not message:
+        return await update.message.reply_text("Usage: /report <what happened>")
+    report_id = create_report(update.effective_user.id, "user_report", message)
+    await update.message.reply_text(f"✅ Report opened: `{report_id}`. An administrator can review it.", parse_mode="Markdown")
+
+
+def appeal_access(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        ensure_user(user.id, getattr(user, "username", None), getattr(user, "full_name", None))
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+@appeal_access
+async def appeal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = " ".join(context.args).strip()
+    if not message:
+        return await update.message.reply_text("Usage: /appeal <why you are requesting review>")
+    appeal_id = create_appeal(update.effective_user.id, message)
+    await update.message.reply_text(f"✅ Appeal ticket opened: `{appeal_id}`.", parse_mode="Markdown")
+
+
+@admin_only
+async def review_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        return await update.message.reply_text("Usage: /review <report_id> <resolved|dismissed> <resolution>")
+    report_id, status = context.args[0], context.args[1]
+    resolution = " ".join(context.args[2:]).strip() or "Reviewed by administrator"
+    if not resolve_report(report_id, update.effective_user.id, status, resolution):
+        return await update.message.reply_text("Report not found.")
+    record_admin_action(update.effective_user.id, "review_report", None, resolution, {"report_id": report_id, "status": status})
+    await update.message.reply_text(f"Report {report_id} updated to {status}.")
+
+
+@admin_only
+async def resolve_appeal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        return await update.message.reply_text("Usage: /resolveappeal <appeal_id> <resolved|denied> <resolution>")
+    appeal_id, status = context.args[0], context.args[1]
+    resolution = " ".join(context.args[2:]).strip() or "Reviewed by administrator"
+    if not resolve_appeal(appeal_id, update.effective_user.id, status, resolution):
+        return await update.message.reply_text("Appeal not found.")
+    record_admin_action(update.effective_user.id, "resolve_appeal", None, resolution, {"appeal_id": appeal_id, "status": status})
+    await update.message.reply_text(f"Appeal {appeal_id} updated to {status}.")
+
+
+@restricted
 @rate_limited
 async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle authorized non-command messages without replacing slash commands."""
@@ -1465,14 +1850,78 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     request_text = update.message.text.strip()
+    create_operation(operation_id, user_id, chat_id, "natural_language")
+    update_operation(operation_id, "running", 0)
 
     plan = await parse_natural_language_intent(request_text, active_session_by_chat.get(chat_id))
+
+    if plan and plan.get("mode") in {"check", "watch", "schedule", "login"}:
+        allowed, used, limit = consume_quota(user_id)
+        if not allowed:
+            await status_msg.edit_text(f"⏳ Free-plan limit reached ({used}/{limit}). Use /upgrade to view paid access options.")
+            log_audit(user_id, "quota", None, "DENIED_LIMIT")
+            update_operation(operation_id, "denied")
+            return
+
+    if plan and plan.get("mode") == "create_report":
+        report_id = create_report(user_id, "user_report", plan["message"])
+        await status_msg.edit_text(f"✅ Report opened: `{report_id}`. An administrator can review it.", parse_mode="Markdown")
+        log_audit(user_id, "natural_language_report", None, f"CREATED_{report_id}")
+        update_operation(operation_id, "succeeded")
+        return
+
+    if plan and plan.get("mode") == "create_appeal":
+        user = get_user(user_id)
+        if user and user["status"] == "banned":
+            await status_msg.edit_text("⛔ A banned account can submit an appeal with `/appeal`, but cannot open a ticket through ordinary chat.", parse_mode="Markdown")
+            update_operation(operation_id, "denied")
+            return
+        appeal_id = create_appeal(user_id, plan["message"])
+        await status_msg.edit_text(f"✅ Appeal ticket opened: `{appeal_id}`.", parse_mode="Markdown")
+        log_audit(user_id, "natural_language_appeal", None, f"CREATED_{appeal_id}")
+        update_operation(operation_id, "succeeded")
+        return
+
+    if plan and plan.get("mode", "").startswith("admin_"):
+        if not is_admin(user_id):
+            await status_msg.edit_text("⛔ Administrator permission is required for that action.")
+            log_audit(user_id, "natural_language_admin", None, "DENIED_NOT_ADMIN")
+            return
+        mode = plan["mode"]
+        if mode == "admin_search_user":
+            rows = search_users(plan["query"])
+            await status_msg.edit_text("No matching users." if not rows else "\n".join(_format_user_row(row) for row in rows))
+            return
+        if mode == "admin_reports":
+            rows = list_reports()
+            await status_msg.edit_text("No open reports." if not rows else "\n\n".join(f"{row['report_id']} from {row['reporter_user_id']} [{row['category']}]\n{row['description'][:500]}" for row in rows))
+            return
+        if mode == "admin_appeals":
+            rows = list_appeals()
+            await status_msg.edit_text("No open appeals." if not rows else "\n\n".join(f"{row['appeal_id']} from {row['user_id']}\n{row['message'][:500]}" for row in rows))
+            return
+        if mode == "admin_ban":
+            target = get_user(plan["target_user_id"])
+            if target and target["role"] == "admin":
+                await status_msg.edit_text("Admin accounts cannot be banned through this command.")
+                return
+            ensure_user(plan["target_user_id"])
+            set_user_status(plan["target_user_id"], "banned", plan["reason"])
+            record_admin_action(user_id, "ban_user", plan["target_user_id"], plan["reason"])
+            await status_msg.edit_text(f"User {plan['target_user_id']} banned.")
+            return
+        if mode == "admin_unban":
+            set_user_status(plan["target_user_id"], "active", "administrator unbanned user")
+            record_admin_action(user_id, "unban_user", plan["target_user_id"], "administrator unbanned user")
+            await status_msg.edit_text(f"User {plan['target_user_id']} unbanned.")
+            return
 
     if not plan:
         reply = await generate_chat_reply(chat_id, request_text)
         remember_chat_turn(chat_id, request_text, reply)
         await status_msg.edit_text(reply)
         log_audit(user_id, "chat", None, "SUCCESS")
+        update_operation(operation_id, "succeeded")
         return
 
     if plan["mode"] == "health":
@@ -1721,6 +2170,13 @@ def build_health_report() -> str:
 
 
 @restricted
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Commands: /check /watch /schedule /schedules /unschedule /watchers /stopwatch /sessions /deletesession /dashboard /upgrade /crypto /report /appeal /support /paysupport /terms /health"
+    )
+
+
+@restricted
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "GreyAI is online. Send a natural-language request, or use /help for the command list."
@@ -1740,7 +2196,28 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(start_browser_pool).post_stop(stop_browser_pool).build()
     
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("admin_user", admin_user_command))
+    app.add_handler(CommandHandler("grantadmin", grant_admin_command))
+    app.add_handler(CommandHandler("revokeadmin", revoke_admin_command))
+    app.add_handler(CommandHandler("ban", ban_user_command))
+    app.add_handler(CommandHandler("unban", unban_user_command))
+    app.add_handler(CommandHandler("reports", reports_command))
+    app.add_handler(CommandHandler("appeals", appeals_command))
+    app.add_handler(CommandHandler("review", review_report_command))
+    app.add_handler(CommandHandler("resolveappeal", resolve_appeal_command))
+    app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("appeal", appeal_command))
+    app.add_handler(CommandHandler("dashboard", dashboard_command))
+    app.add_handler(CommandHandler("upgrade", upgrade_command))
+    app.add_handler(CommandHandler("crypto", crypto_command))
+    app.add_handler(CommandHandler("terms", terms_command))
+    app.add_handler(CommandHandler("support", support_command))
+    app.add_handler(CommandHandler("paysupport", paysupport_command))
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CommandHandler("check", check_url))
     app.add_handler(CommandHandler("watch", watch_url))
     app.add_handler(CommandHandler("schedule", schedule_briefing))
