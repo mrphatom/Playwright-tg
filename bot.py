@@ -401,6 +401,80 @@ def calculate_next_schedule_run(config: Dict[str, Any], now: Optional[datetime] 
     raise ValueError("Schedule has no runnable day")
 
 
+def _normalize_pipeline_actions(raw_actions: Any, mode: str) -> Optional[List[str]]:
+    """Validate model-produced actions against the existing browser action grammar."""
+    if raw_actions is None:
+        return []
+    if not isinstance(raw_actions, list) or len(raw_actions) > 30:
+        return None
+
+    actions: List[str] = []
+    for raw_action in raw_actions:
+        action = str(raw_action or "").strip()
+        if not action or len(action) > 1000:
+            return None
+        if action.startswith("type_password:") or action.startswith("type_username:"):
+            return None
+        if action.startswith("type:"):
+            payload = action[5:]
+            if "=" not in payload:
+                return None
+            selector, value = payload.split("=", 1)
+            if not selector.strip() or not value.strip():
+                return None
+        elif action.startswith("click:") or action.startswith("extract:"):
+            if not action.split(":", 1)[1].strip():
+                return None
+        elif action.startswith("wait:"):
+            try:
+                seconds = float(action.split(":", 1)[1].strip())
+            except (TypeError, ValueError):
+                return None
+            if seconds < 0 or seconds > 30:
+                return None
+        elif action.startswith("ai_extract:") or action.startswith("condition_ai:"):
+            if not action.split(":", 1)[1].strip():
+                return None
+        elif action.startswith("condition_contains:"):
+            if not action.split(":", 1)[1].strip():
+                return None
+        elif action.startswith("save_session:") or action.startswith("load_session:"):
+            name = sanitize_session_name(action.split(":", 1)[1].strip())
+            if not name:
+                return None
+            action = action.split(":", 1)[0] + ":" + name
+        elif action == "proxy:on":
+            pass
+        else:
+            return None
+        actions.append(action)
+
+    if mode == "watch" and not any(
+        action.startswith(("condition_contains:", "condition_ai:")) for action in actions
+    ):
+        return None
+    return actions
+
+
+def parse_deterministic_management_request(user_text: str) -> Optional[Dict[str, Any]]:
+    """Interpret management requests without asking an LLM to invent identifiers."""
+    text = str(user_text or "").strip().lower()
+    if re.search(r"\b(?:show|list|view|display)\b.*\b(?:saved\s+)?sessions?\b", text):
+        return {"mode": "list_sessions"}
+    if re.search(r"\b(?:show|list|view|display)\b.*\b(?:active\s+)?watchers?\b", text):
+        return {"mode": "list_watchers"}
+    watcher_match = re.search(r"\b(?:stop|cancel|remove|delete|disable)\b.*?\bwatcher\b\s*(?:id\s*)?([a-z0-9_-]{3,80})\b", text)
+    if watcher_match:
+        return {"mode": "stop_watch", "watcher_id": watcher_match.group(1)}
+    schedule_match = re.search(r"\b(?:stop|cancel|remove|delete|disable)\b.*?\b(?:schedule|briefing)\b\s*(?:id\s*)?([a-z0-9_-]{3,80})\b", text)
+    if schedule_match:
+        return {"mode": "unschedule", "schedule_id": schedule_match.group(1)}
+    session_match = re.search(r"\b(?:delete|remove|forget)\b.*?\bsession\b\s*(?:called|named|id)?\s*([a-z0-9_-]{1,80})\b", text)
+    if session_match:
+        return {"mode": "delete_session", "session_name": sanitize_session_name(session_match.group(1))}
+    return None
+
+
 def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
     """Validate and convert an AI-produced intent into allowlisted pipeline actions."""
     if not isinstance(raw_plan, dict):
@@ -411,6 +485,8 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
     if mode == "schedule":
         schedule_config = normalize_schedule_config(raw_plan)
         return {"mode": "schedule", "schedule": schedule_config} if schedule_config else None
+    if mode in {"list_sessions", "list_watchers", "stop_watch", "unschedule", "delete_session"}:
+        return None
 
     url = str(raw_plan.get("url", "")).strip()
     if mode not in {"check", "watch"} or not is_valid_url(url) or not is_domain_allowed(url):
@@ -428,13 +504,20 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
         interval_seconds = 60
     interval_seconds = max(30, min(interval_seconds, 86400))
 
-    if mode == "watch":
-        if not condition:
-            return None
-        prefix = "condition_contains" if condition_type == "contains" else "condition_ai"
-        actions = [f"{prefix}:{condition}"]
-    else:
-        actions = [f"ai_extract:{request}"] if request else []
+    raw_actions = raw_plan.get("actions")
+    actions = _normalize_pipeline_actions(raw_actions, mode)
+    if actions is None:
+        return None
+    if raw_actions is None:
+        if mode == "watch":
+            if not condition:
+                return None
+            prefix = "condition_contains" if condition_type == "contains" else "condition_ai"
+            actions = [f"{prefix}:{condition}"]
+        else:
+            actions = [f"ai_extract:{request}"] if request else []
+    elif mode == "watch" and not actions:
+        return None
 
     return {
         "mode": mode,
@@ -447,32 +530,32 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
 
 
 NATURAL_LANGUAGE_SYSTEM_PROMPT = """
-You translate a user's plain-language web automation request into JSON only.
-Never return Markdown, code, or extra keys. Use exactly this object shape:
+Translate the user's request into one JSON command. Return JSON only; never Markdown, code, credentials, or extra keys.
+Use this shape:
 {
   "mode": "check" | "watch" | "schedule" | "unknown",
-  "url": "http or https URL for check/watch, or empty string",
+  "url": "explicit http or https URL for check/watch, or empty string",
   "request": "information to extract for a one-time check",
   "condition": "condition to monitor for a watcher",
   "condition_type": "ai" | "contains",
   "interval_seconds": integer,
+  "actions": ["allowlisted browser pipeline actions"],
   "schedule_time": "HH:MM for a schedule",
   "timezone": "IANA timezone for a schedule",
   "days": "daily, weekdays, weekends, or comma-separated weekday names",
-  "urls": ["http or https URLs for a schedule"],
+  "urls": ["explicit http or https URLs for a schedule"],
   "delivery_mode": "combined" | "separate",
   "summary_prompt": "summary instructions for a schedule",
   "reply_summary": "short confirmation"
 }
-Rules:
-- Extract only an explicit http:// or https:// URL from the user message.
-- Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
-- Use mode check for a one-time lookup, extraction, summary, or screenshot.
-- Use mode schedule for a recurring briefing at a time of day; put every source URL in urls.
-- Use condition_type contains only when a literal text match is clearly requested; otherwise use ai.
-- Default interval_seconds to 60 and never choose less than 30.
-- Default schedule timezone to UTC, schedule days to weekdays, and delivery_mode to combined.
-- If there is no valid URL or no clear web request, use mode unknown.
+Allowed actions are only: type:<css_selector>=<text>, click:<css_selector>, wait:<seconds from 0 to 30>, extract:<css_selector>, ai_extract:<prompt>, save_session:<name>, load_session:<name>, proxy:on, condition_contains:<text>, and condition_ai:<prompt>.
+Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
+Use mode check for a one-time lookup, extraction, summary, screenshot, click, type, or session-load pipeline.
+Use mode schedule for a recurring briefing and put every source URL in urls.
+Use condition_type contains only for a literal text match; otherwise use ai.
+Default interval_seconds to 60, never below 30. Default schedule timezone to UTC, days to weekdays, and delivery_mode to combined.
+Do not invent URLs, selectors, identifiers, or actions. Credentialed login requests are handled outside this prompt and must not be represented here.
+If the message is not a clear supported web command, return mode unknown.
 """.strip()
 
 
@@ -524,6 +607,8 @@ def is_web_automation_request(user_text: str) -> bool:
         "monitor", "watch", "alert", "notify", "tell me when", "schedule",
         "login", "log in", "sign in",
     )
+    if parse_deterministic_management_request(user_text):
+        return True
     if not any(marker in text for marker in web_markers) or not _contains_url_like_text(text):
         return False
     if re.search(r"https?://\S+", text):
@@ -578,12 +663,12 @@ def parse_deterministic_login_request(user_text: str) -> Optional[Dict[str, Any]
 
     url_match = re.search(r"https?://[^\s,]+", text, flags=re.IGNORECASE)
     username_match = re.search(
-        r"\b(?:username|user\s*name|email|e-mail)\s*(?:is|:|=)?\s*[\"'‘’“”]?([^\s,\"'‘’“”]+)[\"'‘’“”]?\s+and\s+(?:the\s+)?password\b",
+        r"\b(?:username|user\s*name|email|e-mail)\s*(?:is|:|=)?\s*[\"'‘’“”]?([^\s,\"'‘’“”]+)[\"'‘’“”]?\s+(?:and\s+)?(?:the\s+)?password\b",
         text,
         flags=re.IGNORECASE,
     )
     password_match = re.search(
-        r"\b(?:password|passcode)\s*(?:is|:|=)?\s*[\"'‘’“”]?(.+?)[\"'‘’“”]?\s*$",
+        r"\b(?:password|passcode)\s*(?:is|:|=)?\s*[\"'‘’“”]?(.+?)[\"'‘’“”]?(?=\s+and\s+(?:remember|save|keep)\b|\s*$)",
         text,
         flags=re.IGNORECASE,
     )
@@ -597,7 +682,14 @@ def parse_deterministic_login_request(user_text: str) -> Optional[Dict[str, Any]
         return None
 
     domain = urlparse(url).hostname or "site"
-    session_name = sanitize_session_name(domain.removeprefix("www."))[:80]
+    requested_session = re.search(
+        r"\bsession\s+(?:called|named)\s+[\"'‘’“”]?([a-zA-Z0-9_-]{1,80})[\"'‘’“”]?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    session_name = sanitize_session_name(
+        requested_session.group(1) if requested_session else domain.removeprefix("www.")
+    )[:80]
     actions = ["type_username:" + username]
     if any(host in domain.lower() for host in ("x.com", "twitter.com")):
         actions.extend([
@@ -613,7 +705,7 @@ def parse_deterministic_login_request(user_text: str) -> Optional[Dict[str, Any]
             "click_login_submit:",
             "wait:5",
         ])
-    if re.search(r"\b(?:save|remember|keep\s+me\s+logged\s+in)\b", lowered):
+    if requested_session or re.search(r"\b(?:save|remember|keep\s+me\s+logged\s+in)\b", lowered):
         actions.append("save_session:" + session_name)
 
     return {"mode": "login", "url": url, "actions": actions, "session_name": session_name}
@@ -683,13 +775,76 @@ def parse_deterministic_schedule_request(user_text: str) -> Optional[Dict[str, A
     })
 
 
+def parse_deterministic_web_request(user_text: str) -> Optional[Dict[str, Any]]:
+    """Recover common check/watch requests when structured interpretation is unavailable."""
+    text = str(user_text or "").strip()
+    lowered = text.lower()
+    url_match = re.search(r"https?://[^\s,]+|(?<![@\w])(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s,]*)?", text, flags=re.IGNORECASE)
+    if not url_match:
+        return None
+    url = url_match.group(0).rstrip(".,;!?)")
+    if not url.lower().startswith(("http://", "https://")):
+        url = "https://" + url
+    if not is_valid_url(url) or not is_domain_allowed(url):
+        return None
+
+    watch_mode = any(marker in lowered for marker in ("monitor", "watch", "tell me when", "alert me when", "notify me when"))
+    interval_match = re.search(r"\bevery\s+(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?)\b", lowered)
+    interval_seconds = 60
+    if interval_match:
+        amount = int(interval_match.group(1))
+        unit = interval_match.group(2)
+        multiplier = 3600 if unit.startswith("hour") else 60 if unit.startswith("min") else 1
+        interval_seconds = max(30, min(amount * multiplier, 86400))
+
+    if watch_mode:
+        condition_match = re.search(
+            r"(?:tell me when|alert me when|notify me when|watch for|monitor for)\s+(.+?)(?:\s+every\s+\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?))?\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        condition = condition_match.group(1).strip(" .,!?") if condition_match else "The requested condition is met"
+        return {
+            "mode": "watch",
+            "url": url,
+            "actions": [f"condition_ai:{condition}"],
+            "condition": condition,
+            "condition_type": "ai",
+            "interval_seconds": interval_seconds,
+        }
+
+    request = ""
+    summarize_match = re.search(r"\b(?:summarize|summarise|extract|read|describe)\b(.*)$", text, flags=re.IGNORECASE)
+    if summarize_match:
+        request = summarize_match.group(1).replace(url_match.group(0), "").strip(" .,!?:;-\")'")
+    if not request:
+        request = text[url_match.end():].strip(" .,!?:;-\")'")
+    if not request:
+        request = "Summarize the important information on this page."
+
+    actions = []
+    session_match = re.search(
+        r"\b(?:using|with|load)\s+(?:the\s+)?(?:saved\s+)?session\s+(?:called\s+|named\s+)?([a-zA-Z0-9_-]{1,80})\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if session_match:
+        actions.append("load_session:" + sanitize_session_name(session_match.group(1)))
+    actions.append("ai_extract:" + request[:500])
+    return {"mode": "check", "url": url, "actions": actions, "request": request}
+
+
 async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, Any]]:
-    """Ask Gemini for a JSON intent, keeping credentialed login requests deterministic."""
+    """Interpret every authorized message before falling back to conversational chat."""
+    management_plan = parse_deterministic_management_request(user_text)
+    if management_plan:
+        return management_plan
+
     login_plan = parse_deterministic_login_request(user_text)
     if re.search(r"\b(?:login|log\s+in|sign\s+in)\b", str(user_text or ""), flags=re.IGNORECASE):
         return login_plan
 
-    fallback = lambda: parse_deterministic_schedule_request(user_text)
+    fallback = lambda: parse_deterministic_schedule_request(user_text) or parse_deterministic_web_request(user_text)
     if not ai_model:
         return fallback()
 
@@ -702,6 +857,9 @@ async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, An
         )
         raw_plan = parse_json_object(response.text or "")
         plan = normalize_natural_language_plan(raw_plan)
+        if plan and plan.get("mode") in {"check", "watch"}:
+            if plan["url"].rstrip("/") not in user_text and plan["url"] not in user_text:
+                return fallback()
         return plan or fallback()
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         logger.warning("Natural-language intent parsing failed: %s", exc)
@@ -1256,21 +1414,59 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
     chat_id = update.effective_chat.id
     request_text = update.message.text.strip()
 
-    if not is_web_automation_request(request_text):
+    plan = await parse_natural_language_intent(request_text)
+
+    if not plan:
         reply = await generate_chat_reply(chat_id, request_text)
         remember_chat_turn(chat_id, request_text, reply)
         await status_msg.edit_text(reply)
         log_audit(user_id, "chat", None, "SUCCESS")
         return
 
-    plan = await parse_natural_language_intent(request_text)
+    if plan["mode"] == "list_sessions":
+        sessions = list_user_sessions(user_id)
+        text = "No encrypted sessions found." if not sessions else "*Saved Encrypted Sessions:*\n" + "\n".join(f"• `{name}`" for name in sessions)
+        await status_msg.edit_text(text, parse_mode="Markdown")
+        log_audit(user_id, "natural_language_list_sessions", None, "SUCCESS")
+        return
 
-    if not plan:
-        await status_msg.edit_text(
-            "❓ I couldn't turn that into a safe web request. Include an explicit "
-            "http:// or https:// URL and describe what to check."
-        )
-        log_audit(user_id, "natural_language", None, "INVALID_INTENT")
+    if plan["mode"] == "list_watchers":
+        watchers = active_watchers.get(chat_id, {})
+        text = "You have no active watchers." if not watchers else "*Active Watchers:*\n" + "\n".join(f"• ID: `{watcher_id}`" for watcher_id in watchers)
+        await status_msg.edit_text(text, parse_mode="Markdown")
+        log_audit(user_id, "natural_language_list_watchers", None, "SUCCESS")
+        return
+
+    if plan["mode"] == "stop_watch":
+        watcher_id = plan["watcher_id"]
+        if chat_id in active_watchers and watcher_id in active_watchers[chat_id]:
+            active_watchers[chat_id][watcher_id].cancel()
+            deactivate_watcher_in_db(watcher_id)
+            await status_msg.edit_text(f"🛑 Watcher `{watcher_id}` stopped.", parse_mode="Markdown")
+            log_audit(user_id, "natural_language_stop_watch", None, f"STOPPED_WATCHER_{watcher_id}")
+        else:
+            await status_msg.edit_text("⚠️ Watcher ID not found.")
+        return
+
+    if plan["mode"] == "unschedule":
+        schedule_id = plan["schedule_id"]
+        task = active_schedules.get(schedule_id)
+        if task:
+            task.cancel()
+        if deactivate_schedule_in_db(schedule_id, chat_id):
+            await status_msg.edit_text(f"✅ Schedule `{schedule_id}` stopped.", parse_mode="Markdown")
+            log_audit(user_id, "natural_language_unschedule", None, f"STOPPED_SCHEDULE_{schedule_id}")
+        else:
+            await status_msg.edit_text("⚠️ Schedule not found.")
+        return
+
+    if plan["mode"] == "delete_session":
+        session_name = plan["session_name"]
+        if delete_user_session(user_id, session_name):
+            await status_msg.edit_text(f"🗑️ Encrypted session `{session_name}` deleted.", parse_mode="Markdown")
+            log_audit(user_id, "natural_language_delete_session", None, f"DELETED_SESSION_{session_name}")
+        else:
+            await status_msg.edit_text("⚠️ Session not found.")
         return
 
     if plan["mode"] == "login":

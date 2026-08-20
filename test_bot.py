@@ -129,6 +129,92 @@ def test_natural_language_plan_rejects_invalid_or_disallowed_urls(monkeypatch):
     }) is None
 
 
+def test_normalize_plan_preserves_allowlisted_pipeline_actions(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://example.com/dashboard",
+        "actions": [
+            "load_session:x_login",
+            "wait:2",
+            "extract:.headline",
+            "ai_extract:Summarize the page",
+            "save_session:x_login",
+        ],
+    })
+
+    assert plan["actions"] == [
+        "load_session:x_login",
+        "wait:2",
+        "extract:.headline",
+        "ai_extract:Summarize the page",
+        "save_session:x_login",
+    ]
+
+
+def test_normalize_plan_rejects_unknown_or_unsafe_actions(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    assert normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://example.com",
+        "actions": ["shell:rm -rf /"],
+    }) is None
+    assert normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://example.com",
+        "actions": ["type_password:secret"],
+    }) is None
+
+
+def test_combined_session_login_accepts_screenshot_wording(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = bot.parse_deterministic_login_request(
+        "Create a session called 'x_login', then I want you to login https://x.com, "
+        "Username = 'mrphatom' Password = 'secret-password'"
+    )
+
+    assert plan["mode"] == "login"
+    assert "save_session:x_login" in plan["actions"]
+
+
+def test_combined_session_login_uses_requested_session_name(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = bot.parse_deterministic_login_request(
+        "Create a session called x_login, then login to https://x.com with "
+        "username 'mrphatom' and password 'secret-password' and remember this login"
+    )
+
+    assert plan["mode"] == "login"
+    assert "save_session:x_login" in plan["actions"]
+
+
+def test_natural_language_management_commands_are_interpreted():
+    import bot
+
+    assert bot.parse_deterministic_management_request("show my saved sessions") == {
+        "mode": "list_sessions"
+    }
+    assert bot.parse_deterministic_management_request("list active watchers") == {
+        "mode": "list_watchers"
+    }
+    assert bot.parse_deterministic_management_request("stop watcher abc123") == {
+        "mode": "stop_watch",
+        "watcher_id": "abc123",
+    }
+    assert bot.parse_deterministic_management_request("cancel schedule qwe789") == {
+        "mode": "unschedule",
+        "schedule_id": "qwe789",
+    }
+
+
 def test_natural_language_login_request_builds_masked_browser_actions(monkeypatch):
     import bot
     monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
@@ -186,6 +272,54 @@ def test_natural_language_parser_falls_back_for_unknown_schedule_output(monkeypa
     assert plan["schedule"]["urls"] == ["https://google.com/news"]
 
 
+def test_deterministic_web_fallback_handles_check_and_watch(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    check_plan = bot.parse_deterministic_web_request(
+        "Please summarize https://example.com/news in three points"
+    )
+    assert check_plan["mode"] == "check"
+    assert check_plan["url"] == "https://example.com/news"
+    assert check_plan["actions"] == ["ai_extract:in three points"]
+
+    watch_plan = bot.parse_deterministic_web_request(
+        "Monitor https://example.com/store and tell me when Apple Pie is in stock every 2 minutes"
+    )
+    assert watch_plan["mode"] == "watch"
+    assert watch_plan["interval_seconds"] == 120
+    assert watch_plan["actions"] == ["condition_ai:Apple Pie is in stock"]
+
+
+def test_natural_language_parser_preserves_model_action_pipeline(monkeypatch):
+    import bot
+
+    class FakeResponse:
+        text = json.dumps({
+            "mode": "check",
+            "url": "https://example.com/dashboard",
+            "request": "",
+            "condition": "",
+            "condition_type": "ai",
+            "interval_seconds": 60,
+            "actions": ["load_session:x_login", "wait:2", "extract:.headline"],
+        })
+
+    class FakeModel:
+        def generate_content(self, prompt, generation_config=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(bot, "ai_model", FakeModel())
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = asyncio.run(bot.parse_natural_language_intent(
+        "Open https://example.com/dashboard using my x_login session, wait two seconds, and extract .headline"
+    ))
+
+    assert plan["mode"] == "check"
+    assert plan["actions"] == ["load_session:x_login", "wait:2", "extract:.headline"]
+
+
 def test_natural_language_parser_accepts_fenced_json(monkeypatch):
     import bot
 
@@ -201,7 +335,7 @@ def test_natural_language_parser_accepts_fenced_json(monkeypatch):
     monkeypatch.setattr(bot, "ai_model", FakeModel())
     monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
 
-    plan = asyncio.run(bot.parse_natural_language_intent("tell me when Apple Pie is in stock"))
+    plan = asyncio.run(bot.parse_natural_language_intent("Tell me when Apple Pie is in stock on https://example.com"))
 
     assert plan["mode"] == "watch"
     assert plan["actions"] == ["condition_contains:Apple Pie is in stock"]
