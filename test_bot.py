@@ -1144,3 +1144,74 @@ def test_developer_event_feed_redacts_secret_like_payload_keys(monkeypatch):
     assert "gai_live.secret" not in update.message.text
     assert "redacted" in update.message.text
     assert "evt_1" in update.message.text
+
+
+def test_current_fact_question_routes_to_web_verification():
+    import bot
+    request = "Have Cristiano Ronaldo officially announced his retirement?"
+    assert bot.is_factual_web_verification_request(request) is True
+    assert bot.classify_message_route(request) == "task"
+    plan = bot.parse_deterministic_web_request(request)
+    assert plan["mode"] == "check"
+    assert plan["url"].startswith("https://news.google.com/search?q=")
+    assert plan["discovered_url"] is True
+    assert any(action.startswith("ai_extract:") for action in plan["actions"])
+
+
+def test_model_unknown_falls_back_to_deterministic_current_fact_check(monkeypatch):
+    import bot
+    class FakeProvider:
+        async def generate_text(self, *args, **kwargs):
+            return '{"mode":"unknown"}'
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+    monkeypatch.setattr(bot, "gemini_provider", FakeProvider())
+    plan = asyncio.run(bot.parse_natural_language_intent("Have Cristiano Ronaldo officially announced his retirement?"))
+    assert plan["mode"] == "check"
+    assert plan["url"].startswith("https://news.google.com/search?q=")
+
+
+def test_non_current_explanatory_question_stays_chat():
+    import bot
+    assert bot.is_factual_web_verification_request("What is retirement?") is False
+    assert bot.classify_message_route("What is retirement?") == "chat"
+
+
+def test_role_targeted_message_is_preview_only_and_server_scoped(monkeypatch):
+    import bot
+    captured = {}
+
+    class FakeMessage:
+        async def reply_text(self, text, **kwargs):
+            self.text = text
+            return self
+
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=6411860985), message=FakeMessage())
+    context = SimpleNamespace(args=["developers", "|", "Planned update at 18:00"], bot=SimpleNamespace())
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: True)
+    monkeypatch.setattr(bot, "ROLE_MESSAGING_ENABLED", True)
+    monkeypatch.setattr(bot, "BULK_ACTIONS_ENABLED", True)
+    monkeypatch.setattr(bot, "list_users_by_role", lambda role, limit: [{"telegram_user_id": 77}, {"telegram_user_id": 88}])
+    monkeypatch.setattr(bot, "create_bulk_job", lambda *args, **kwargs: {"job_id": "bulk_1", "action": "mass_dm", "payload_json": json.dumps({"audience": "developers"}), "target_count": 2, "expires_at": "soon", "confirmation_token": "confirm"})
+    monkeypatch.setattr(bot, "record_admin_action", lambda *args, **kwargs: "audit_1")
+    asyncio.run(bot.mass_role_message_command(update, context))
+    assert "Preview only" in update.message.text
+    assert "/confirmbulk bulk_1 confirm" in update.message.text
+    assert "developers" in update.message.text
+
+
+def test_hard_maintenance_blocks_browser_work_and_redacts_failure_reason(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "CRASH_FAILSAFE_ENABLED", True)
+    monkeypatch.setattr(bot, "list_users_by_status", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bot, "admin_ids", lambda: set())
+    maintenance_state = {"mode": "operational"}
+    monkeypatch.setattr(bot, "get_maintenance_state", lambda: maintenance_state)
+    monkeypatch.setattr(bot, "set_maintenance_state", lambda *args, **kwargs: maintenance_state.update({"mode": "hard_maintenance"}) or maintenance_state)
+    class FakeBot:
+        async def send_message(self, **kwargs):
+            return None
+    state = asyncio.run(bot.enter_hard_maintenance(FakeBot(), RuntimeError("api_key=supersecret token=hidden"), "op_1"))
+    assert state["mode"] == "hard_maintenance"
+    assert "supersecret" not in bot._sanitize_failure_reason(RuntimeError("api_key=supersecret"))
+    assert "hidden" not in bot._sanitize_failure_reason(RuntimeError("token=hidden"))
+    assert bot.maintenance_blocks_browser_work() is True

@@ -16,7 +16,7 @@ from pathlib import Path
 from html import escape as html_escape
 from datetime import datetime, timedelta, time as datetime_time
 from typing import List, Dict, Optional, Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent
@@ -48,6 +48,7 @@ from control_plane import (
     set_user_role,
     search_users,
     list_users_by_status,
+    list_users_by_role,
     list_reports,
     list_appeals,
     get_report,
@@ -90,6 +91,16 @@ from control_plane import (
     get_admin_analytics,
     record_developer_event,
     list_developer_events,
+    get_maintenance_state,
+    set_maintenance_state,
+    list_maintenance_events,
+    save_runtime_snapshot,
+    create_queue_entry,
+    claim_queue_entry,
+    update_queue_entry,
+    update_queue_eta,
+    list_queue_entries,
+    get_queue_stats,
 )
 
 # ==========================================
@@ -134,6 +145,13 @@ BULK_ACTIONS_ENABLED = os.getenv("BULK_ACTIONS_ENABLED", "true").strip().lower()
 DEVELOPER_EVENTS_ENABLED = os.getenv("DEVELOPER_EVENTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 MAX_BULK_TARGETS = max(1, min(500, int(os.getenv("MAX_BULK_TARGETS", "200"))))
 NOTIFICATION_POLL_SECONDS = max(2, min(60, int(os.getenv("NOTIFICATION_POLL_SECONDS", "5"))))
+ROLE_MESSAGING_ENABLED = os.getenv("ROLE_MESSAGING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+MAINTENANCE_FEATURE_ENABLED = os.getenv("MAINTENANCE_FEATURE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+CRASH_FAILSAFE_ENABLED = os.getenv("CRASH_FAILSAFE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+QUEUE_ENABLED = os.getenv("QUEUE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+QUEUE_MAX_DEPTH = max(1, min(1000, int(os.getenv("QUEUE_MAX_DEPTH", "100"))))
+QUEUE_POLL_SECONDS = max(0.2, min(10.0, float(os.getenv("QUEUE_POLL_SECONDS", "1"))))
+QUEUE_ETA_FLOOR_SECONDS = max(1, min(60, int(os.getenv("QUEUE_ETA_FLOOR_SECONDS", "5"))))
 INLINE_ENABLED = os.getenv("INLINE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GROUP_INVOCATION_ENABLED = os.getenv("GROUP_INVOCATION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 CHANNEL_INVOCATION_ENABLED = os.getenv("CHANNEL_INVOCATION_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -281,6 +299,10 @@ async def configure_bot_profile(bot) -> None:
         BotCommand("appeal", "Open an account review appeal"),
         BotCommand("announce", "Preview an administrator announcement"),
         BotCommand("dm", "Preview a private administrator message"),
+        BotCommand("massrole", "Preview a role-targeted message"),
+        BotCommand("maintenance", "Set or clear administrator maintenance status"),
+        BotCommand("status", "View GreyAI service status"),
+        BotCommand("maintenance_log", "View service status history"),
         BotCommand("analytics", "View top, suspicious, and risky users"),
         BotCommand("banned", "View banned users"),
         BotCommand("devrequest", "Request governed developer access"),
@@ -322,6 +344,14 @@ if GEMINI_API_KEY:
     ai_model = genai.GenerativeModel(GEMINI_MODEL)
 else:
     ai_model = None
+
+
+class QueueRejected(RuntimeError):
+    """The bounded browser backlog cannot accept another request."""
+
+
+class QueueUnavailable(RuntimeError):
+    """Browser work is unavailable because the service is in maintenance."""
 
 
 class TextProviderUnavailable(RuntimeError):
@@ -657,11 +687,22 @@ active_schedules: Dict[str, asyncio.Task] = {}
 chat_histories: Dict[int, List[Dict[str, str]]] = {}
 active_session_by_chat: Dict[int, str] = {}
 user_cooldowns: Dict[int, float] = {}
+queue_dispatch_task = None
+queue_worker_tasks: List[asyncio.Task] = []
+browser_request_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+queue_sequence = 0
+crash_failsafe_lock = asyncio.Lock()
+queue_duration_samples: List[float] = []
 runtime_metrics = {
     "commands_total": 0,
     "browser_tasks_total": 0,
     "scheduled_runs_total": 0,
     "failures_total": 0,
+    "queue_admitted": 0,
+    "queue_completed": 0,
+    "queue_rejected": 0,
+    "queue_failures": 0,
+    "crash_failsafe_events": 0,
 }
 
 # ==========================================
@@ -1444,6 +1485,8 @@ def classify_message_route(user_text: str) -> str:
         return "task"
     if is_web_automation_request(signal_text):
         return "task"
+    if is_factual_web_verification_request(signal_text):
+        return "task"
     if re.search(r"\b(?:go|navigate|take|open|visit|browse)\s+(?:to\s+)?(?:the\s+)?[a-z0-9][a-z0-9 .-]{1,80}", lowered):
         return "task"
     if re.search(r"\b(?:summarize|extract|scrape|check)\b", lowered) and (
@@ -1677,6 +1720,25 @@ def parse_deterministic_schedule_request(user_text: str) -> Optional[Dict[str, A
     })
 
 
+def is_factual_web_verification_request(user_text: str) -> bool:
+    text = str(user_text or "").strip().lower()
+    if not text or not text.endswith(("?", ".", "!")) and "?" not in text:
+        return False
+    currentness = ("latest", "current", "currently", "today", "recent", "officially", "announced", "retirement", "retired", "confirmed", "true", "real")
+    question_start = bool(re.match(r"^(did|does|has|have|is|are|was|were)\b", text))
+    verification_phrase = bool(re.search(r"\b(?:can you verify|is it true|officially announced|officially confirmed)\b", text))
+    return any(term in text for term in currentness) and (question_start or verification_phrase)
+
+
+def discover_factual_web_reference(user_text: str) -> Optional[str]:
+    if not is_factual_web_verification_request(user_text):
+        return None
+    query = re.sub(r"\s+", " ", str(user_text or "").strip()).strip(" ?!.")[:240]
+    if not query:
+        return None
+    return "https://news.google.com/search?q=" + quote_plus(query)
+
+
 def discover_named_web_reference(user_text: str) -> Optional[str]:
     """Resolve only an explicit subreddit shorthand; never guess arbitrary hosts."""
     text = str(user_text or "")
@@ -1695,13 +1757,16 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     url_match = re.search(r"https?://[^\s,]+|(?<![@\w])(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s,]*)?", text, flags=re.IGNORECASE)
     discovered_url = discover_named_web_reference(text) if not url_match else None
     if not url_match and not discovered_url:
+        discovered_url = discover_factual_web_reference(text)
+    if not url_match and not discovered_url:
         return None
     url = url_match.group(0).rstrip(".,;!?)") if url_match else discovered_url
-    reference_text = url_match.group(0) if url_match else re.search(
+    reference_match = re.search(
         r"(?:reddit(?:\.com)?\s+)?r/([A-Za-z0-9_]{2,21})\b|\bsubreddit\s+[A-Za-z0-9_]{2,21}\b",
         text,
         flags=re.IGNORECASE,
-    ).group(0)
+    )
+    reference_text = url_match.group(0) if url_match else (reference_match.group(0) if reference_match else "")
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
     if not is_valid_url(url) or not is_domain_allowed(url):
@@ -1750,9 +1815,11 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
         return result
 
     request = ""
-    request_text = re.sub(re.escape(reference_text), " ", text, count=1, flags=re.IGNORECASE)
+    request_text = re.sub(re.escape(reference_text), " ", text, count=1, flags=re.IGNORECASE) if reference_text else text
     if url_match:
         request_text = request_text.replace(url_match.group(0), " ")
+    elif discovered_url and discovered_url in request_text:
+        request_text = request_text.replace(discovered_url, " ")
     summarize_match = re.search(r"\b(?:summarize|summarise|extract|read|describe)\b(.*)$", request_text, flags=re.IGNORECASE)
     if summarize_match:
         request = summarize_match.group(1).strip(" .,!?:;-\")'")
@@ -1938,6 +2005,142 @@ async def run_browser_task_with_retry(url: str, actions: List[str], user_id: int
     raise last_error or RuntimeError("browser task failed")
 
 
+def priority_for_user(user_id: int) -> int:
+    user = get_user(user_id)
+    if not user:
+        return 10
+    if user["role"] == "admin":
+        return 100
+    if user["plan"] == "max":
+        return 80
+    if user["role"] == "developer":
+        return 70
+    if user["plan"] == "pro":
+        return 50
+    return 10
+
+
+def estimate_browser_wait_seconds(user_id: int) -> int:
+    if not QUEUE_ENABLED or not queue_worker_tasks:
+        return 0
+    try:
+        stats = get_queue_stats()
+        average = float(stats.get("average_completed_seconds") or 45.0)
+        queued = list_queue_entries("queued", QUEUE_MAX_DEPTH)
+        priority = priority_for_user(user_id)
+        ahead = sum(1 for row in queued if int(row["priority"]) > priority or (int(row["priority"]) == priority and row["user_id"] != user_id))
+        running = int(stats.get("running") or 0)
+        slots = max(1, MAX_CONCURRENT_TASKS)
+        return max(QUEUE_ETA_FLOOR_SECONDS if (ahead or running) else 0, int(((ahead + running) * average) / slots))
+    except Exception:
+        logger.exception("queue_eta_calculation_failed")
+        return QUEUE_ETA_FLOOR_SECONDS
+
+
+async def run_browser_request(operation_id: str, user_id: int, chat_id: Optional[int], kind: str, work_factory, status_msg=None) -> Dict[str, Any]:
+    if maintenance_blocks_browser_work():
+        raise QueueUnavailable("browser work is paused while GreyAI is in hard maintenance")
+    if not QUEUE_ENABLED or not queue_worker_tasks:
+        async with task_semaphore:
+            return await work_factory()
+    global queue_sequence
+    stats = get_queue_stats()
+    if int(stats.get("queued") or 0) + int(stats.get("running") or 0) >= QUEUE_MAX_DEPTH:
+        runtime_metrics["queue_rejected"] += 1
+        update_queue_entry(operation_id, "rejected", "queue_full")
+        raise QueueRejected("GreyAI is at capacity; your request was not admitted. Please retry shortly.")
+    priority = priority_for_user(user_id)
+    eta = estimate_browser_wait_seconds(user_id)
+    if not create_queue_entry(operation_id, user_id, chat_id, kind, priority, eta):
+        raise QueueRejected("This operation was already admitted or duplicated.")
+    update_operation(operation_id, "queued")
+    runtime_metrics["queue_admitted"] += 1
+    if status_msg and eta:
+        await status_msg.edit_text(f"🕒 Queued safely behind higher-priority work. Estimated wait: about {eta} seconds.")
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    queue_sequence += 1
+    try:
+        await browser_request_queue.put((-priority, queue_sequence, operation_id, future, work_factory))
+        return await future
+    except asyncio.CancelledError:
+        update_queue_entry(operation_id, "cancelled", "request_cancelled")
+        if not future.done():
+            future.cancel()
+        raise
+
+
+async def _browser_queue_worker(context_bot) -> None:
+    while True:
+        item = await browser_request_queue.get()
+        try:
+            _, _, operation_id, future, work_factory = item
+            if future.cancelled():
+                update_queue_entry(operation_id, "cancelled", "request_cancelled")
+                continue
+            if maintenance_blocks_browser_work():
+                update_queue_entry(operation_id, "rejected", "hard_maintenance")
+                if not future.done():
+                    future.set_exception(QueueUnavailable("browser work is paused while GreyAI is in hard maintenance"))
+                continue
+            if not claim_queue_entry(operation_id):
+                if not future.done():
+                    future.set_exception(QueueRejected("This operation is no longer queued."))
+                continue
+            started = time.monotonic()
+            try:
+                result = await work_factory()
+            except asyncio.CancelledError:
+                update_queue_entry(operation_id, "cancelled", "worker_cancelled")
+                if not future.done():
+                    future.cancel()
+                raise
+            except Exception as exc:
+                runtime_metrics["queue_failures"] += 1
+                update_queue_entry(operation_id, "failed", type(exc).__name__)
+                if not future.done():
+                    future.set_exception(exc)
+            else:
+                duration = time.monotonic() - started
+                queue_duration_samples.append(duration)
+                del queue_duration_samples[:-100]
+                runtime_metrics["queue_completed"] += 1
+                update_queue_entry(operation_id, "succeeded")
+                if not future.done():
+                    future.set_result(result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("browser_queue_worker_unexpected_failure")
+            await enter_hard_maintenance(context_bot, exc)
+        finally:
+            browser_request_queue.task_done()
+
+
+async def start_queue_dispatcher(application: Application) -> None:
+    global queue_dispatch_task, queue_worker_tasks
+    if not QUEUE_ENABLED or queue_dispatch_task:
+        return
+    queue_worker_tasks = [asyncio.create_task(_browser_queue_worker(application.bot)) for _ in range(max(1, MAX_CONCURRENT_TASKS))]
+    queue_dispatch_task = asyncio.gather(*queue_worker_tasks)
+    application.bot_data["queue_worker_tasks"] = queue_worker_tasks
+    logger.info("priority_queue_started workers=%s max_depth=%s", len(queue_worker_tasks), QUEUE_MAX_DEPTH)
+
+
+async def stop_queue_dispatcher() -> None:
+    global queue_dispatch_task, queue_worker_tasks
+    if queue_dispatch_task and not queue_dispatch_task.done():
+        queue_dispatch_task.cancel()
+        await asyncio.gather(queue_dispatch_task, return_exceptions=True)
+    for task in queue_worker_tasks:
+        if not task.done():
+            task.cancel()
+    if queue_worker_tasks:
+        await asyncio.gather(*queue_worker_tasks, return_exceptions=True)
+    queue_worker_tasks = []
+    queue_dispatch_task = None
+
+
 async def run_scheduled_briefing(schedule: Dict[str, Any], context_bot):
     config = schedule["config"]
     operation_id = uuid.uuid4().hex[:12]
@@ -2036,7 +2239,12 @@ async def restore_schedules_from_db(context_bot):
 async def post_init(application: Application):
     global notification_worker_task
     provider_alerts.attach_bot(application.bot)
-    await start_browser_pool(application)
+    try:
+        await start_browser_pool(application)
+    except Exception as exc:
+        logger.exception("browser_pool_start_failed_entering_maintenance")
+        await enter_hard_maintenance(application.bot, exc)
+    await start_queue_dispatcher(application)
     if NOTIFICATION_WORKER_ENABLED:
         notification_worker_task = asyncio.create_task(notification_worker(application.bot))
         application.bot_data["notification_worker_task"] = notification_worker_task
@@ -2046,6 +2254,7 @@ async def post_init(application: Application):
 async def stop_browser_pool(application: Application):
     global notification_worker_task
     provider_alerts.shutdown()
+    await stop_queue_dispatcher()
     if notification_worker_task and not notification_worker_task.done():
         notification_worker_task.cancel()
     for task in application.bot_data.get("ephemeral_message_tasks", set()):
@@ -2367,23 +2576,34 @@ async def check_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_audit(user_id, "/check", url, "BLOCKED_DOMAIN_NOT_WHITELISTED")
         return await update.message.reply_text("⛔ *Domain Blocked:* This domain is not in the allowed whitelist.", parse_mode='Markdown')
 
-    status_msg = await update.message.reply_text("⏳ Queued...")
+    operation_id = uuid.uuid4().hex[:12]
+    create_operation(operation_id, user_id, chat_id, "check", url)
+    status_msg = await update.message.reply_text(f"⏳ Queued... Ref: `{operation_id}`", parse_mode="Markdown")
     
     try:
-        async with task_semaphore:
-            res = await asyncio.wait_for(run_browser_task(url, parts[1:], user_id, status_msg), timeout=COMMAND_TIMEOUT)
+        res = await run_browser_request(
+            operation_id, user_id, chat_id, "check",
+            lambda: run_browser_task_with_retry(url, parts[1:], user_id, operation_id, status_msg),
+            status_msg=status_msg,
+        )
+
+        caption = truncate_text(f"📄 *Title:* {res.get('title')}\n🔗 *URL:* {url}", 1024)
+        with open(res["screenshot"], 'rb') as photo:
+            await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode='Markdown')
+
+        if res["extracted"]:
+            await context.bot.send_message(chat_id=chat_id, text=truncate_text("\n\n".join(res["extracted"]), 4000), parse_mode='Markdown')
+
+        os.remove(res["screenshot"])
+        await status_msg.delete()
+        log_audit(user_id, "/check", url, "SUCCESS")
             
-            caption = truncate_text(f"📄 *Title:* {res.get('title')}\n🔗 *URL:* {url}", 1024)
-            with open(res["screenshot"], 'rb') as photo:
-                await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode='Markdown')
-                
-            if res["extracted"]:
-                await context.bot.send_message(chat_id=chat_id, text=truncate_text("\n\n".join(res["extracted"]), 4000), parse_mode='Markdown')
-                
-            os.remove(res["screenshot"])
-            await status_msg.delete()
-            log_audit(user_id, "/check", url, "SUCCESS")
-            
+    except QueueUnavailable:
+        update_operation(operation_id, "rejected")
+        await status_msg.edit_text("🛠️ GreyAI is in hard maintenance. Browser work is paused while the service is stabilized; use /status for updates.")
+    except QueueRejected as exc:
+        update_operation(operation_id, "rejected")
+        await status_msg.edit_text(f"⏳ {exc}")
     except asyncio.TimeoutError:
         log_audit(user_id, "/check", url, "TIMEOUT")
         await status_msg.edit_text(f"❌ *Timeout:* The command exceeded the {COMMAND_TIMEOUT}s limit.", parse_mode='Markdown')
@@ -2578,6 +2798,118 @@ def enqueue_moderation_notification(user_id: int, action: str, title: str, body:
     )
 
 
+def _sanitize_failure_reason(error: Any) -> str:
+    text = f"{type(error).__name__}: {str(error or '')}"[:600]
+    return re.sub(r"(?i)(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", text)
+
+
+def _runtime_snapshot_payload(operation_id: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        queue = get_queue_stats()
+    except Exception:
+        queue = {"queued": None, "running": None, "average_completed_seconds": None}
+    return {
+        "runtime_metrics": dict(runtime_metrics),
+        "provider_metrics": {key: int(value) for key, value in provider_metrics.items()},
+        "queue": queue,
+        "active_watchers": sum(len(items) for items in active_watchers.values()),
+        "active_schedules": len(active_schedules),
+        "operation_id": str(operation_id or "")[:100] or None,
+        "browser_ready": bool(pool.browser),
+    }
+
+
+def _maintenance_message(state: Optional[Dict[str, Any]] = None) -> str:
+    current = state or get_maintenance_state()
+    mode = current.get("mode", "operational")
+    if mode == "operational":
+        return "✅ GreyAI is operational. No active maintenance is reported."
+    label = mode.replace("_", " ").title()
+    message = current.get("message") or "GreyAI is operating with reduced availability."
+    updated = current.get("updated_at") or "unknown"
+    return f"⚠️ GreyAI status: {label}\n{message}\nLast updated: {updated}\nUse /maintenance_log to view recent status events."
+
+
+async def enter_hard_maintenance(bot, error: Any, operation_id: Optional[str] = None) -> Dict[str, Any]:
+    """Fail closed after an unhandled runtime failure and preserve a sanitized snapshot."""
+    if not CRASH_FAILSAFE_ENABLED:
+        return get_maintenance_state()
+    async with crash_failsafe_lock:
+        current = get_maintenance_state()
+        if current.get("mode") == "hard_maintenance":
+            return current
+        incident_id = "inc_" + secrets.token_urlsafe(8)
+        safe_reason = _sanitize_failure_reason(error)
+        snapshot_id = save_runtime_snapshot("crash", _runtime_snapshot_payload(operation_id), incident_id)
+        state = set_maintenance_state(
+            "hard_maintenance",
+            "GreyAI is temporarily unavailable while the service is being stabilized. Existing chats remain safe; browser tasks are paused.",
+            "An unexpected runtime failure triggered the automatic safety stop.",
+            incident_id=incident_id,
+            metadata={"snapshot_id": snapshot_id, "error_type": type(error).__name__},
+        )
+        runtime_metrics["crash_failsafe_events"] += 1
+        public_body = f"GreyAI has entered hard maintenance after an unexpected service failure. Browser tasks are paused while the issue is investigated. Incident: {incident_id}."
+        for row in list_users_by_status(None, 500):
+            try:
+                enqueue_safe_user_notification(int(row["telegram_user_id"]), "maintenance", "GreyAI hard maintenance", public_body, f"incident:{incident_id}:user:{row['telegram_user_id']}")
+            except Exception:
+                logger.exception("crash_notification_enqueue_failed")
+        for administrator_id in admin_ids():
+            try:
+                await bot.send_message(chat_id=administrator_id, text=f"🚨 GreyAI entered hard maintenance. Incident: {incident_id}\nReason: {safe_reason}\nSnapshot: {snapshot_id}\nPublic browser work is paused; inspect the dashboard and /maintenance_log.")
+            except TelegramError:
+                logger.warning("crash_admin_notification_failed incident_id=%s", incident_id)
+        logger.critical("runtime_hard_maintenance incident_id=%s snapshot_id=%s reason=%s", incident_id, snapshot_id, safe_reason)
+        return state
+
+
+def maintenance_blocks_browser_work() -> bool:
+    return MAINTENANCE_FEATURE_ENABLED and get_maintenance_state().get("mode") == "hard_maintenance"
+
+
+@admin_only
+async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not MAINTENANCE_FEATURE_ENABLED:
+        return await update.message.reply_text("Maintenance controls are disabled by configuration.")
+    raw = " ".join(context.args).strip()
+    if "|" not in raw:
+        return await update.message.reply_text("Usage: /maintenance <operational|scheduled|degraded|hard_maintenance> | <message> | <reason>")
+    parts = [part.strip() for part in raw.split("|", 2)]
+    mode = parts[0].lower()
+    if mode not in {"operational", "scheduled", "degraded", "hard_maintenance"} or not parts[1]:
+        return await update.message.reply_text("Invalid maintenance mode or empty public message.")
+    reason = parts[2] if len(parts) > 2 else "Administrator status update"
+    state = set_maintenance_state(mode, parts[1][:1000], reason[:1000], update.effective_user.id, metadata={"source": "telegram_command"})
+    record_admin_action(update.effective_user.id, "maintenance_update", None, reason[:500], {"mode": mode})
+    await update.message.reply_text(_maintenance_message(state))
+
+
+@restricted
+async def maintenance_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(_maintenance_message())
+
+
+@restricted
+async def maintenance_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = list_maintenance_events(20)
+    if not rows:
+        return await update.message.reply_text("No maintenance events have been recorded.")
+    lines = ["GreyAI status history"]
+    for row in rows:
+        lines.append(f"{row['created_at']} — {row['mode'].replace('_', ' ').title()}\n{row['message'][:300]}\nReason: {row['reason'][:300]}")
+    await update.message.reply_text("\n\n".join(lines)[:3900])
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error or RuntimeError("unknown application error")
+    operation_id = None
+    if update and getattr(update, "effective_message", None):
+        operation_id = getattr(update.effective_message, "message_id", None)
+    await enter_hard_maintenance(context.bot, error, str(operation_id) if operation_id else None)
+    logger.error("unhandled_application_error error_type=%s", type(error).__name__, exc_info=(type(error), error, getattr(error, "__traceback__", None)))
+
+
 def developer_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
@@ -2720,7 +3052,7 @@ async def disallow_channel_command(update: Update, context: ContextTypes.DEFAULT
 @admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /banned, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /announce <message>, /dm <id> <message>, /massdm <ids> | <message>, /massban <ids> | <reason>, /massunban <ids>, /massappeals <resolved|denied> <ids> | <resolution>, /confirmbulk <job_id> <token>, /analytics, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>, /allowchannel <channel_id>, /disallowchannel <channel_id>, /allowdomain <pattern>, /disallowdomain <pattern>, /resetdomain <pattern>, /domains"
+        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /banned, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /announce <message>, /dm <id> <message>, /massdm <ids> | <message>, /massrole <users|developers|admins> | <message>, /massban <ids> | <reason>, /massunban <ids>, /massappeals <resolved|denied> <ids> | <resolution>, /confirmbulk <job_id> <token>, /analytics, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>, /allowchannel <channel_id>, /disallowchannel <channel_id>, /allowdomain <pattern>, /disallowdomain <pattern>, /resetdomain <pattern>, /domains"
     )
 
 
@@ -2732,9 +3064,11 @@ def _parse_bulk_ids(raw_values: List[str]) -> List[str]:
 
 
 def _bulk_preview_text(job: Dict[str, Any]) -> str:
+    payload = json.loads(job.get("payload_json") or "{}") if isinstance(job.get("payload_json"), str) else job.get("payload_json", {})
+    audience_line = f"\nAudience: {payload.get('audience')}" if payload.get("audience") else ""
     return (
         f"Preview only — no changes have been made.\n"
-        f"Action: {job['action']}\nTargets: {job['target_count']}\n"
+        f"Action: {job['action']}{audience_line}\nTargets: {job['target_count']}\n"
         f"Expires: {job['expires_at']}\n\n"
         f"Confirm with:\n/confirmbulk {job['job_id']} {job['confirmation_token']}\n\n"
         "The confirmation token is short-lived and single-use."
@@ -2764,6 +3098,26 @@ async def direct_message_command(update: Update, context: ContextTypes.DEFAULT_T
     message = " ".join(context.args[1:]).strip()[:3500]
     job = create_bulk_job(update.effective_user.id, "mass_dm", {"title": "GreyAI administrator message", "body": message}, [target_id])
     record_admin_action(update.effective_user.id, "dm_preview", int(target_id), "direct message preview created", {"job_id": job["job_id"]})
+    await update.message.reply_text(_bulk_preview_text(job))
+
+
+@admin_only
+async def mass_role_message_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ROLE_MESSAGING_ENABLED or not BULK_ACTIONS_ENABLED:
+        return await update.message.reply_text("Role-targeted messaging is disabled by configuration.")
+    raw = " ".join(context.args)
+    if "|" not in raw:
+        return await update.message.reply_text("Usage: /massrole <users|developers|admins> | <message>")
+    audience, message = raw.split("|", 1)
+    audience = audience.strip().lower()
+    message = message.strip()[:3500]
+    role = {"users": "user", "developers": "developer", "admins": "admin"}.get(audience)
+    if not role or not message:
+        return await update.message.reply_text("Audience must be users, developers, or admins, followed by a non-empty message.")
+    rows = list_users_by_role(role, MAX_BULK_TARGETS)
+    targets = [str(row["telegram_user_id"]) for row in rows]
+    job = create_bulk_job(update.effective_user.id, "mass_dm", {"title": f"GreyAI message for {audience}", "body": message, "audience": audience, "audience_role": role}, targets)
+    record_admin_action(update.effective_user.id, "mass_role_preview", None, f"role-targeted message preview for {audience}", {"job_id": job["job_id"], "target_count": job["target_count"], "audience": audience})
     await update.message.reply_text(_bulk_preview_text(job))
 
 
@@ -2848,7 +3202,9 @@ async def _execute_confirmed_bulk_job(job: Dict[str, Any], admin_id: int) -> Dic
         try:
             target_id = int(raw_target) if str(raw_target).isdigit() else None
             if action in {"announce", "mass_dm"}:
-                if target_id is None or not get_user(target_id):
+                target = get_user(target_id) if target_id is not None else None
+                expected_role = payload.get("audience_role")
+                if target_id is None or not target or target["status"] == "banned" or (expected_role and target["role"] != expected_role):
                     failed += 1
                 else:
                     enqueue_safe_user_notification(target_id, "announcement", payload.get("title", "GreyAI administrator message"), payload.get("body", "")[:3500], f"bulk:{job['job_id']}:{target_id}")
@@ -3518,10 +3874,11 @@ async def _process_natural_language(
     if plan["mode"] == "login":
         await status_msg.edit_text(f"🔐 Logging in to `{plan['url']}`...", parse_mode="Markdown")
         try:
-            async with task_semaphore:
-                result = await run_browser_task_with_retry(
-                    plan["url"], plan["actions"], user_id, operation_id, status_msg=status_msg
-                )
+            result = await run_browser_request(
+                operation_id, user_id, chat_id, "login",
+                lambda: run_browser_task_with_retry(plan["url"], plan["actions"], user_id, operation_id, status_msg=status_msg),
+                status_msg=status_msg,
+            )
 
             caption = truncate_text(
                 f"📄 *Login flow finished*\n🔗 *URL:* {plan['url']}",
@@ -3538,6 +3895,12 @@ async def _process_natural_language(
             os.remove(result["screenshot"])
             await status_msg.delete()
             log_audit(user_id, "natural_language_login", plan["url"], "SUCCESS")
+        except QueueUnavailable:
+            update_operation(operation_id, "rejected")
+            await status_msg.edit_text("🛠️ GreyAI is in hard maintenance. Browser work is paused while the service is stabilized; use /status for updates.")
+        except QueueRejected as exc:
+            update_operation(operation_id, "rejected")
+            await status_msg.edit_text(f"⏳ {exc}")
         except asyncio.TimeoutError:
             log_audit(user_id, "natural_language_login", plan["url"], "TIMEOUT")
             await status_msg.edit_text(f"❌ The login flow exceeded the {COMMAND_TIMEOUT}-second timeout.")
@@ -3564,10 +3927,11 @@ async def _process_natural_language(
     if plan["mode"] == "check":
         await status_msg.edit_text(f"🌐 Checking `{plan['url']}`...", parse_mode="Markdown")
         try:
-            async with task_semaphore:
-                result = await run_browser_task_with_retry(
-                    plan["url"], plan["actions"], user_id, operation_id, status_msg=status_msg
-                )
+            result = await run_browser_request(
+                operation_id, user_id, chat_id, "check",
+                lambda: run_browser_task_with_retry(plan["url"], plan["actions"], user_id, operation_id, status_msg=status_msg),
+                status_msg=status_msg,
+            )
 
             caption = truncate_text(
                 f"📄 *Title:* {result.get('title')}\n🔗 *URL:* {plan['url']}",
@@ -3584,6 +3948,12 @@ async def _process_natural_language(
             os.remove(result["screenshot"])
             await status_msg.delete()
             log_audit(user_id, "natural_language", plan["url"], "SUCCESS")
+        except QueueUnavailable:
+            update_operation(operation_id, "rejected")
+            await status_msg.edit_text("🛠️ GreyAI is in hard maintenance. Browser work is paused while the service is stabilized; use /status for updates.")
+        except QueueRejected as exc:
+            update_operation(operation_id, "rejected")
+            await status_msg.edit_text(f"⏳ {exc}")
         except asyncio.TimeoutError:
             log_audit(user_id, "natural_language", plan["url"], "TIMEOUT")
             await status_msg.edit_text(
@@ -3889,15 +4259,19 @@ async def delete_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_health_report() -> str:
     memory = psutil.virtual_memory()
     browser_state = "ready" if pool.browser else "offline"
+    maintenance = get_maintenance_state()
+    queue = get_queue_stats()
     return (
         "*GreyAI health*\n"
         f"Browser: `{browser_state}`\n"
+        f"Maintenance: `{maintenance.get('mode', 'operational')}`\n"
         f"CPU: `{psutil.cpu_percent(interval=None):.1f}%`\n"
         f"Memory: `{memory.percent:.1f}%`\n"
         f"Active watchers: `{sum(len(items) for items in active_watchers.values())}`\n"
         f"Active schedules: `{len(active_schedules)}`\n"
+        f"Queue: `{queue.get('queued', 0)} queued / {queue.get('running', 0)} running` | Avg task: `{queue.get('average_completed_seconds', 0)}s`\n"
         f"Commands: `{runtime_metrics['commands_total']}` | Browser attempts: `{runtime_metrics['browser_tasks_total']}`\n"
-        f"Failures: `{runtime_metrics['failures_total']}`\n"
+        f"Failures: `{runtime_metrics['failures_total']}` | Queue rejected: `{runtime_metrics['queue_rejected']}` | Crash failsafe: `{runtime_metrics['crash_failsafe_events']}`\n"
         f"Gemini attempts: `{provider_metrics['text_attempts'] + provider_metrics['media_attempts']}` | Quota failures: `{provider_metrics['quota_failures']}`\n"
         f"Model failures: `{provider_metrics['model_failures']}` | Fallback successes: `{provider_metrics['fallback_successes']}`\n"
         f"Alerts sent: `{provider_metrics['alerts_sent']}` | Suppressed: `{provider_metrics['alerts_suppressed']}` | Recoveries: `{provider_metrics['recoveries_sent']}`"
@@ -3917,7 +4291,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Web agent</b>\n"
         "/check &lt;url&gt; | actions — Run a secure browser workflow\n"
         "/watch &lt;interval&gt; &lt;url&gt; | condition — Monitor a page\n"
-        "Natural language also works: <code>watch r/forhire every 1 hour for a new web developer post</code>. Reddit is resolved to its subreddit URL and stored as a persistent watcher.\n"
+        "Natural language also works: <code>watch r/forhire every 1 hour for a new web developer post</code>. Current-fact questions such as <code>Have Cristiano Ronaldo officially announced his retirement?</code> are converted into a safe Google News verification check and return extracted evidence plus an optional screenshot.\n"
         "/watchers — List monitors\n"
         "/stopwatch &lt;watcher_id&gt; — Stop a monitor\n"
         "/schedule &lt;time&gt; &lt;url&gt; | briefing — Schedule a recurring briefing\n"
@@ -3948,7 +4322,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use <code>POST /api/v1/check</code> with <code>Authorization: Bearer &lt;key&gt;</code> from another Telegram bot.\n\n"
         "<b>Administrator controls</b>\n"
         "/admin, /admin_user, /ban, /unban, /banned, /reports, /appeals, /review, /resolveappeal\n"
-        "/announce, /dm, /massdm, /massban, /massunban, /massappeals, /confirmbulk\n"
+        "/announce, /dm, /massdm, /massrole &lt;users|developers|admins&gt; | &lt;message&gt;, /massban, /massunban, /massappeals, /confirmbulk\n"
+        "/maintenance &lt;mode&gt; | &lt;public message&gt; | &lt;reason&gt; — publish status/update and maintenance reason\n"
+        "/status, /maintenance_log — view current status and timestamped status history\n"
         "/analytics — top users, top referrers, suspicious queue, and most risky accounts\n"
         "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n"
         "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n"
@@ -4052,6 +4428,11 @@ def main():
     app.add_handler(CommandHandler("announce", announce_command))
     app.add_handler(CommandHandler("dm", direct_message_command))
     app.add_handler(CommandHandler("massdm", mass_dm_command))
+    app.add_handler(CommandHandler("massrole", mass_role_message_command))
+    app.add_handler(CommandHandler("massmessage", mass_role_message_command))
+    app.add_handler(CommandHandler("maintenance", maintenance_command))
+    app.add_handler(CommandHandler("status", maintenance_status_command))
+    app.add_handler(CommandHandler("maintenance_log", maintenance_log_command))
     app.add_handler(CommandHandler("massban", mass_ban_command))
     app.add_handler(CommandHandler("massunban", mass_unban_command))
     app.add_handler(CommandHandler("massappeals", mass_appeal_command))
@@ -4085,6 +4466,7 @@ def main():
     if CHANNEL_INVOCATION_ENABLED:
         app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, channel_post_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language_handler))
+    app.add_error_handler(global_error_handler)
     
     logger.info("🚀 TeleScout Enterprise SQLite Engine Online.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

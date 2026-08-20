@@ -83,6 +83,31 @@ def test_developer_event_feed_is_owner_scoped_and_cursorable(platform_db):
     assert cp.list_developer_events(42, after_event_id=first, limit=10) == []
 
 
+def test_role_audience_excludes_banned_users_and_is_role_scoped(platform_db):
+    cp.ensure_user(9001)
+    cp.ensure_user(42)
+    cp.ensure_user(43)
+    cp.set_user_role(43, cp.ROLE_DEVELOPER)
+    cp.set_user_status(42, cp.STATUS_BANNED, "test")
+    assert [row["telegram_user_id"] for row in cp.list_users_by_role(cp.ROLE_DEVELOPER)] == [43]
+    assert [row["telegram_user_id"] for row in cp.list_users_by_role(cp.ROLE_USER)] == []
+
+
+def test_maintenance_history_snapshot_and_queue_lifecycle_are_durable(platform_db):
+    state = cp.set_maintenance_state("scheduled", "Planned update", "database migration", 9001, incident_id="inc_test")
+    assert state["mode"] == "scheduled"
+    assert cp.list_maintenance_events(5)[0]["reason"] == "database migration"
+    snapshot_id = cp.save_runtime_snapshot("crash", {"api_key": "must not be logged", "queue": {"queued": 2}}, "inc_test")
+    assert snapshot_id.startswith("snp_")
+    assert cp.get_latest_runtime_snapshot("crash")["snapshot_id"] == snapshot_id
+    assert cp.create_queue_entry("op_queue", 42, 42, "check", 10, 15) is True
+    assert cp.create_queue_entry("op_queue", 42, 42, "check", 10, 15) is False
+    assert cp.claim_queue_entry("op_queue") is True
+    assert cp.claim_queue_entry("op_queue") is False
+    assert cp.update_queue_entry("op_queue", "succeeded") is True
+    assert cp.get_queue_stats()["counts"]["succeeded"] == 1
+
+
 def test_roles_public_access_and_ban_lifecycle(platform_db):
     admin = cp.ensure_user(9001, "admin", "Admin")
     user = cp.ensure_user(42, "alice", "Alice")

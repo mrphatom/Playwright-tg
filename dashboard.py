@@ -37,6 +37,10 @@ from control_plane import (
     get_appeal,
     get_admin_analytics,
     list_users_by_status,
+    get_maintenance_state,
+    list_maintenance_events,
+    get_queue_stats,
+    get_latest_runtime_snapshot,
     enqueue_user_notification,
     authenticate_api_key,
     check_api_key_rate_limit,
@@ -161,10 +165,38 @@ async def operations_handler(request: web.Request):
     return web.json_response({"operations": _json_rows(list_operations(user_id, 100)), "sessions": _json_rows(list_session_metadata(user_id, 100))})
 
 
+def public_status_payload() -> Dict[str, Any]:
+    state = get_maintenance_state()
+    return {"status": state.get("mode", "operational"), "message": state.get("message", ""), "reason": state.get("reason", ""), "incident_id": state.get("incident_id"), "started_at": state.get("started_at"), "ends_at": state.get("ends_at"), "updated_at": state.get("updated_at")}
+
+
+async def public_status_handler(request: web.Request):
+    return web.json_response(public_status_payload())
+
+
+async def public_maintenance_events_handler(request: web.Request):
+    events = []
+    for row in list_maintenance_events(50):
+        events.append({"event_id": row["event_id"], "mode": row["mode"], "message": row["message"], "reason": row["reason"], "incident_id": row["incident_id"], "created_at": row["created_at"]})
+    return web.json_response({"events": events})
+
+
+async def admin_runtime_handler(request: web.Request):
+    _, user = _require_admin(request)
+    snapshot = get_latest_runtime_snapshot("crash")
+    return web.json_response({"queue": get_queue_stats(), "maintenance": public_status_payload(), "latest_crash_snapshot": ({"snapshot_id": snapshot["snapshot_id"], "incident_id": snapshot["incident_id"], "snapshot_kind": snapshot["snapshot_kind"], "created_at": snapshot["created_at"]} if snapshot else None)})
+
+
 async def health_handler(request: web.Request):
     session, user = _require_session(request)
     operations = list_operations(None if is_admin(user["telegram_user_id"]) and request.query.get("scope") == "all" else user["telegram_user_id"], 100)
-    return web.json_response({"status": "ok", "role": user["role"], "operations": len(operations), "process": {"pid": os.getpid()}})
+    response = {"status": "ok", "role": user["role"], "operations": len(operations), "process": {"pid": os.getpid()}, "maintenance": public_status_payload()}
+    if not is_admin(user["telegram_user_id"]):
+        response["maintenance"].pop("reason", None)
+        response["queue"] = {"queued": None, "running": None}
+    else:
+        response["queue"] = get_queue_stats()
+    return web.json_response(response)
 
 
 async def api_check_handler(request: web.Request):
@@ -187,7 +219,7 @@ async def api_check_handler(request: web.Request):
         raise web.HTTPBadRequest(text=json.dumps({"error": "url_required"}), content_type="application/json")
 
     # Importing inside the handler avoids a bot/dashboard module cycle at startup.
-    from bot import COMMAND_TIMEOUT, is_domain_allowed, is_valid_url, run_browser_task_with_retry, task_semaphore
+    from bot import COMMAND_TIMEOUT, is_domain_allowed, is_valid_url, run_browser_task_with_retry, run_browser_request, QueueUnavailable, QueueRejected
 
     if not is_valid_url(url) or not is_domain_allowed(url):
         record_developer_audit(None, principal["user_id"], principal["key_id"], "api_check", "denied", {"reason": "url_not_allowed"})
@@ -202,10 +234,18 @@ async def api_check_handler(request: web.Request):
     create_operation(operation_id, principal["user_id"], None, "api_check", url, {"api_key_id": principal["key_id"], "source": "telegram_integration"})
     screenshot_path = None
     try:
-        async with task_semaphore:
-            result = await asyncio.wait_for(run_browser_task_with_retry(url, [f"ai_extract:{extract}"], principal["user_id"], operation_id), timeout=COMMAND_TIMEOUT + 5)
+        result = await run_browser_request(
+            operation_id, principal["user_id"], None, "api_check",
+            lambda: asyncio.wait_for(run_browser_task_with_retry(url, [f"ai_extract:{extract}"], principal["user_id"], operation_id), timeout=COMMAND_TIMEOUT + 5),
+        )
         screenshot_path = result.get("screenshot")
         return web.json_response({"ok": True, "operation_id": operation_id, "title": str(result.get("title", ""))[:300], "url": url, "extracted": [str(item)[:4000] for item in result.get("extracted", [])[:10]]})
+    except QueueUnavailable:
+        update_operation(operation_id, "rejected")
+        raise web.HTTPServiceUnavailable(text=json.dumps({"error": "maintenance", "operation_id": operation_id}), content_type="application/json")
+    except QueueRejected:
+        update_operation(operation_id, "rejected")
+        raise web.HTTPTooManyRequests(text=json.dumps({"error": "queue_full", "operation_id": operation_id}), content_type="application/json")
     except asyncio.TimeoutError:
         update_operation(operation_id, "failed")
         raise web.HTTPGatewayTimeout(text=json.dumps({"error": "browser_timeout", "operation_id": operation_id}), content_type="application/json")
@@ -407,6 +447,8 @@ def create_dashboard_app() -> web.Application:
         web.get("/login", login_handler),
         web.get("/logout", logout_handler),
         web.get("/api/me", me_handler),
+        web.get("/api/status", public_status_handler),
+        web.get("/api/status/events", public_maintenance_events_handler),
         web.get("/api/health", health_handler),
         web.post("/api/v1/check", api_check_handler),
         web.get("/api/v1/keys", developer_keys_handler),
@@ -418,6 +460,7 @@ def create_dashboard_app() -> web.Application:
         web.get("/api/admin/users", admin_users_handler),
         web.get("/api/admin/referrals", admin_referrals_handler),
         web.get("/api/admin/analytics", admin_analytics_handler),
+        web.get("/api/admin/runtime", admin_runtime_handler),
         web.get("/api/admin/banned", admin_banned_handler),
         web.get("/api/admin/reports", admin_reports_handler),
         web.get("/api/admin/appeals", admin_appeals_handler),

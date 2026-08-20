@@ -25,6 +25,18 @@ def test_dashboard_registers_developer_and_integration_routes(dashboard_db):
     assert "/api/v1/developer/stats" in paths
     assert "/api/admin/analytics" in paths
     assert "/api/admin/banned" in paths
+    assert "/api/status" in paths
+    assert "/api/status/events" in paths
+    assert "/api/admin/runtime" in paths
+
+
+def test_public_status_payload_is_sanitized_and_timestamped(dashboard_db):
+    cp.set_maintenance_state("scheduled", "Planned maintenance", "database update", 9001, incident_id="inc_1")
+    payload = dashboard.public_status_payload()
+    assert payload["status"] == "scheduled"
+    assert payload["message"] == "Planned maintenance"
+    assert payload["updated_at"]
+    assert payload["incident_id"] == "inc_1"
 
 
 def test_api_key_boundary_fails_closed_without_bearer_header(dashboard_db):
