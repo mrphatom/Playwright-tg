@@ -11,7 +11,7 @@ from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import TelegramError
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Browser, Playwright, BrowserContext
@@ -211,6 +211,91 @@ def is_domain_allowed(url: str) -> bool:
     except Exception:
         return False
 
+
+def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
+    """Validate and convert an AI-produced intent into allowlisted pipeline actions."""
+    if not isinstance(raw_plan, dict):
+        return None
+
+    mode = str(raw_plan.get("mode", "")).strip().lower()
+    url = str(raw_plan.get("url", "")).strip()
+    if mode not in {"check", "watch"} or not is_valid_url(url) or not is_domain_allowed(url):
+        return None
+
+    request = str(raw_plan.get("request", "")).strip()[:500]
+    condition = str(raw_plan.get("condition", "")).strip()[:500]
+    condition_type = str(raw_plan.get("condition_type", "ai")).strip().lower()
+    if condition_type not in {"ai", "contains"}:
+        condition_type = "ai"
+
+    try:
+        interval_seconds = int(raw_plan.get("interval_seconds", 60))
+    except (TypeError, ValueError):
+        interval_seconds = 60
+    interval_seconds = max(30, min(interval_seconds, 86400))
+
+    if mode == "watch":
+        if not condition:
+            return None
+        prefix = "condition_contains" if condition_type == "contains" else "condition_ai"
+        actions = [f"{prefix}:{condition}"]
+    else:
+        actions = [f"ai_extract:{request}"] if request else []
+
+    return {
+        "mode": mode,
+        "url": url,
+        "actions": actions,
+        "condition": condition,
+        "condition_type": condition_type,
+        "interval_seconds": interval_seconds,
+    }
+
+
+NATURAL_LANGUAGE_SYSTEM_PROMPT = """
+You translate a user's plain-language web automation request into JSON only.
+Never return Markdown, code, or extra keys. Use exactly this object shape:
+{
+  "mode": "check" | "watch" | "unknown",
+  "url": "http or https URL, or empty string",
+  "request": "information to extract for a one-time check",
+  "condition": "condition to monitor for a watcher",
+  "condition_type": "ai" | "contains",
+  "interval_seconds": integer,
+  "reply_summary": "short confirmation"
+}
+Rules:
+- Extract only an explicit http:// or https:// URL from the user message.
+- Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
+- Use mode check for a one-time lookup, extraction, summary, or screenshot.
+- Use condition_type contains only when a literal text match is clearly requested; otherwise use ai.
+- Default interval_seconds to 60 and never choose less than 30.
+- If there is no valid URL or no clear web request, use mode unknown.
+""".strip()
+
+
+async def parse_natural_language_intent(user_text: str) -> Optional[Dict[str, Any]]:
+    """Ask Gemini for a JSON intent, then validate it before execution."""
+    if not ai_model:
+        return None
+
+    prompt = f"{NATURAL_LANGUAGE_SYSTEM_PROMPT}\n\nUser request:\n{user_text[:2000]}"
+    try:
+        response = await asyncio.to_thread(
+            ai_model.generate_content,
+            prompt,
+            generation_config={"temperature": 0.1, "max_output_tokens": 512},
+        )
+        raw_plan = json.loads((response.text or "").strip())
+        return normalize_natural_language_plan(raw_plan)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning("Natural-language intent parsing failed: %s", exc)
+        return None
+    except Exception:
+        logger.exception("Unexpected natural-language intent parsing error")
+        return None
+
+
 def sanitize_session_name(name: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_-]', '_', name.strip())
 
@@ -229,7 +314,7 @@ def mask_sensitive_action(action: str) -> str:
 def restricted(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
-        if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+        if not ALLOWED_USERS or user_id not in ALLOWED_USERS:
             logger.warning(f"Unauthorized access by ID {user_id}")
             log_audit(user_id, func.__name__, None, "DENIED_UNAUTHORIZED")
             return

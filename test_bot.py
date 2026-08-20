@@ -13,7 +13,8 @@ from bot import (
     is_domain_allowed,
     save_encrypted_session,
     load_encrypted_session,
-    init_db
+    init_db,
+    normalize_natural_language_plan
 )
 
 @pytest.fixture(autouse=True)
@@ -57,6 +58,63 @@ def test_encrypted_session_storage():
     # Load & Decrypt
     decrypted = load_encrypted_session(user_id, session_name)
     assert decrypted == dummy_cookies
+
+def test_natural_language_check_plan_normalizes_valid_input(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://example.com/products",
+        "request": "Summarize the product title",
+        "condition": "",
+        "condition_type": "ai",
+        "interval_seconds": 60,
+    })
+
+    assert plan == {
+        "mode": "check",
+        "url": "https://example.com/products",
+        "actions": ["ai_extract:Summarize the product title"],
+        "condition": "",
+        "condition_type": "ai",
+        "interval_seconds": 60,
+    }
+
+
+def test_natural_language_watch_plan_clamps_interval_and_uses_condition(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = normalize_natural_language_plan({
+        "mode": "watch",
+        "url": "https://example.com/products",
+        "request": "",
+        "condition": "Apple Pie is in stock",
+        "condition_type": "contains",
+        "interval_seconds": 5,
+    })
+
+    assert plan["mode"] == "watch"
+    assert plan["actions"] == ["condition_contains:Apple Pie is in stock"]
+    assert plan["interval_seconds"] == 30
+
+
+def test_natural_language_plan_rejects_invalid_or_disallowed_urls(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["allowed.example"])
+
+    assert normalize_natural_language_plan({
+        "mode": "check",
+        "url": "javascript:alert(1)",
+        "request": "read it",
+    }) is None
+    assert normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://blocked.example/page",
+        "request": "read it",
+    }) is None
+
 
 def test_domain_whitelist_filtering(monkeypatch):
     """Verify domain whitelist correctly permits or blocks URLs."""
