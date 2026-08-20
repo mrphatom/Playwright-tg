@@ -12,6 +12,7 @@ def platform_db(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(path))
     monkeypatch.setenv("PUBLIC_MODE", "true")
     monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "9001")
+    monkeypatch.setenv("API_KEY_HASH_SECRET", "platform-test-secret")
     cp.init_platform_db()
     return path
 
@@ -128,3 +129,66 @@ def test_payment_order_is_idempotent_and_grants_entitlement(platform_db, monkeyp
     assert cp.mark_payment_success(max_id, "max") is True
     assert cp.get_user(42)["plan"] == "max"
     assert cp.get_user(42)["quota_limit"] == 5000
+
+
+def test_legacy_users_table_migrates_to_include_developer_role(tmp_path, monkeypatch):
+    path = tmp_path / "legacy.db"
+    monkeypatch.setenv("DB_PATH", str(path))
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE users (telegram_user_id INTEGER PRIMARY KEY, username TEXT, display_name TEXT, role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')), status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'limited', 'suspended', 'banned')), plan TEXT NOT NULL DEFAULT 'free', quota_limit INTEGER NOT NULL DEFAULT 20, quota_used INTEGER NOT NULL DEFAULT 0, quota_reset_at TEXT, risk_score REAL NOT NULL DEFAULT 0, strike_count INTEGER NOT NULL DEFAULT 0, banned_until TEXT, status_reason TEXT, created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        connection.execute("INSERT INTO users VALUES (42, 'alice', 'Alice', 'user', 'active', 'free', 20, 0, NULL, 0, 0, NULL, NULL, 'now', 'now', 'now')")
+        connection.commit()
+    cp.init_platform_db()
+    assert cp.set_user_role(42, cp.ROLE_DEVELOPER) is True
+    assert cp.is_developer(42) is True
+    assert cp.get_user(42)["quota_limit"] == cp.developer_quota_limit()
+
+
+def test_developer_request_is_idempotent_and_admin_reviewable(platform_db):
+    cp.ensure_user(42)
+    first_id, first_created = cp.create_developer_access_request(42, "I need a scoped check API for my Telegram bot")
+    second_id, second_created = cp.create_developer_access_request(42, "duplicate request")
+    assert (first_id, first_created) == (second_id, True)
+    assert second_created is False
+    assert cp.resolve_developer_access_request(first_id, 9001, "approved", "approved after review") is True
+    assert cp.resolve_developer_access_request(first_id, 9001, "approved", "duplicate") is False
+    assert cp.list_developer_access_requests("approved")[0]["request_id"] == first_id
+
+
+def test_api_key_is_shown_once_scoped_owned_and_revocable(platform_db, monkeypatch):
+    monkeypatch.setenv("API_KEY_HASH_SECRET", "test-api-key-secret")
+    cp.ensure_user(42)
+    cp.set_user_role(42, cp.ROLE_DEVELOPER)
+    created = cp.create_api_key(42, "telegram bot", ["check"], rate_limit_per_minute=2)
+    assert created["key"].startswith("gai_live.")
+    assert created["key"] not in str(cp.list_api_keys(42))
+    assert cp.authenticate_api_key(created["key"])["key_id"] == created["key_id"]
+    assert cp.authenticate_api_key(created["key"], "watch") is None
+    assert cp.revoke_api_key(created["key_id"], 9001) is False
+    assert cp.revoke_api_key(created["key_id"], 42) is True
+    assert cp.authenticate_api_key(created["key"]) is None
+
+
+def test_api_key_rate_limit_is_atomic_and_bounded(platform_db, monkeypatch):
+    monkeypatch.setenv("API_KEY_HASH_SECRET", "test-api-key-secret")
+    cp.ensure_user(42)
+    cp.set_user_role(42, cp.ROLE_DEVELOPER)
+    created = cp.create_api_key(42, "limited bot", ["check"], rate_limit_per_minute=2)
+    principal = cp.authenticate_api_key(created["key"])
+    assert principal is not None
+    assert cp.check_api_key_rate_limit(principal["key_id"], 42, principal["rate_limit_per_minute"])[0] is True
+    assert cp.check_api_key_rate_limit(principal["key_id"], 42, principal["rate_limit_per_minute"])[0] is True
+    allowed, used, limit = cp.check_api_key_rate_limit(principal["key_id"], 42, principal["rate_limit_per_minute"])
+    assert (allowed, used, limit) == (False, 2, 2)
+    assert cp.get_developer_stats(42)["denied_events_last_24h"] >= 1
+
+
+def test_revoking_developer_role_revokes_all_active_keys(platform_db):
+    cp.ensure_user(42)
+    cp.set_user_role(42, cp.ROLE_DEVELOPER)
+    first = cp.create_api_key(42, "one", ["check"])
+    second = cp.create_api_key(42, "two", ["check"])
+    assert cp.revoke_all_api_keys_for_user(42, 9001) == 2
+    assert all(item["status"] == "revoked" for item in cp.list_api_keys(42))
+    assert cp.authenticate_api_key(first["key"]) is None
+    assert cp.authenticate_api_key(second["key"]) is None

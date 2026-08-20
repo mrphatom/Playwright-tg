@@ -33,6 +33,14 @@ from control_plane import (
     set_user_status,
     resolve_report,
     resolve_appeal,
+    authenticate_api_key,
+    check_api_key_rate_limit,
+    consume_quota,
+    create_api_key,
+    list_api_keys,
+    revoke_api_key,
+    get_developer_stats,
+    record_developer_audit,
 )
 
 SESSION_COOKIE = "greyai_session"
@@ -67,6 +75,29 @@ def _require_admin(request: web.Request):
     session, user = _require_session(request)
     if not is_admin(user["telegram_user_id"]):
         raise web.HTTPForbidden(text=json.dumps({"error": "administrator_required"}), content_type="application/json")
+    return session, user
+
+
+def _require_api_key(request: web.Request, required_scope: Optional[str] = None):
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "api_key_required"}), content_type="application/json")
+    principal = authenticate_api_key(authorization[7:].strip())
+    if not principal:
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "invalid_api_key"}), content_type="application/json")
+    if required_scope and required_scope not in principal["scopes"]:
+        record_developer_audit(None, principal["user_id"], principal["key_id"], "api_scope_check", "denied", {"scope": required_scope})
+        raise web.HTTPForbidden(text=json.dumps({"error": "scope_required", "scope": required_scope}), content_type="application/json")
+    allowed, used, limit = check_api_key_rate_limit(principal["key_id"], principal["user_id"], principal["rate_limit_per_minute"])
+    if not allowed:
+        raise web.HTTPTooManyRequests(text=json.dumps({"error": "api_rate_limit_exceeded", "used": used, "limit": limit}), content_type="application/json", headers={"Retry-After": "60"})
+    return principal
+
+
+def _require_developer(request: web.Request):
+    session, user = _require_session(request)
+    if user["role"] != "developer" or user["status"] != "active":
+        raise web.HTTPForbidden(text=json.dumps({"error": "developer_role_required"}), content_type="application/json")
     return session, user
 
 
@@ -129,6 +160,97 @@ async def health_handler(request: web.Request):
     session, user = _require_session(request)
     operations = list_operations(None if is_admin(user["telegram_user_id"]) and request.query.get("scope") == "all" else user["telegram_user_id"], 100)
     return web.json_response({"status": "ok", "role": user["role"], "operations": len(operations), "process": {"pid": os.getpid()}})
+
+
+async def api_check_handler(request: web.Request):
+    principal = _require_api_key(request, "check")
+    max_body_size = 16 * 1024
+    if request.content_length and request.content_length > max_body_size:
+        raise web.HTTPRequestEntityTooLarge(max_size=max_body_size, actual_size=request.content_length)
+    body = await request.content.read(max_body_size + 1)
+    if len(body) > max_body_size:
+        raise web.HTTPRequestEntityTooLarge(max_size=max_body_size, actual_size=len(body))
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_json"}), content_type="application/json")
+    if not isinstance(data, dict):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "json_object_required"}), content_type="application/json")
+    url = str(data.get("url", "")).strip()[:2048]
+    extract = str(data.get("extract", "Summarize the important facts on this page.")).strip()[:500]
+    if not url:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "url_required"}), content_type="application/json")
+
+    # Importing inside the handler avoids a bot/dashboard module cycle at startup.
+    from bot import COMMAND_TIMEOUT, is_domain_allowed, is_valid_url, run_browser_task_with_retry, task_semaphore
+
+    if not is_valid_url(url) or not is_domain_allowed(url):
+        record_developer_audit(None, principal["user_id"], principal["key_id"], "api_check", "denied", {"reason": "url_not_allowed"})
+        raise web.HTTPBadRequest(text=json.dumps({"error": "url_not_allowed"}), content_type="application/json")
+    allowed_quota, used, limit = consume_quota(principal["user_id"])
+    if not allowed_quota:
+        record_developer_audit(None, principal["user_id"], principal["key_id"], "api_check", "denied", {"reason": "quota_exceeded"})
+        raise web.HTTPTooManyRequests(text=json.dumps({"error": "quota_exceeded", "used": used, "limit": limit}), content_type="application/json")
+
+    operation_id = "api_" + secrets.token_hex(6)
+    from bot import create_operation, update_operation
+    create_operation(operation_id, principal["user_id"], None, "api_check", url, {"api_key_id": principal["key_id"], "source": "telegram_integration"})
+    screenshot_path = None
+    try:
+        async with task_semaphore:
+            result = await asyncio.wait_for(run_browser_task_with_retry(url, [f"ai_extract:{extract}"], principal["user_id"], operation_id), timeout=COMMAND_TIMEOUT + 5)
+        screenshot_path = result.get("screenshot")
+        return web.json_response({"ok": True, "operation_id": operation_id, "title": str(result.get("title", ""))[:300], "url": url, "extracted": [str(item)[:4000] for item in result.get("extracted", [])[:10]]})
+    except asyncio.TimeoutError:
+        update_operation(operation_id, "failed")
+        raise web.HTTPGatewayTimeout(text=json.dumps({"error": "browser_timeout", "operation_id": operation_id}), content_type="application/json")
+    except Exception:
+        update_operation(operation_id, "failed")
+        raise web.HTTPBadGateway(text=json.dumps({"error": "browser_check_failed", "operation_id": operation_id}), content_type="application/json")
+    finally:
+        if screenshot_path and os.path.exists(screenshot_path):
+            try:
+                os.remove(screenshot_path)
+            except OSError:
+                pass
+
+
+async def developer_keys_handler(request: web.Request):
+    _, user = _require_developer(request)
+    return web.json_response({"keys": list_api_keys(user["telegram_user_id"])})
+
+
+async def developer_key_create_handler(request: web.Request):
+    session, user = _require_developer(request)
+    _require_csrf(request, session)
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_json"}), content_type="application/json")
+    scopes = data.get("scopes", ["check"])
+    if isinstance(scopes, str):
+        scopes = scopes.split(",")
+    if not isinstance(scopes, list):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "scopes_must_be_a_list"}), content_type="application/json")
+    try:
+        created = create_api_key(user["telegram_user_id"], str(data.get("name", "")), scopes, int(data.get("rate_limit_per_minute", 30)))
+    except (PermissionError, ValueError, TypeError) as exc:
+        raise web.HTTPBadRequest(text=json.dumps({"error": str(exc)}), content_type="application/json")
+    return web.json_response(created, status=201)
+
+
+async def developer_key_revoke_handler(request: web.Request):
+    session, user = _require_developer(request)
+    _require_csrf(request, session)
+    key_id = request.match_info["key_id"]
+    if not revoke_api_key(key_id, user["telegram_user_id"]):
+        raise web.HTTPNotFound(text=json.dumps({"error": "api_key_not_found"}), content_type="application/json")
+    return web.json_response({"ok": True, "key_id": key_id})
+
+
+async def developer_stats_handler(request: web.Request):
+    _, user = _require_developer(request)
+    return web.json_response(get_developer_stats(user["telegram_user_id"]))
 
 
 async def referrals_handler(request: web.Request):
@@ -231,16 +353,19 @@ async def websocket_handler(request: web.Request):
 HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GreyAI Operations</title>
 <style>body{font-family:system-ui;background:#0b1020;color:#e7ecff;margin:0}main{max-width:1100px;margin:auto;padding:28px}section{background:#131b32;border:1px solid #2d3b63;border-radius:14px;padding:18px;margin:14px 0}h1{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.metric{background:#0e1630;border-radius:10px;padding:14px}.muted{color:#9aa8cd}code{color:#9bd4ff}button{background:#5c7cfa;color:white;border:0;border-radius:8px;padding:8px 12px;cursor:pointer}input{background:#0e1630;color:white;border:1px solid #3b4c7c;border-radius:8px;padding:8px;margin-right:6px}pre{white-space:pre-wrap;overflow:auto;max-height:420px}</style></head>
-<body><main><h1>GreyAI Operations</h1><p class="muted">Live execution, account, and safety control plane</p><div class="grid"><div class="metric">Status<br><strong id="status">connecting</strong></div><div class="metric">Role<br><strong id="role">-</strong></div><div class="metric">Operations<br><strong id="count">0</strong></div></div><section><h2>Execution log</h2><pre id="ops">Loading…</pre></section><section><h2>Referrals</h2><pre id="referrals">Loading…</pre></section><section id="admin" hidden><h2>Administrator console</h2><p><input id="userq" placeholder="Telegram ID or username"><button onclick="searchUsers()">Search user</button></p><pre id="users">Search results appear here.</pre><p><input id="banid" placeholder="User ID"><input id="reason" placeholder="Reason"><button onclick="banUser()">Ban</button><button onclick="unbanUser()">Unban</button></p><h3>Referral activity</h3><pre id="adminreferrals">Loading…</pre><h3>Open reports</h3><pre id="reports">Loading…</pre><p><input id="reportid" placeholder="Report ID"><input id="reportresolution" placeholder="Resolution"><button onclick="resolveReport()">Resolve report</button></p><h3>Open appeals</h3><pre id="appeals">Loading…</pre><p><input id="appealid" placeholder="Appeal ID"><input id="appealresolution" placeholder="Resolution"><button onclick="resolveAppeal()">Resolve appeal</button></p></section><p><a href="/logout" style="color:#9bd4ff">Sign out</a></p></main>
+<body><main><h1>GreyAI Operations</h1><p class="muted">Live execution, account, and safety control plane</p><div class="grid"><div class="metric">Status<br><strong id="status">connecting</strong></div><div class="metric">Role<br><strong id="role">-</strong></div><div class="metric">Operations<br><strong id="count">0</strong></div></div><section><h2>Execution log</h2><pre id="ops">Loading…</pre></section><section><h2>Referrals</h2><pre id="referrals">Loading…</pre></section><section id="developer" hidden><h2>Developer console</h2><p class="muted">API keys are scoped and shown only once when created.</p><pre id="developerstats">Loading…</pre><pre id="developerkeys">Loading…</pre><p><input id="keyname" placeholder="Key name"><input id="keyscope" value="check" placeholder="Scopes"><button onclick="createKey()">Create key</button></p><p><input id="revokeid" placeholder="Key ID"><button onclick="revokeKey()">Revoke key</button></p></section><section id="admin" hidden><h2>Administrator console</h2><p><input id="userq" placeholder="Telegram ID or username"><button onclick="searchUsers()">Search user</button></p><pre id="users">Search results appear here.</pre><p><input id="banid" placeholder="User ID"><input id="reason" placeholder="Reason"><button onclick="banUser()">Ban</button><button onclick="unbanUser()">Unban</button></p><h3>Referral activity</h3><pre id="adminreferrals">Loading…</pre><h3>Open reports</h3><pre id="reports">Loading…</pre><p><input id="reportid" placeholder="Report ID"><input id="reportresolution" placeholder="Resolution"><button onclick="resolveReport()">Resolve report</button></p><h3>Open appeals</h3><pre id="appeals">Loading…</pre><p><input id="appealid" placeholder="Appeal ID"><input id="appealresolution" placeholder="Resolution"><button onclick="resolveAppeal()">Resolve appeal</button></p></section><p><a href="/logout" style="color:#9bd4ff">Sign out</a></p></main>
 <script>
 const csrf=decodeURIComponent(document.cookie.split('; ').find(x=>x.startsWith('greyai_csrf='))?.split('=')[1]||'');
-async function me(){const r=await fetch('/api/me');if(!r.ok){location.href='/';return}const u=await r.json();document.querySelector('#role').textContent=u.role;document.querySelector('#admin').hidden=u.role!=='admin'}
+async function me(){const r=await fetch('/api/me');if(!r.ok){location.href='/';return}const u=await r.json();document.querySelector('#role').textContent=u.role;document.querySelector('#admin').hidden=u.role!=='admin';document.querySelector('#developer').hidden=u.role!=='developer'}
 async function refresh(){const r=await fetch('/api/operations'+(document.querySelector('#role').textContent==='admin'?'?scope=all':''));if(!r.ok)return;const d=await r.json();document.querySelector('#count').textContent=d.operations.length;document.querySelector('#ops').textContent=JSON.stringify(d.operations,null,2);document.querySelector('#status').textContent='healthy';const ref=await (await fetch('/api/referrals')).json();document.querySelector('#referrals').textContent=JSON.stringify(ref,null,2);if(document.querySelector('#role').textContent==='admin'){const ar=await (await fetch('/api/admin/referrals')).json();document.querySelector('#adminreferrals').textContent=JSON.stringify(ar.referrals,null,2)}}
+async function developerRefresh(){const s=await (await fetch('/api/v1/developer/stats')).json();document.querySelector('#developerstats').textContent=JSON.stringify(s,null,2);const k=await (await fetch('/api/v1/keys')).json();document.querySelector('#developerkeys').textContent=JSON.stringify(k.keys,null,2)}
+async function createKey(){const r=await fetch('/api/v1/keys',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({name:document.querySelector('#keyname').value,scopes:document.querySelector('#keyscope').value.split(',')})});const d=await r.json();alert(r.ok?'Copy this key now; it will not be shown again: '+d.key:(d.error||'Key creation failed'));await developerRefresh()}
+async function revokeKey(){const r=await fetch('/api/v1/keys/'+encodeURIComponent(document.querySelector('#revokeid').value),{method:'DELETE',headers:{'X-CSRF-Token':csrf}});if(!r.ok)alert('Key revocation failed');await developerRefresh()}
 async function searchUsers(){const q=encodeURIComponent(document.querySelector('#userq').value);const d=await (await fetch('/api/admin/users?q='+q)).json();document.querySelector('#users').textContent=JSON.stringify(d.users,null,2)}
 async function adminAction(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});if(!r.ok)alert('Action failed');await refresh()}
 function banUser(){adminAction('/api/admin/ban',{user_id:document.querySelector('#banid').value,reason:document.querySelector('#reason').value})}function unbanUser(){adminAction('/api/admin/unban',{user_id:document.querySelector('#banid').value})}function resolveReport(){adminAction('/api/admin/reports/'+encodeURIComponent(document.querySelector('#reportid').value),{status:'resolved',resolution:document.querySelector('#reportresolution').value})}function resolveAppeal(){adminAction('/api/admin/appeals/'+encodeURIComponent(document.querySelector('#appealid').value),{status:'resolved',resolution:document.querySelector('#appealresolution').value})}
 async function queues(){for(const [url,id,key] of [['/api/admin/reports','reports','reports'],['/api/admin/appeals','appeals','appeals']]){const r=await fetch(url);if(r.ok)document.querySelector('#'+id).textContent=JSON.stringify((await r.json())[key],null,2)}}
-me().then(()=>{refresh();queues();setInterval(refresh,3000);setInterval(queues,10000)});
+me().then(()=>{refresh();queues();if(document.querySelector('#role').textContent==='developer'){developerRefresh();setInterval(developerRefresh,10000)}setInterval(refresh,3000);setInterval(queues,10000)});
 </script></body></html>"""
 
 
@@ -258,6 +383,11 @@ def create_dashboard_app() -> web.Application:
         web.get("/logout", logout_handler),
         web.get("/api/me", me_handler),
         web.get("/api/health", health_handler),
+        web.post("/api/v1/check", api_check_handler),
+        web.get("/api/v1/keys", developer_keys_handler),
+        web.post("/api/v1/keys", developer_key_create_handler),
+        web.delete("/api/v1/keys/{key_id}", developer_key_revoke_handler),
+        web.get("/api/v1/developer/stats", developer_stats_handler),
         web.get("/api/operations", operations_handler),
         web.get("/api/referrals", referrals_handler),
         web.get("/api/admin/users", admin_users_handler),

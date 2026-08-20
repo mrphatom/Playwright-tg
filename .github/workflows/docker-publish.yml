@@ -32,7 +32,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run Pytest
-        run: pytest test_bot.py -v
+        run: pytest test_bot.py test_platform.py test_dashboard.py -v
       # -------------------------------------------
 
       # --- CD PHASE: Build and Publish Docker Image ---
