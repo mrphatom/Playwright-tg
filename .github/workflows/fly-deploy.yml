@@ -75,6 +75,14 @@ jobs:
           
         run: flyctl deploy --config fly.toml --app playwright-tg-mrphatom --image registry.fly.io/playwright-tg-mrphatom:main --yes
 
+      - name: Configure dedicated API-key hashing secret
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          API_KEY_HASH_SECRET: ${{ secrets.API_KEY_HASH_SECRET }}
+        run: |
+          test -n "$API_KEY_HASH_SECRET"
+          flyctl secrets set API_KEY_HASH_SECRET="$API_KEY_HASH_SECRET" --app playwright-tg-mrphatom
+
       - name: Ensure public IPv4 for dashboard hostname
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
