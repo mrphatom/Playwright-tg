@@ -290,7 +290,7 @@ class ProviderAlertManager:
         now = time.monotonic()
         async with self._lock:
             self._active_incidents.add(incident_key)
-            last_sent = self._last_sent_at.get(incident_key, 0.0)
+            last_sent = self._last_sent_at.get(incident_key, float("-inf"))
             if now - last_sent < self.cooldown_seconds:
                 provider_metrics["alerts_suppressed"] += 1
                 return
