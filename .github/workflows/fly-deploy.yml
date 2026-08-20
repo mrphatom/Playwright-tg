@@ -73,7 +73,18 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           
-        run: flyctl deploy --config fly.toml --app playwright-tg-mrphatom --image registry.fly.io/playwright-tg-mrphatom:main --yes
+        run: |
+          for attempt in 1 2 3; do
+            echo "Fly.io deploy attempt ${attempt}/3"
+            if flyctl deploy --config fly.toml --app playwright-tg-mrphatom --image registry.fly.io/playwright-tg-mrphatom:main --yes; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep 30
+            fi
+          done
+          echo "Fly.io deployment failed after 3 attempts" >&2
+          exit 1
 
       - name: Configure dedicated API-key hashing secret
         env:
