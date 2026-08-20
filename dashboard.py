@@ -34,6 +34,10 @@ from control_plane import (
     set_user_status,
     resolve_report,
     resolve_appeal,
+    get_appeal,
+    get_admin_analytics,
+    list_users_by_status,
+    enqueue_user_notification,
     authenticate_api_key,
     check_api_key_rate_limit,
     consume_quota,
@@ -270,6 +274,16 @@ async def admin_users_handler(request: web.Request):
     return web.json_response({"users": _json_rows(search_users(query, 100))})
 
 
+async def admin_analytics_handler(request: web.Request):
+    _require_admin(request)
+    return web.json_response(get_admin_analytics(min(int(request.query.get("limit", "25")), 100)))
+
+
+async def admin_banned_handler(request: web.Request):
+    _require_admin(request)
+    return web.json_response({"users": _json_rows(list_users_by_status("banned", min(int(request.query.get("limit", "100")), 200)))})
+
+
 async def admin_reports_handler(request: web.Request):
     _require_admin(request)
     return web.json_response({"reports": _json_rows(list_reports(request.query.get("status", "open"), 100))})
@@ -292,7 +306,8 @@ async def admin_ban_handler(request: web.Request):
     reason = str(data.get("reason", "administrator action"))[:500]
     set_user_status(target_id, "banned", reason)
     action_id = record_admin_action(admin["telegram_user_id"], "ban_user", target_id, reason)
-    return web.json_response({"ok": True, "action_id": action_id})
+    enqueue_user_notification(target_id, "moderation", "GreyAI account access update", f"Your GreyAI account has been banned. Reason: {reason}\n\nIf you believe this is incorrect, submit an appeal with /appeal.", f"dashboard:moderation:ban:{action_id}")
+    return web.json_response({"ok": True, "action_id": action_id, "notification_queued": True})
 
 
 async def admin_unban_handler(request: web.Request):
@@ -302,7 +317,8 @@ async def admin_unban_handler(request: web.Request):
     target_id = int(data.get("user_id"))
     set_user_status(target_id, "active", "administrator unbanned user")
     action_id = record_admin_action(admin["telegram_user_id"], "unban_user", target_id, "administrator unbanned user")
-    return web.json_response({"ok": True, "action_id": action_id})
+    enqueue_user_notification(target_id, "moderation", "GreyAI account access restored", "An administrator restored access to your GreyAI account. You may use the bot again.", f"dashboard:moderation:unban:{action_id}")
+    return web.json_response({"ok": True, "action_id": action_id, "notification_queued": True})
 
 
 async def admin_review_report_handler(request: web.Request):
@@ -325,10 +341,13 @@ async def admin_resolve_appeal_handler(request: web.Request):
     data = await request.json()
     status = str(data.get("status", "reviewing"))
     resolution = str(data.get("resolution", "reviewed by administrator"))[:4000]
-    if not resolve_appeal(appeal_id, admin["telegram_user_id"], status, resolution):
+    appeal = get_appeal(appeal_id)
+    if not appeal or not resolve_appeal(appeal_id, admin["telegram_user_id"], status, resolution):
         raise web.HTTPNotFound(text=json.dumps({"error": "appeal_not_found"}), content_type="application/json")
-    action_id = record_admin_action(admin["telegram_user_id"], "resolve_appeal", None, resolution, {"appeal_id": appeal_id, "status": status})
-    return web.json_response({"ok": True, "action_id": action_id})
+    action_id = record_admin_action(admin["telegram_user_id"], "resolve_appeal", appeal["user_id"], resolution, {"appeal_id": appeal_id, "status": status})
+    outcome = "accepted" if status == "resolved" else "denied" if status == "denied" else status
+    enqueue_user_notification(appeal["user_id"], "moderation", "GreyAI appeal decision", f"Your appeal {appeal_id} was updated to {outcome}. Administrator resolution: {resolution}", f"dashboard:moderation:appeal:{action_id}")
+    return web.json_response({"ok": True, "action_id": action_id, "notification_queued": True})
 
 
 async def websocket_handler(request: web.Request):
@@ -398,6 +417,8 @@ def create_dashboard_app() -> web.Application:
         web.get("/api/referrals", referrals_handler),
         web.get("/api/admin/users", admin_users_handler),
         web.get("/api/admin/referrals", admin_referrals_handler),
+        web.get("/api/admin/analytics", admin_analytics_handler),
+        web.get("/api/admin/banned", admin_banned_handler),
         web.get("/api/admin/reports", admin_reports_handler),
         web.get("/api/admin/appeals", admin_appeals_handler),
         web.post("/api/admin/ban", admin_ban_handler),

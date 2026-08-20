@@ -23,6 +23,8 @@ def test_dashboard_registers_developer_and_integration_routes(dashboard_db):
     assert "/api/v1/keys" in paths
     assert "/api/v1/keys/{key_id}" in paths
     assert "/api/v1/developer/stats" in paths
+    assert "/api/admin/analytics" in paths
+    assert "/api/admin/banned" in paths
 
 
 def test_api_key_boundary_fails_closed_without_bearer_header(dashboard_db):

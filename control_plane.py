@@ -238,6 +238,51 @@ def init_platform_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_admin_actions_time ON admin_actions(created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS user_notifications (
+                notification_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'delivered', 'failed', 'dead_letter')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                next_attempt_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                delivered_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_notifications_pending ON user_notifications(status, next_attempt_at, created_at);
+            CREATE INDEX IF NOT EXISTS idx_notifications_user ON user_notifications(user_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS admin_bulk_jobs (
+                job_id TEXT PRIMARY KEY,
+                admin_user_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                target_ids_json TEXT NOT NULL DEFAULT '[]',
+                confirmation_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'preview' CHECK (status IN ('preview', 'confirmed', 'running', 'completed', 'failed', 'cancelled')),
+                processed_count INTEGER NOT NULL DEFAULT 0,
+                succeeded_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_bulk_jobs_admin_time ON admin_bulk_jobs(admin_user_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS developer_events (
+                event_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_developer_events_owner_time ON developer_events(owner_user_id, created_at, event_id);
+
             CREATE TABLE IF NOT EXISTS referral_codes (
                 code TEXT PRIMARY KEY,
                 referrer_user_id INTEGER NOT NULL UNIQUE,
@@ -612,6 +657,15 @@ def get_developer_stats(user_id: int) -> Dict[str, Any]:
     return {"active_keys": int(active), "requests_last_24h": int(total), "denied_events_last_24h": int(denied)}
 
 
+def list_users_by_status(status: Optional[str] = None, limit: int = 200) -> List[sqlite3.Row]:
+    if status is not None and status not in ALLOWED_STATUSES:
+        raise ValueError("invalid user status")
+    with _connect() as connection:
+        if status:
+            return connection.execute("SELECT telegram_user_id, username, display_name, role, status, plan, quota_used, quota_limit, risk_score, strike_count, last_seen_at FROM users WHERE status = ? ORDER BY last_seen_at DESC LIMIT ?", (status, max(1, min(int(limit), 500)))).fetchall()
+        return connection.execute("SELECT telegram_user_id, username, display_name, role, status, plan, quota_used, quota_limit, risk_score, strike_count, last_seen_at FROM users WHERE status != 'banned' ORDER BY last_seen_at DESC LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
+
+
 def search_users(query: str, limit: int = 25) -> List[sqlite3.Row]:
     query = (query or "").strip()[:100]
     try:
@@ -714,6 +768,16 @@ def list_appeals(status: str = "open", limit: int = 100) -> List[sqlite3.Row]:
         return connection.execute("SELECT appeal_id, user_id, related_report_id, message, status, assigned_admin_id, resolution, created_at, updated_at FROM appeals WHERE status = ? ORDER BY created_at ASC LIMIT ?", (status, max(1, min(limit, 500)))).fetchall()
 
 
+def get_report(report_id: str) -> Optional[sqlite3.Row]:
+    with _connect() as connection:
+        return connection.execute("SELECT report_id, reporter_user_id, target_user_id, category, description, status, resolution FROM reports WHERE report_id = ?", (str(report_id)[:100],)).fetchone()
+
+
+def get_appeal(appeal_id: str) -> Optional[sqlite3.Row]:
+    with _connect() as connection:
+        return connection.execute("SELECT appeal_id, user_id, related_report_id, message, status, resolution FROM appeals WHERE appeal_id = ?", (str(appeal_id)[:100],)).fetchone()
+
+
 def resolve_report(report_id: str, admin_user_id: int, status: str, resolution: str) -> bool:
     if status not in {"open", "reviewing", "resolved", "dismissed"}:
         raise ValueError("invalid report status")
@@ -728,6 +792,149 @@ def resolve_appeal(appeal_id: str, admin_user_id: int, status: str, resolution: 
         raise ValueError("invalid appeal status")
     with _connect() as connection:
         cursor = connection.execute("UPDATE appeals SET status = ?, assigned_admin_id = ?, resolution = ?, updated_at = ? WHERE appeal_id = ?", (status, admin_user_id, resolution[:4000], utc_now(), appeal_id))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def enqueue_user_notification(user_id: int, kind: str, title: str, body: str, idempotency_key: str) -> tuple[str, bool]:
+    notification_id = "ntf_" + secrets.token_urlsafe(8)
+    now = utc_now()
+    clean_kind = str(kind or "system")[:80]
+    clean_title = str(title or "GreyAI update")[:200]
+    clean_body = str(body or "")[:4000]
+    clean_key = str(idempotency_key or "")[:200]
+    if not clean_key or not clean_body:
+        raise ValueError("notification body and idempotency key are required")
+    with _connect() as connection:
+        try:
+            connection.execute(
+                "INSERT INTO user_notifications (notification_id, user_id, kind, title, body, idempotency_key, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (notification_id, user_id, clean_kind, clean_title, clean_body, clean_key, now, now, now),
+            )
+            connection.commit()
+            return notification_id, True
+        except sqlite3.IntegrityError:
+            row = connection.execute("SELECT notification_id FROM user_notifications WHERE idempotency_key = ?", (clean_key,)).fetchone()
+            return (row["notification_id"] if row else notification_id), False
+
+
+NOTIFICATION_LEASE_SECONDS = 900
+MAX_NOTIFICATION_ATTEMPTS = 5
+
+
+def list_pending_notifications(limit: int = 50) -> List[sqlite3.Row]:
+    now = utc_now()
+    lease_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=NOTIFICATION_LEASE_SECONDS)).replace(microsecond=0).isoformat()
+    with _connect() as connection:
+        return connection.execute(
+            "SELECT * FROM user_notifications WHERE (((status = 'pending') OR (status = 'failed' AND attempt_count < ?)) AND (next_attempt_at IS NULL OR next_attempt_at <= ?) OR (status = 'sending' AND updated_at <= ?)) ORDER BY created_at LIMIT ?",
+            (MAX_NOTIFICATION_ATTEMPTS, now, lease_cutoff, max(1, min(int(limit), 200))),
+        ).fetchall()
+
+
+def mark_notification_sending(notification_id: str) -> bool:
+    now = utc_now()
+    lease_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=NOTIFICATION_LEASE_SECONDS)).replace(microsecond=0).isoformat()
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE user_notifications SET status = 'sending', attempt_count = attempt_count + 1, updated_at = ? WHERE notification_id = ? AND (status IN ('pending', 'failed') OR (status = 'sending' AND updated_at <= ?))",
+            (now, str(notification_id)[:100], lease_cutoff),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def mark_notification_delivered(notification_id: str) -> bool:
+    now = utc_now()
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE user_notifications SET status = 'delivered', delivered_at = ?, updated_at = ?, last_error = NULL WHERE notification_id = ? AND status IN ('sending', 'pending', 'failed')",
+            (now, now, str(notification_id)[:100]),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def mark_notification_failed(notification_id: str, error: str, retry_after_seconds: int = 300) -> bool:
+    now = datetime.now(timezone.utc)
+    next_attempt = (now + timedelta(seconds=max(30, min(int(retry_after_seconds), 86400)))).replace(microsecond=0).isoformat()
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE user_notifications SET status = CASE WHEN attempt_count >= ? THEN 'dead_letter' ELSE 'failed' END, last_error = ?, next_attempt_at = CASE WHEN attempt_count >= ? THEN NULL ELSE ? END, updated_at = ? WHERE notification_id = ? AND status IN ('sending', 'pending', 'failed')",
+            (MAX_NOTIFICATION_ATTEMPTS, str(error or "delivery failed")[:500], MAX_NOTIFICATION_ATTEMPTS, next_attempt, utc_now(), str(notification_id)[:100]),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def create_bulk_job(admin_user_id: int, action: str, payload: Dict[str, Any], target_ids: Iterable[Any], ttl_minutes: int = 10) -> Dict[str, Any]:
+    allowed_actions = {"announce", "mass_dm", "mass_ban", "mass_unban", "mass_appeal"}
+    clean_action = str(action or "").strip()[:40]
+    if clean_action not in allowed_actions:
+        raise ValueError("unsupported bulk action")
+    clean_targets = sorted({str(value).strip()[:100] for value in target_ids if str(value).strip()})
+    if len(clean_targets) > 500:
+        raise ValueError("bulk target limit exceeded")
+    job_id = "bulk_" + secrets.token_urlsafe(8)
+    token = secrets.token_urlsafe(10)
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=max(1, min(int(ttl_minutes), 15)))).replace(microsecond=0).isoformat()
+    with _connect() as connection:
+        connection.execute(
+            "INSERT INTO admin_bulk_jobs (job_id, admin_user_id, action, payload_json, target_ids_json, confirmation_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, admin_user_id, clean_action, json.dumps(payload or {}, separators=(",", ":")), json.dumps(clean_targets), _token_hash(token), expires, utc_now()),
+        )
+        connection.commit()
+    return {"job_id": job_id, "confirmation_token": token, "action": clean_action, "target_count": len(clean_targets), "expires_at": expires, "status": "preview"}
+
+
+def confirm_bulk_job(job_id: str, confirmation_token: str, admin_user_id: int) -> Optional[Dict[str, Any]]:
+    now = utc_now()
+    with _connect() as connection:
+        row = connection.execute("SELECT * FROM admin_bulk_jobs WHERE job_id = ? AND admin_user_id = ? AND status = 'preview'", (str(job_id)[:100], admin_user_id)).fetchone()
+        if not row or row["expires_at"] <= now or not hmac.compare_digest(row["confirmation_hash"], _token_hash(str(confirmation_token or ""))):
+            return None
+        connection.execute("UPDATE admin_bulk_jobs SET status = 'confirmed', confirmed_at = ? WHERE job_id = ? AND status = 'preview'", (now, row["job_id"]))
+        connection.commit()
+        confirmed = dict(row)
+        confirmed["status"] = "confirmed"
+        confirmed["confirmed_at"] = now
+        return confirmed
+
+
+def get_admin_analytics(limit: int = 25) -> Dict[str, Any]:
+    bounded = max(1, min(int(limit), 100))
+    with _connect() as connection:
+        banned = connection.execute("SELECT telegram_user_id, username, display_name, status_reason, banned_until, updated_at FROM users WHERE status = 'banned' ORDER BY updated_at DESC LIMIT ?", (bounded,)).fetchall()
+        suspicious = connection.execute("SELECT u.telegram_user_id, u.username, u.display_name, MAX(r.score) AS risk_score, MAX(r.confidence) AS confidence, COUNT(r.risk_event_id) AS event_count FROM risk_events r JOIN users u ON u.telegram_user_id = r.user_id WHERE r.human_review_required = 1 AND r.decision = 'human_review' GROUP BY u.telegram_user_id ORDER BY risk_score DESC, confidence DESC LIMIT ?", (bounded,)).fetchall()
+        top_users = connection.execute("SELECT u.telegram_user_id, u.username, u.display_name, COUNT(o.operation_id) AS operation_count FROM operations o JOIN users u ON u.telegram_user_id = o.telegram_user_id GROUP BY u.telegram_user_id ORDER BY operation_count DESC, u.telegram_user_id LIMIT ?", (bounded,)).fetchall()
+        top_referrers = connection.execute("SELECT u.telegram_user_id, u.username, u.display_name, COUNT(r.referral_id) AS referral_count, SUM(CASE WHEN r.status = 'qualified' THEN 1 ELSE 0 END) AS qualified_count FROM referrals r JOIN users u ON u.telegram_user_id = r.referrer_user_id GROUP BY u.telegram_user_id ORDER BY referral_count DESC, qualified_count DESC LIMIT ?", (bounded,)).fetchall()
+        most_risky = connection.execute("SELECT u.telegram_user_id, u.username, u.display_name, u.risk_score, u.strike_count, u.status FROM users u ORDER BY u.risk_score DESC, u.strike_count DESC LIMIT ?", (bounded,)).fetchall()
+    def rows(result):
+        return [dict(row) for row in result]
+    return {"banned_users": rows(banned), "suspicious_users": rows(suspicious), "top_users": rows(top_users), "top_referrers": rows(top_referrers), "most_risky_users": rows(most_risky)}
+
+
+def record_developer_event(owner_user_id: int, event_type: str, payload: Dict[str, Any]) -> str:
+    event_id = "evt_" + secrets.token_urlsafe(8)
+    safe_payload = json.dumps(payload or {}, separators=(",", ":"))[:4000]
+    with _connect() as connection:
+        connection.execute("INSERT INTO developer_events (event_id, owner_user_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)", (event_id, owner_user_id, str(event_type or "event")[:80], safe_payload, utc_now()))
+        connection.commit()
+    return event_id
+
+
+def list_developer_events(owner_user_id: int, after_event_id: Optional[str] = None, limit: int = 50) -> List[sqlite3.Row]:
+    with _connect() as connection:
+        if after_event_id:
+            return connection.execute("SELECT event_id, event_type, payload_json, created_at FROM developer_events WHERE owner_user_id = ? AND created_at > COALESCE((SELECT created_at FROM developer_events WHERE event_id = ? AND owner_user_id = ?), '') ORDER BY created_at, event_id LIMIT ?", (owner_user_id, str(after_event_id)[:100], owner_user_id, max(1, min(int(limit), 200)))).fetchall()
+        return connection.execute("SELECT event_id, event_type, payload_json, created_at FROM developer_events WHERE owner_user_id = ? ORDER BY created_at, event_id LIMIT ?", (owner_user_id, max(1, min(int(limit), 200)))).fetchall()
+
+
+def update_bulk_job_counts(job_id: str, processed: int, succeeded: int, failed: int, status: str = "completed") -> bool:
+    if status not in {"running", "completed", "failed", "cancelled"}:
+        raise ValueError("invalid bulk job status")
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE admin_bulk_jobs SET status = ?, processed_count = ?, succeeded_count = ?, failed_count = ?, completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE completed_at END WHERE job_id = ?", (status, max(0, int(processed)), max(0, int(succeeded)), max(0, int(failed)), status, utc_now(), str(job_id)[:100]))
         connection.commit()
         return cursor.rowcount == 1
 
