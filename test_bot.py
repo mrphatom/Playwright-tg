@@ -129,6 +129,28 @@ def test_natural_language_plan_rejects_invalid_or_disallowed_urls(monkeypatch):
     }) is None
 
 
+def test_natural_language_parser_falls_back_for_unknown_schedule_output(monkeypatch):
+    import bot
+
+    class FakeResponse:
+        text = '{"mode": "unknown"}'
+
+    class FakeModel:
+        def generate_content(self, prompt, generation_config=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(bot, "ai_model", FakeModel())
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = asyncio.run(bot.parse_natural_language_intent(
+        "Every weekday at 08:00 Europe/London, summarize https://google.com/news "
+        "and send me one combined morning briefing"
+    ))
+
+    assert plan["mode"] == "schedule"
+    assert plan["schedule"]["urls"] == ["https://google.com/news"]
+
+
 def test_natural_language_parser_accepts_fenced_json(monkeypatch):
     import bot
 
@@ -193,6 +215,39 @@ def test_schedule_config_rejects_invalid_timezone_or_url(monkeypatch):
         "delivery_mode": "combined",
         "summary_prompt": "Summarize it",
     }) is None
+
+
+def test_schedule_config_normalizes_scheme_less_urls(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    config = normalize_schedule_config({
+        "schedule_time": "08:00",
+        "timezone": "Europe/London",
+        "days": "weekdays",
+        "urls": ["google.com/news"],
+        "delivery_mode": "combined",
+        "summary_prompt": "Summarize the latest news",
+    })
+
+    assert config["urls"] == ["https://google.com/news"]
+
+
+def test_deterministic_schedule_fallback_parses_exact_telegram_request(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = bot.parse_deterministic_schedule_request(
+        "Every weekday at 08:00 Europe/London, summarize https://google.com/news "
+        "and send me one combined morning briefing"
+    )
+
+    assert plan["mode"] == "schedule"
+    assert plan["schedule"]["schedule_time"] == "08:00"
+    assert plan["schedule"]["timezone"] == "Europe/London"
+    assert plan["schedule"]["days"] == [0, 1, 2, 3, 4]
+    assert plan["schedule"]["urls"] == ["https://google.com/news"]
+    assert plan["schedule"]["delivery_mode"] == "combined"
 
 
 def test_natural_language_schedule_plan_normalizes_to_schedule(monkeypatch):
@@ -281,7 +336,13 @@ def test_plain_conversation_is_not_routed_to_web_automation():
     assert is_web_automation_request("Every weekday at 08:00 summarize https://example.com") is True
 
 
-def test_chat_prompt_keeps_bounded_history_and_current_message():
+def test_scheme_less_schedule_is_web_automation_request():
+    assert is_web_automation_request(
+        "Every weekday at 08:00 Europe/London summarize google.com/news"
+    ) is True
+
+
+def test_chat_prompt_includes_bounded_history_and_current_message():
     history = [
         {"role": "user", "text": f"old-{index}"}
         for index in range(20)
