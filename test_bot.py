@@ -765,7 +765,7 @@ def test_gemini_failover_uses_secondary_after_retryable_primary_failure(monkeypa
     provider = bot.GeminiFailoverProvider("primary", "secondary", "test-model", cooldown_seconds=60)
     calls = []
 
-    def fake_request(key, prompt, generation_config):
+    def fake_request(key, prompt, generation_config, model):
         calls.append(key)
         if key == "primary":
             raise HTTPError("https://gemini", 429, "quota", {}, None)
@@ -779,6 +779,48 @@ def test_gemini_failover_uses_secondary_after_retryable_primary_failure(monkeypa
     assert calls == ["primary", "secondary"]
 
 
+def test_gemini_text_failover_uses_fallback_model_after_quota(monkeypatch):
+    import bot
+    from urllib.error import HTTPError
+
+    provider = bot.GeminiFailoverProvider(
+        "primary",
+        None,
+        "primary-model",
+        text_fallback_model="fallback-model",
+    )
+    calls = []
+
+    def fake_request(key, prompt, generation_config, model):
+        calls.append((key, model))
+        if model == "primary-model":
+            raise HTTPError("https://gemini", 429, "quota", {}, None)
+        return "fallback response"
+
+    monkeypatch.setattr(provider, "_request_text", fake_request)
+
+    result = asyncio.run(provider.generate_text("hello", {"max_output_tokens": 8}))
+
+    assert result == "fallback response"
+    assert calls == [("primary", "primary-model"), ("primary", "fallback-model")]
+
+
+def test_chat_reply_reports_text_capacity_without_exposing_provider_details(monkeypatch):
+    import bot
+
+    class ExhaustedProvider:
+        async def generate_text(self, prompt, generation_config):
+            raise bot.TextProviderUnavailable("Gemini text capacity is temporarily unavailable")
+
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+    monkeypatch.setattr(bot, "gemini_provider", ExhaustedProvider())
+
+    reply = asyncio.run(bot.generate_chat_reply(123, "Hello"))
+
+    assert "text capacity is temporarily unavailable" in reply
+    assert "provider" not in reply.lower()
+
+
 def test_gemini_failover_does_not_retry_malformed_request(monkeypatch):
     import bot
     from urllib.error import HTTPError
@@ -786,7 +828,7 @@ def test_gemini_failover_does_not_retry_malformed_request(monkeypatch):
     provider = bot.GeminiFailoverProvider("primary", "secondary", "test-model")
     calls = []
 
-    def fake_request(key, prompt, generation_config):
+    def fake_request(key, prompt, generation_config, model):
         calls.append(key)
         raise HTTPError("https://gemini", 400, "invalid request", {}, None)
 

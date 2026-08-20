@@ -89,6 +89,7 @@ CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+TEXT_FALLBACK_MODEL = os.getenv("TEXT_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 MULTIMODAL_MODEL = os.getenv("MULTIMODAL_MODEL", "gemini-3.5-flash-lite")
 MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", "12000000"))
 MAX_MEDIA_CONTEXT_CHARS = int(os.getenv("MAX_MEDIA_CONTEXT_CHARS", "6000"))
@@ -231,6 +232,10 @@ else:
     ai_model = None
 
 
+class TextProviderUnavailable(RuntimeError):
+    """Safe user-facing category for exhausted or unavailable text providers."""
+
+
 class MediaProviderUnavailable(RuntimeError):
     """Safe user-facing category for exhausted or unavailable media providers."""
 
@@ -242,10 +247,11 @@ class MediaProviderTimeout(TimeoutError):
 class GeminiFailoverProvider:
     """Use one of two Gemini keys per request without restarting caller workflows."""
 
-    def __init__(self, primary_key: Optional[str], secondary_key: Optional[str], model: str, cooldown_seconds: int = 20, media_model: Optional[str] = None):
+    def __init__(self, primary_key: Optional[str], secondary_key: Optional[str], model: str, cooldown_seconds: int = 20, media_model: Optional[str] = None, text_fallback_model: Optional[str] = None):
         self.primary_key = primary_key
         self.secondary_key = secondary_key
         self.model = model
+        self.text_fallback_model = text_fallback_model or model
         self.media_model = media_model or model
         self.cooldown_seconds = max(1, cooldown_seconds)
         self._cooldowns: Dict[str, float] = {}
@@ -262,7 +268,7 @@ class GeminiFailoverProvider:
         if isinstance(error, (asyncio.TimeoutError, TimeoutError, urllib.error.URLError, ConnectionError)):
             return True
         text = str(error).lower()
-        return any(marker in text for marker in ("quota", "rate limit", "resource exhausted", "temporarily unavailable", "timeout", "timed out"))
+        return any(marker in text for marker in ("quota", "rate limit", "resource exhausted", "temporarily unavailable", "timeout", "timed out", "empty text"))
 
     def _mark_cooldown(self, key: str) -> None:
         self._cooldowns[key] = time.monotonic() + self.cooldown_seconds
@@ -270,15 +276,16 @@ class GeminiFailoverProvider:
     def _is_cooling_down(self, key: str) -> bool:
         return time.monotonic() < self._cooldowns.get(key, 0.0)
 
-    def _request_text(self, key: str, prompt: str, generation_config: Dict[str, Any]) -> str:
-        if key == GEMINI_API_KEY and key == self.primary_key and ai_model is not None:
+    def _request_text(self, key: str, prompt: str, generation_config: Dict[str, Any], model: Optional[str] = None) -> str:
+        request_model = model or self.model
+        if request_model == self.model and key == GEMINI_API_KEY and key == self.primary_key and ai_model is not None:
             response = ai_model.generate_content(prompt, generation_config=generation_config)
             return str(getattr(response, "text", "") or "").strip()
         payload = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": generation_config,
         }).encode("utf-8")
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{request_model}:generateContent"
         request = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
         with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS) as response:
             data = json.loads(response.read().decode("utf-8"))
@@ -308,23 +315,44 @@ class GeminiFailoverProvider:
                 asyncio.to_thread(ai_model.generate_content, prompt, generation_config=generation_config or {}),
                 timeout=CHAT_TIMEOUT_SECONDS,
             )
-            return str(getattr(response, "text", "") or "").strip()
+            text = str(getattr(response, "text", "") or "").strip()
+            if not text:
+                raise TextProviderUnavailable("Gemini returned an empty text response")
+            return text
         if not keys:
             raise RuntimeError("Gemini is not configured")
+
+        models = [self.model]
+        if self.text_fallback_model and self.text_fallback_model not in models:
+            models.append(self.text_fallback_model)
         last_error = None
-        for index, key in enumerate(keys):
-            if index < len(keys) - 1 and self._is_cooling_down(key):
+        for key_index, key in enumerate(keys):
+            if key_index < len(keys) - 1 and self._is_cooling_down(key):
                 continue
-            try:
-                return await asyncio.wait_for(asyncio.to_thread(self._request_text, key, prompt, generation_config or {}), timeout=CHAT_TIMEOUT_SECONDS)
-            except Exception as error:
-                last_error = error
-                if not self._is_retryable(error) or index == len(keys) - 1:
-                    raise
-                self._mark_cooldown(key)
+            key_had_retryable_failure = False
+            for model_index, model in enumerate(models):
+                try:
+                    text = await asyncio.wait_for(
+                        asyncio.to_thread(self._request_text, key, prompt, generation_config or {}, model),
+                        timeout=CHAT_TIMEOUT_SECONDS,
+                    )
+                    text = str(text or "").strip()
+                    if not text:
+                        raise TextProviderUnavailable("Gemini returned an empty text response")
+                    return text
+                except Exception as error:
+                    last_error = error
+                    if not self._is_retryable(error):
+                        raise
+                    key_had_retryable_failure = True
+                    if model_index < len(models) - 1:
+                        continue
+                    self._mark_cooldown(key)
+            if key_had_retryable_failure:
+                continue
         if last_error:
-            raise last_error
-        raise RuntimeError("No healthy Gemini key available")
+            raise TextProviderUnavailable("Gemini text capacity is unavailable") from last_error
+        raise TextProviderUnavailable("No healthy Gemini text provider is available")
 
     async def generate_media(self, path: str, mime_type: str, instruction: str) -> str:
         keys = self._candidate_keys()
@@ -355,7 +383,13 @@ class GeminiFailoverProvider:
         raise MediaProviderUnavailable("No healthy Gemini media provider is available")
 
 
-gemini_provider = GeminiFailoverProvider(GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_MODEL, media_model=MULTIMODAL_MODEL)
+gemini_provider = GeminiFailoverProvider(
+    GEMINI_API_KEY,
+    GEMINI_API_KEY_2,
+    GEMINI_MODEL,
+    media_model=MULTIMODAL_MODEL,
+    text_fallback_model=TEXT_FALLBACK_MODEL,
+)
 
 
 def gemini_configured() -> bool:
@@ -1050,6 +1084,9 @@ async def generate_chat_reply(chat_id: int, user_text: str) -> str:
     except asyncio.TimeoutError:
         logger.warning("Conversational reply timed out chat_id=%s", chat_id)
         return "Chat is taking longer than expected. Please try again with a shorter message."
+    except TextProviderUnavailable:
+        logger.warning("Conversational reply unavailable because all Gemini text providers are exhausted chat_id=%s", chat_id)
+        return "Gemini text capacity is temporarily unavailable. Please try again shortly; your request was not executed."
     except Exception:
         logger.exception("Conversational reply failed")
         return "I couldn't generate a reply right now. Please try again in a moment."
@@ -1303,6 +1340,13 @@ async def parse_natural_language_intent(user_text: str, default_session_name: Op
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         logger.warning("Natural-language intent parsing failed: %s", exc)
         return fallback()
+    except TextProviderUnavailable:
+        deterministic_plan = fallback()
+        if deterministic_plan:
+            logger.warning("Natural-language intent model unavailable; using deterministic plan")
+            return deterministic_plan
+        logger.warning("Natural-language intent parsing unavailable because all Gemini text providers are exhausted")
+        raise
     except Exception:
         logger.exception("Unexpected natural-language intent parsing error")
         return fallback()
@@ -2391,7 +2435,12 @@ async def _process_natural_language(update: Update, context: ContextTypes.DEFAUL
     create_operation(operation_id, user_id, chat_id, "natural_language")
     update_operation(operation_id, "running", 0)
 
-    plan = await parse_natural_language_intent(request_text, active_session_by_chat.get(chat_id))
+    try:
+        plan = await parse_natural_language_intent(request_text, active_session_by_chat.get(chat_id))
+    except TextProviderUnavailable:
+        update_operation(operation_id, "failed")
+        await status_msg.edit_text("Gemini text capacity is temporarily unavailable. No browser action was executed; please try again shortly.")
+        return
 
     if plan and plan.get("mode") in {"check", "watch", "schedule", "login"}:
         allowed, used, limit = consume_quota(user_id)

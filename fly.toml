@@ -17,6 +17,8 @@ primary_region = "iad"
   MAX_CONCURRENT_TASKS = "3"
   
   COMMAND_TIMEOUT = "90"
+  GEMINI_MODEL = "gemini-3.6-flash"
+  TEXT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
   MULTIMODAL_MODEL = "gemini-3.5-flash-lite"
   MEDIA_TIMEOUT_SECONDS = "45"
   
