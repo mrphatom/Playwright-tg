@@ -228,6 +228,14 @@ Set `GEMINI_API_KEY_2` to enable the optional provider failover. The primary key
 
 GreyAI sends rate-limited Telegram alerts to the configured administrators in `ADMIN_TELEGRAM_IDS` (or the private-mode administrator list). It reports two categories: quota exhaustion and model failure. Each category is deduplicated per model using `PROVIDER_ALERT_COOLDOWN_SECONDS`, which defaults to 900 seconds. A fallback success is reported as degraded service; a complete provider failure is reported as an incident. After a recorded incident, the next successful request can send one recovery notification. Alerts never include API keys, prompts, user IDs, URLs, raw exception text, response bodies, or authorization headers, and delivery failures never block the user request. Set `PROVIDER_ALERTS_ENABLED=false` to disable Telegram notifications while retaining in-process counters. `/health` exposes bounded provider-attempt, quota-failure, model-failure, fallback-success, alert, suppression, and recovery counters.
 
+### Shared-chat invocation
+
+GreyAI supports three Telegram invocation surfaces. **Inline mode** lets an authorized user type `@GreyBrowserBot your question` in any private chat, group, or channel and choose GreyAI’s answer. Enable this in [@BotFather](https://t.me/BotFather) with `/setinline`; inline results are intended for questions and read-only public-page explanations, while full browser tasks should remain in the private GreyAI chat [2] [3].
+
+**Groups are opt-in.** A group administrator must run `/enablegreyai`. After activation, GreyAI ignores ordinary group messages and responds only to explicit `@GreyBrowserBot` mentions, replies to GreyAI messages, and `/ask <request>`. `/disablegreyai` turns group handling off. Authorization, quotas, rate limits, and the existing domain and SSRF protections still apply.
+
+**Channels are allowlisted and disabled by default.** To enable them, set `CHANNEL_INVOCATION_ENABLED=true`, add GreyAI as a channel administrator, and have the GreyAI administrator run `/allowchannel <channel_id>`; static IDs may also be supplied through `ALLOWED_CHANNEL_IDS`. Use `/disallowchannel <channel_id>` to revoke access. Channel posts must explicitly mention `@GreyBrowserBot` and are limited to read-only webpage extraction. Login, form filling, saved sessions, schedules, and interactive browser actions are rejected. The bot does not silently read private conversations or unmentioned group/channel content. Telegram delivers channel-post updates to bots through the Bot API update stream, while inline results can be selected in chats, groups, and channels [2] [3] [4].
+
 A referral is attributed through Telegram’s `/start` deep-link parameter and cannot be reassigned. It becomes qualified only after the invited user completes a verified Telegram Stars Pro purchase. The referrer and invited user then receive configurable one-time quota bonuses recorded in the referral reward ledger. Invalid codes, self-referrals, duplicate attribution, and referrals from banned accounts are rejected.
 
 Telegram Stars are the in-Telegram payment rail for digital access. Crypto checkout is intentionally provider-gated through `CRYPTO_CHECKOUT_URL`; do not accept wallet addresses, seed phrases, or client-provided payment claims as proof of payment.
@@ -260,6 +268,9 @@ Developers can manage keys through the authenticated dashboard at `GET /api/v1/k
 ## References
 
 [1]: https://ai.google.dev/gemini-api/docs/rate-limits "Gemini API rate limits"
+[2]: https://core.telegram.org/bots/api "Telegram Bot API"
+[3]: https://core.telegram.org/api/bots/inline "Telegram inline queries"
+[4]: https://core.telegram.org/bots/features "Telegram bot features"
 
 ## 📂 Documentation
 

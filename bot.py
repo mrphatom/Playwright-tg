@@ -19,8 +19,8 @@ from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, InlineQueryHandler, ChosenInlineResultHandler, filters
 from telegram.error import TelegramError
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Browser, Playwright, BrowserContext
@@ -96,12 +96,12 @@ MAX_MEDIA_CONTEXT_CHARS = int(os.getenv("MAX_MEDIA_CONTEXT_CHARS", "6000"))
 CHAT_TIMEOUT_SECONDS = int(os.getenv("CHAT_TIMEOUT_SECONDS", "20"))
 MEDIA_TIMEOUT_SECONDS = int(os.getenv("MEDIA_TIMEOUT_SECONDS", "45"))
 API_KEY_MESSAGE_TTL_SECONDS = max(30, min(300, int(os.getenv("API_KEY_MESSAGE_TTL_SECONDS", "90"))))
-BOT_SHORT_DESCRIPTION = "GreyAI: fast chat, web automation, schedules, monitoring, multimodal input, and Telegram bot integrations."
+BOT_SHORT_DESCRIPTION = "GreyAI: fast chat, inline questions, group mentions, web automation, schedules, monitoring, and multimodal input."
 BOT_DESCRIPTION = (
     "GreyAI is a Telegram assistant for fast conversation and authorized web work. "
     "Send text, voice notes, or screenshots; ask it to browse, summarize, monitor, schedule briefings, "
-    "manage encrypted sessions, or connect another Telegram bot through scoped developer API keys. "
-    "Use /help for commands and permissions."
+        "manage encrypted sessions, invoke it inline in any chat, or call it in opted-in groups and allowlisted channels. "
+        "Use /help for commands, privacy rules, and permissions."
 )
 
 ALLOWED_USERS = set(int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_USERS", "").split(",") if uid.strip().isdigit())
@@ -115,6 +115,13 @@ PRO_PLAN_QUOTA = int(os.getenv("PRO_PLAN_QUOTA", "1000"))
 MAX_PLAN_QUOTA = int(os.getenv("MAX_PLAN_QUOTA", "5000"))
 PROVIDER_ALERTS_ENABLED = os.getenv("PROVIDER_ALERTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 PROVIDER_ALERT_COOLDOWN_SECONDS = max(60, min(86400, int(os.getenv("PROVIDER_ALERT_COOLDOWN_SECONDS", "900"))))
+INLINE_ENABLED = os.getenv("INLINE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+GROUP_INVOCATION_ENABLED = os.getenv("GROUP_INVOCATION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+CHANNEL_INVOCATION_ENABLED = os.getenv("CHANNEL_INVOCATION_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+INLINE_TIMEOUT_SECONDS = max(3, min(20, int(os.getenv("INLINE_TIMEOUT_SECONDS", "8"))))
+ALLOWED_CHANNEL_IDS = {
+    int(value.strip()) for value in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if value.strip().lstrip("-").isdigit()
+}
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 provider_metrics = {
     "text_attempts": 0,
@@ -190,6 +197,9 @@ async def configure_bot_profile(bot) -> None:
     commands = [
         BotCommand("start", "Start GreyAI and see your referral link"),
         BotCommand("help", "Show the full command and feature guide"),
+        BotCommand("ask", "Ask GreyAI in a private chat or enabled group"),
+        BotCommand("enablegreyai", "Enable GreyAI in a group"),
+        BotCommand("disablegreyai", "Disable GreyAI in a group"),
         BotCommand("health", "Check service and browser health"),
         BotCommand("check", "Run a secure browser check"),
         BotCommand("watch", "Monitor a page until a condition is met"),
@@ -642,9 +652,79 @@ def init_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Chat-scope settings. Group and channel activation is explicit and durable.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id INTEGER PRIMARY KEY,
+                chat_type TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                enabled_by_user_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
     init_platform_db()
     logger.info("Database initialized successfully.")
+
+def get_chat_setting(chat_id: int) -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(get_db_path()) as conn:
+        row = conn.execute(
+            "SELECT chat_id, chat_type, enabled, enabled_by_user_id FROM chat_settings WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "chat_id": row[0],
+        "chat_type": row[1],
+        "enabled": bool(row[2]),
+        "enabled_by_user_id": row[3],
+    }
+
+
+def set_chat_setting(chat_id: int, chat_type: str, enabled: bool, enabled_by_user_id: Optional[int]) -> None:
+    with sqlite3.connect(get_db_path()) as conn:
+        conn.execute(
+            """INSERT INTO chat_settings (chat_id, chat_type, enabled, enabled_by_user_id, updated_at)
+               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type,
+               enabled=excluded.enabled, enabled_by_user_id=excluded.enabled_by_user_id,
+               updated_at=CURRENT_TIMESTAMP""",
+            (chat_id, chat_type, int(enabled), enabled_by_user_id),
+        )
+        conn.commit()
+
+
+def chat_scope_enabled(chat_id: int, chat_type: str) -> bool:
+    setting = get_chat_setting(chat_id)
+    if setting is None:
+        return False
+    return setting["chat_type"] == chat_type and setting["enabled"]
+
+
+def normalize_invocation_text(text: str, bot_username: Optional[str] = None) -> str:
+    normalized = str(text or "").strip()
+    if bot_username:
+        normalized = re.sub(rf"@{re.escape(bot_username)}\b", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"^/greyai(?:@\w+)?\s*", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"^/ask(?:@\w+)?\s*", "", normalized, flags=re.IGNORECASE)
+    return normalized.strip()
+
+
+def is_bot_mention_or_reply(message, bot_username: Optional[str]) -> bool:
+    text = str(message.text or message.caption or "")
+    if bot_username and re.search(rf"@{re.escape(bot_username)}\b", text, flags=re.IGNORECASE):
+        return True
+    replied = message.reply_to_message
+    replied_user = getattr(replied, "from_user", None)
+    return bool(replied_user and replied_user.is_bot and replied_user.username and bot_username and replied_user.username.lower() == bot_username.lower())
+
+
+def channel_is_allowed(chat_id: int) -> bool:
+    return CHANNEL_INVOCATION_ENABLED and (chat_id in ALLOWED_CHANNEL_IDS or chat_scope_enabled(chat_id, "channel"))
+
 
 def log_audit(user_id: int, command: str, target_url: Optional[str], status: str):
     """Inserts a command log entry into SQLite."""
@@ -2299,9 +2379,40 @@ async def devrequest_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 @admin_only
+async def allow_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /allowchannel <channel_id>")
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("Channel ID must be a numeric Telegram channel ID, usually beginning with -100.")
+    try:
+        bot_user = await context.bot.get_me()
+        member = await context.bot.get_chat_member(channel_id, bot_user.id)
+    except TelegramError:
+        return await update.message.reply_text("I could not verify that GreyAI can access this channel. Add GreyAI as a channel administrator, then try again.")
+    if member.status not in {"administrator", "creator"}:
+        return await update.message.reply_text("GreyAI must be a channel administrator before it can process channel posts.")
+    set_chat_setting(channel_id, "channel", True, update.effective_user.id)
+    await update.message.reply_text(f"✅ Channel {channel_id} is allowlisted. Mention @GreyBrowserBot in a channel post for read-only webpage extraction.")
+
+
+@admin_only
+async def disallow_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /disallowchannel <channel_id>")
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("Channel ID must be numeric.")
+    set_chat_setting(channel_id, "channel", False, update.effective_user.id)
+    await update.message.reply_text(f"✅ Channel {channel_id} is no longer allowlisted for GreyAI.")
+
+
+@admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>"
+        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>, /allowchannel <channel_id>, /disallowchannel <channel_id>"
     )
 
 
@@ -2581,35 +2692,61 @@ async def _download_media_to_temp(context: ContextTypes.DEFAULT_TYPE, file_id: s
         raise
 
 
-async def _process_natural_language(update: Update, context: ContextTypes.DEFAULT_TYPE, request_text_override: Optional[str] = None):
+async def _process_natural_language(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    request_text_override: Optional[str] = None,
+    user_id_override: Optional[int] = None,
+    public_context: bool = False,
+    shared_context: bool = False,
+):
     """Process authorized text or media-derived text through chat or agent mode."""
-    if not update.message:
+    source_message = update.message or update.channel_post
+    if not source_message:
         return
-    request_text = str(request_text_override if request_text_override is not None else (update.message.text or "")).strip()
+    request_text = str(request_text_override if request_text_override is not None else (source_message.text or "")).strip()
     if not request_text:
         return
 
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+    user_id = user_id_override if user_id_override is not None else (update.effective_user.id if update.effective_user else None)
+    chat_id = update.effective_chat.id if update.effective_chat else source_message.chat_id
+    if user_id is None:
+        logger.warning("natural_language_missing_user_identity chat_id=%s", chat_id)
+        return
     if classify_message_route(request_text) == "chat":
         reply = await generate_chat_reply(chat_id, request_text)
         remember_chat_turn(chat_id, request_text, reply)
-        await update.message.reply_text(reply)
+        await source_message.reply_text(reply)
         log_audit(user_id, "chat", None, "SUCCESS")
         return
 
     runtime_metrics["commands_total"] += 1
     operation_id = uuid.uuid4().hex[:12]
-    status_msg = await update.message.reply_text(f"🧠 Thinking...\nRef: `{operation_id}`", parse_mode="Markdown")
+    status_msg = await source_message.reply_text(f"🧠 Thinking...\nRef: `{operation_id}`", parse_mode="Markdown")
     create_operation(operation_id, user_id, chat_id, "natural_language")
     update_operation(operation_id, "running", 0)
 
     try:
-        plan = await parse_natural_language_intent(request_text, active_session_by_chat.get(chat_id))
+        plan = await parse_natural_language_intent(
+            request_text,
+            None if shared_context else active_session_by_chat.get(chat_id),
+        )
     except TextProviderUnavailable:
         update_operation(operation_id, "failed")
         await status_msg.edit_text("Gemini text capacity is temporarily unavailable. No browser action was executed; please try again shortly.")
         return
+
+    if shared_context:
+        allowed_modes = {"check"} if public_context else {"check", "watch"}
+        if plan and plan.get("mode") not in allowed_modes:
+            context_label = "Channel" if public_context else "Group"
+            await status_msg.edit_text(f"⛔ {context_label} mode supports read-only webpage checks and monitors only. Use a private GreyAI chat for sessions, forms, schedules, or other automations.")
+            update_operation(operation_id, "denied")
+            return
+        if plan and any(str(action).split(":", 1)[0] not in {"ai_extract", "extract", "wait", "screenshot", "condition_ai", "condition_contains"} for action in plan.get("actions", [])):
+            await status_msg.edit_text("⛔ This channel request contains an interactive browser action. Channel mode allows read-only extraction only.")
+            update_operation(operation_id, "denied")
+            return
 
     if plan and plan.get("mode") in {"check", "watch", "schedule", "login"}:
         allowed, used, limit = consume_quota(user_id)
@@ -2933,9 +3070,163 @@ async def _process_natural_language(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Answer @GreyBrowserBot queries so users can invoke GreyAI in any chat."""
+    if not INLINE_ENABLED or not update.inline_query:
+        return
+    query = str(update.inline_query.query or "").strip()[:1200]
+    user = update.inline_query.from_user
+    ensure_user(user.id, getattr(user, "username", None), getattr(user, "full_name", None))
+    if not is_allowed_user(user.id):
+        result = InlineQueryResultArticle(
+            id="access-denied",
+            title="GreyAI access required",
+            description="Open GreyAI privately and complete authorization first.",
+            input_message_content=InputTextMessageContent("GreyAI access is not enabled for this Telegram account."),
+        )
+        await update.inline_query.answer([result], cache_time=30, is_personal=True)
+        return
+    if not query:
+        result = InlineQueryResultArticle(
+            id="inline-help",
+            title="Ask GreyAI",
+            description="Type a question, summarize a public page, or ask for a safe explanation.",
+            input_message_content=InputTextMessageContent("Use @GreyBrowserBot followed by a question or public webpage request."),
+        )
+        await update.inline_query.answer([result], cache_time=30, is_personal=True)
+        return
+    try:
+        reply = await asyncio.wait_for(generate_chat_reply(user.id, query), timeout=INLINE_TIMEOUT_SECONDS)
+        text = truncate_text(f"GreyAI: {reply}", 4000)
+    except asyncio.TimeoutError:
+        text = "GreyAI is taking longer than Telegram's inline response window. Open the private bot chat for a full answer."
+    except TextProviderUnavailable:
+        text = "GreyAI text capacity is temporarily unavailable. Please try again shortly."
+    except Exception:
+        logger.exception("inline_query_failed user_id=%s", user.id)
+        text = "GreyAI could not answer this inline request right now. Please try again shortly."
+    result = InlineQueryResultArticle(
+        id=uuid.uuid4().hex,
+        title="GreyAI answer",
+        description=truncate_text(text.replace("\\n", " "), 180),
+        input_message_content=InputTextMessageContent(text),
+    )
+    await update.inline_query.answer([result], cache_time=5, is_personal=True)
+    log_audit(user.id, "inline_query", None, "ANSWERED")
+
+
+async def chosen_inline_result_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chosen = update.chosen_inline_result
+    if chosen:
+        log_audit(chosen.from_user.id, "inline_result", None, "CHOSEN")
+
+
+async def _is_group_admin_or_greyai_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    if is_admin(user.id):
+        return True
+    if not update.effective_chat or update.effective_chat.type not in {"group", "supergroup"}:
+        return False
+    member = await context.bot.get_chat_member(update.effective_chat.id, user.id)
+    return member.status in {"administrator", "creator"}
+
+
+@restricted
+async def enable_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type not in {"group", "supergroup"}:
+        return await update.message.reply_text("Use /enablegreyai inside a group or supergroup.")
+    if not await _is_group_admin_or_greyai_admin(update, context):
+        return await update.message.reply_text("⛔ A group administrator must enable GreyAI for this chat.")
+    set_chat_setting(update.effective_chat.id, update.effective_chat.type, True, update.effective_user.id)
+    await update.message.reply_text("✅ GreyAI is enabled for this group. It responds only to @GreyBrowserBot mentions, replies to GreyAI messages, and /ask commands.")
+
+
+@restricted
+async def disable_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type not in {"group", "supergroup"}:
+        return await update.message.reply_text("Use /disablegreyai inside a group or supergroup.")
+    if not await _is_group_admin_or_greyai_admin(update, context):
+        return await update.message.reply_text("⛔ A group administrator must disable GreyAI for this chat.")
+    set_chat_setting(update.effective_chat.id, update.effective_chat.type, False, update.effective_user.id)
+    await update.message.reply_text("✅ GreyAI is disabled for this group.")
+
+
+@restricted
+@rate_limited
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and chat.type in {"group", "supergroup"} and not chat_scope_enabled(chat.id, chat.type):
+        return await update.message.reply_text("GreyAI is not enabled in this group. A group administrator can use /enablegreyai.")
+    request = " ".join(context.args).strip()
+    if not request:
+        return await update.message.reply_text("Usage: /ask <question or authorized task>")
+    return await _process_natural_language(update, context, request_text_override=request)
+
+
+async def group_invocation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not GROUP_INVOCATION_ENABLED or not message or not chat or chat.type not in {"group", "supergroup"} or not user or user.is_bot:
+        return
+    if not chat_scope_enabled(chat.id, chat.type) or not is_bot_mention_or_reply(message, context.bot.username):
+        return
+    ensure_user(user.id, getattr(user, "username", None), getattr(user, "full_name", None))
+    if not is_allowed_user(user.id):
+        await message.reply_text("⛔ Your account is not currently allowed to use GreyAI.")
+        return
+    now = time.time()
+    if now - user_cooldowns.get(user.id, 0) < 5:
+        await message.reply_text("⏳ Please wait a few seconds before asking GreyAI again.")
+        return
+    user_cooldowns[user.id] = now
+    request = normalize_invocation_text(message.text or message.caption or "", context.bot.username)
+    if not request:
+        return await message.reply_text("Ask me a question after mentioning @GreyBrowserBot, or use /ask <request>.")
+    return await _process_natural_language(update, context, request_text_override=request, shared_context=True)
+
+
+async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    post = update.channel_post
+    if not post or not channel_is_allowed(post.chat_id):
+        return
+    if not is_bot_mention_or_reply(post, context.bot.username):
+        return
+    request = normalize_invocation_text(post.text or post.caption or "", context.bot.username)
+    if not request:
+        return await post.reply_text("Mention @GreyBrowserBot with a read-only webpage question.")
+    service_user_id = -10_000_000_000_000 - abs(post.chat_id)
+    return await _process_natural_language(
+        update,
+        context,
+        request_text_override=request,
+        user_id_override=service_user_id,
+        public_context=True,
+        shared_context=True,
+    )
+
+
 async def multimodal_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, media_kind: str):
     if not update.message:
         return
+    chat = update.effective_chat
+    user = update.effective_user
+    if not user:
+        return
+    if chat and chat.type in {"group", "supergroup"}:
+        if not GROUP_INVOCATION_ENABLED or not chat_scope_enabled(chat.id, chat.type) or not is_bot_mention_or_reply(update.message, context.bot.username):
+            return
+    ensure_user(user.id, getattr(user, "username", None), getattr(user, "full_name", None))
+    if not is_allowed_user(user.id):
+        await update.message.reply_text("⛔ Your account is not currently allowed to use GreyAI.")
+        return
+    now = time.time()
+    if now - user_cooldowns.get(user.id, 0) < 5:
+        await update.message.reply_text("⏳ Please wait a few seconds before sending another media request.")
+        return
+    user_cooldowns[user.id] = now
     status = await update.message.reply_text("🔎 Interpreting your media…")
     path = None
     try:
@@ -2987,14 +3278,10 @@ async def multimodal_message_handler(update: Update, context: ContextTypes.DEFAU
                 logger.warning("temporary_media_cleanup_failed path=%s", path)
 
 
-@restricted
-@rate_limited
 async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await multimodal_message_handler(update, context, "voice")
 
 
-@restricted
-@rate_limited
 async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await multimodal_message_handler(update, context, "image")
 
@@ -3070,6 +3357,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>GreyAI command guide</b>\n\n"
         "<b>Conversation and multimodal input</b>\n"
         "Send an ordinary message for fast chat. Send a voice note or screenshot for transcription and visual identification. Browser-like wording, named websites, schedules, watchers, and management requests enter agent mode.\n\n"
+        "<b>Use GreyAI in shared chats</b>\n"
+        "Private chat: enable inline mode with @BotFather using /setinline, then type <code>@GreyBrowserBot your question</code> in any private chat, group, or channel and choose the answer. Inline mode is for questions and read-only public-page explanations; full browser tasks stay in the private GreyAI chat.\n"
+        "Groups: a group administrator first uses /enablegreyai. GreyAI then responds only to @GreyBrowserBot mentions, replies to GreyAI messages, and /ask requests. Ordinary group messages are ignored. Use /disablegreyai to turn it off.\n"
+        "Channels: channel invocation is disabled by default and requires administrator configuration of CHANNEL_INVOCATION_ENABLED and ALLOWED_CHANNEL_IDS. Channel mode is read-only and requires a bot mention; forms, saved sessions, logins, and interactive actions are rejected.\n\n"
         "<b>Web agent</b>\n"
         "/check &lt;url&gt; | actions — Run a secure browser workflow\n"
         "/watch &lt;interval&gt; &lt;url&gt; | condition — Monitor a page\n"
@@ -3090,6 +3381,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/referral — Create your invite link\n"
         "/report &lt;text&gt; — Send a support or safety report\n"
         "/appeal &lt;text&gt; — Request account review\n\n"
+        "<b>Shared-chat commands</b>\n"
+        "/ask &lt;request&gt; — Ask GreyAI in a private chat or enabled group\n"
+        "/enablegreyai — Enable mention/reply handling in a group (group admin)\n"
+        "/disablegreyai — Disable GreyAI handling in a group (group admin)\n\n"
         "<b>Developer integrations</b>\n"
         "/devrequest &lt;reason&gt; — Request governed developer access\n"
         "/newkey &lt;name&gt; check — Create a scoped key; the secret appears once in a self-deleting message\n"
@@ -3099,7 +3394,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use <code>POST /api/v1/check</code> with <code>Authorization: Bearer &lt;key&gt;</code> from another Telegram bot.\n\n"
         "<b>Administrator controls</b>\n"
         "/admin, /admin_user, /ban, /unban, /reports, /appeals, /review, /resolveappeal\n"
-        "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n\n"
+        "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n"
+        "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n\n"
         "Never send an API secret again after copying it. If a key is exposed, revoke it immediately with /revokekey.",
         parse_mode="HTML",
     )
@@ -3162,6 +3458,11 @@ def main():
     
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("ask", ask_command))
+    app.add_handler(CommandHandler("enablegreyai", enable_group_command))
+    app.add_handler(CommandHandler("disablegreyai", disable_group_command))
+    app.add_handler(CommandHandler("allowchannel", allow_channel_command))
+    app.add_handler(CommandHandler("disallowchannel", disallow_channel_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("referral", referral_command))
     app.add_handler(CommandHandler("referrals", referrals_command))
@@ -3193,6 +3494,9 @@ def main():
     app.add_handler(CommandHandler("support", support_command))
     app.add_handler(CommandHandler("paysupport", paysupport_command))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+    if INLINE_ENABLED:
+        app.add_handler(InlineQueryHandler(inline_query_handler))
+        app.add_handler(ChosenInlineResultHandler(chosen_inline_result_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CommandHandler("check", check_url))
     app.add_handler(CommandHandler("watch", watch_url))
@@ -3205,6 +3509,10 @@ def main():
     app.add_handler(CommandHandler("deletesession", delete_session))
     app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_message_handler))
+    if GROUP_INVOCATION_ENABLED:
+        app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, group_invocation_handler))
+    if CHANNEL_INVOCATION_ENABLED:
+        app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, channel_post_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language_handler))
     
     logger.info("🚀 TeleScout Enterprise SQLite Engine Online.")

@@ -37,6 +37,60 @@ def setup_test_db():
     if os.path.exists("test_telescout.db"):
         os.remove("test_telescout.db")
 
+def test_shared_chat_invocation_normalization_and_group_opt_in(monkeypatch):
+    import bot
+
+    bot.set_chat_setting(-100123, "supergroup", True, 77)
+
+    assert bot.chat_scope_enabled(-100123, "supergroup") is True
+    assert bot.chat_scope_enabled(-100123, "group") is False
+    assert bot.normalize_invocation_text("@GreyBrowserBot summarize https://github.com", "GreyBrowserBot") == "summarize https://github.com"
+    assert bot.normalize_invocation_text("/ask check https://github.com", "GreyBrowserBot") == "check https://github.com"
+
+
+def test_channel_invocation_requires_explicit_flag_and_allowlist(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "CHANNEL_INVOCATION_ENABLED", True)
+    monkeypatch.setattr(bot, "ALLOWED_CHANNEL_IDS", {-10099})
+    assert bot.channel_is_allowed(-10099) is True
+    assert bot.channel_is_allowed(-10098) is False
+    monkeypatch.setattr(bot, "CHANNEL_INVOCATION_ENABLED", False)
+    assert bot.channel_is_allowed(-10099) is False
+
+
+def test_inline_query_returns_private_answer_result(monkeypatch):
+    import bot
+
+    class FakeInlineQuery:
+        query = "What is GreyAI?"
+        from_user = SimpleNamespace(id=77, username="tester", full_name="Test User")
+
+        def __init__(self):
+            self.responses = []
+
+        async def answer(self, results, **kwargs):
+            self.responses.append((results, kwargs))
+
+    inline = FakeInlineQuery()
+    update = SimpleNamespace(inline_query=inline)
+    context = SimpleNamespace()
+    monkeypatch.setattr(bot, "INLINE_ENABLED", True)
+    monkeypatch.setattr(bot, "is_allowed_user", lambda user_id: True)
+
+    async def fake_chat_reply(chat_id, text):
+        return "GreyAI is online."
+
+    monkeypatch.setattr(bot, "generate_chat_reply", fake_chat_reply)
+    asyncio.run(bot.inline_query_handler(update, context))
+
+    results, options = inline.responses[0]
+    assert results[0].title == "GreyAI answer"
+    assert results[0].input_message_content.message_text == "GreyAI: GreyAI is online."
+    assert options["is_personal"] is True
+    assert options["cache_time"] == 5
+
+
 def test_url_validation_strictness():
     assert is_valid_url("https://example.com") is True
     assert is_valid_url("http://example.com/path?args=1") is True
