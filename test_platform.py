@@ -192,3 +192,24 @@ def test_revoking_developer_role_revokes_all_active_keys(platform_db):
     assert all(item["status"] == "revoked" for item in cp.list_api_keys(42))
     assert cp.authenticate_api_key(first["key"]) is None
     assert cp.authenticate_api_key(second["key"]) is None
+
+
+def test_configured_admin_inherits_developer_capabilities_and_can_create_key(platform_db, monkeypatch):
+    monkeypatch.setenv("API_KEY_HASH_SECRET", "test-api-key-secret")
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "9001")
+    admin = cp.ensure_user(9001)
+
+    assert admin["role"] == cp.ROLE_ADMIN
+    assert cp.is_admin(9001) is True
+    assert cp.is_developer(9001) is True
+    created = cp.create_api_key(9001, "admin relay", ["check"])
+    assert cp.authenticate_api_key(created["key"])["user_id"] == 9001
+
+
+def test_non_admin_still_cannot_create_developer_key_without_approval(platform_db, monkeypatch):
+    monkeypatch.setenv("API_KEY_HASH_SECRET", "test-api-key-secret")
+    cp.ensure_user(42)
+
+    assert cp.is_developer(42) is False
+    with pytest.raises(PermissionError):
+        cp.create_api_key(42, "blocked", ["check"])

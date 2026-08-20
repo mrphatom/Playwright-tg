@@ -21,6 +21,7 @@ from control_plane import (
     get_dashboard_session,
     get_user,
     is_admin,
+    is_developer,
     list_appeals,
     list_operations,
     list_reports,
@@ -96,8 +97,8 @@ def _require_api_key(request: web.Request, required_scope: Optional[str] = None)
 
 def _require_developer(request: web.Request):
     session, user = _require_session(request)
-    if user["role"] != "developer" or user["status"] != "active":
-        raise web.HTTPForbidden(text=json.dumps({"error": "developer_role_required"}), content_type="application/json")
+    if not is_developer(user["telegram_user_id"]):
+        raise web.HTTPForbidden(text=json.dumps({"error": "developer_capability_required"}), content_type="application/json")
     return session, user
 
 

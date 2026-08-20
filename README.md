@@ -43,6 +43,7 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
    ```env
    TELEGRAM_BOT_TOKEN=your_telegram_bot_token
    GEMINI_API_KEY=your_gemini_api_key
+   GEMINI_API_KEY_2=your_optional_fallback_gemini_api_key
    GEMINI_MODEL=gemini-3.6-flash
    MULTIMODAL_MODEL=gemini-3.6-flash
    CHAT_TIMEOUT_SECONDS=20
@@ -128,13 +129,15 @@ The current plans are **Pro at 750 Stars for 30 days with 1,000 monthly executio
 
 Voice notes and photos are processed only after normal authorization checks. Media is size-limited, downloaded to a temporary file, sent to Gemini for interpretation, and deleted in a `finally` cleanup path. The interpreted content is bounded and marked as untrusted before it reaches either chat or agent routing. The dashboard uses bounded requests, explicit degraded/error states, and retrying polling rather than leaving panels indefinitely stuck on “Loading…”.
 
+Set `GEMINI_API_KEY_2` to enable the optional provider failover. The primary key is used first; quota/rate-limit responses, timeouts, transport failures, and Gemini 5xx responses temporarily cool down that key and retry the same model request with the secondary key. The failover is per model call, so an active Playwright page, saved session, operation ID, and task state are not restarted. Invalid-request and authentication errors are not treated as quota exhaustion. Keys are server-side secrets and are never logged or placed in request URLs.
+
 A referral is attributed through Telegram’s `/start` deep-link parameter and cannot be reassigned. It becomes qualified only after the invited user completes a verified Telegram Stars Pro purchase. The referrer and invited user then receive configurable one-time quota bonuses recorded in the referral reward ledger. Invalid codes, self-referrals, duplicate attribution, and referrals from banned accounts are rejected.
 
 Telegram Stars are the in-Telegram payment rail for digital access. Crypto checkout is intentionally provider-gated through `CRYPTO_CHECKOUT_URL`; do not accept wallet addresses, seed phrases, or client-provided payment claims as proof of payment.
 
 ### Developer Mode and Telegram Integrations
 
-Developer access is granted only by an administrator. A user sends a direct request with `/devrequest <what you are building>`. The bot stores the request and notifies the configured administrator IDs. The administrator then approves with `/grantdeveloper <Telegram ID>` or denies it with `/denydeveloper <Telegram ID> [reason]`. Removing access with `/revokedeveloper <Telegram ID>` also revokes all active keys for that user.
+Developer access is granted only by an administrator. Configured administrators automatically inherit developer capabilities while retaining the stored `admin` role and all administrator permissions. Ordinary users must send a direct request with `/devrequest <what you are building>`. The bot stores the request and notifies the configured administrator IDs. The administrator then approves with `/grantdeveloper <Telegram ID>` or denies it with `/denydeveloper <Telegram ID> [reason]`. Removing access with `/revokedeveloper <Telegram ID>` also revokes all active keys for that user.
 
 After approval, a developer can create a scoped integration key with `/newkey <name> check`, list metadata with `/devkeys`, revoke a key with `/revokekey <key_id>`, and view usage with `/developerstats`. The plaintext key is shown once only. The database stores a keyed digest, never the secret itself, and all key lifecycle and authorization events are audited. The initial release enables only the `check` scope; `watch`, `schedule`, and `sessions` remain reserved until their ownership and delivery semantics are reviewed.
 
