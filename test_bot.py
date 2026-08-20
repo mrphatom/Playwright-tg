@@ -919,6 +919,47 @@ def test_gemini_failover_uses_secondary_after_retryable_primary_failure(monkeypa
     assert calls == ["primary", "secondary"]
 
 
+def test_gemini_failover_rotates_through_all_four_keys(monkeypatch):
+    import bot
+    from urllib.error import HTTPError
+
+    provider = bot.GeminiFailoverProvider("primary", "secondary", "test-model", cooldown_seconds=60, tertiary_key="tertiary", quaternary_key="quaternary")
+    calls = []
+
+    def fake_request(key, prompt, generation_config, model):
+        calls.append(key)
+        if key != "quaternary":
+            raise HTTPError("https://gemini", 429, "quota", {}, None)
+        return "safe provider response"
+
+    monkeypatch.setattr(provider, "_request_text", fake_request)
+    result = asyncio.run(provider.generate_text("hello", {"max_output_tokens": 8}))
+
+    assert result == "safe provider response"
+    assert calls == ["primary", "secondary", "tertiary", "quaternary"]
+    assert provider.last_successful_key_slot == 4
+    assert all(secret not in result for secret in calls)
+
+
+def test_gemini_failover_skips_cooling_keys_and_uses_next_healthy_slot(monkeypatch):
+    import bot
+    provider = bot.GeminiFailoverProvider("primary", "secondary", "test-model", cooldown_seconds=60, tertiary_key="tertiary", quaternary_key="quaternary")
+    provider._mark_cooldown("primary")
+    provider._mark_cooldown("secondary")
+    calls = []
+
+    def fake_request(key, prompt, generation_config, model):
+        calls.append(key)
+        return "tertiary response"
+
+    monkeypatch.setattr(provider, "_request_text", fake_request)
+    result = asyncio.run(provider.generate_text("hello", {"max_output_tokens": 8}))
+
+    assert result == "tertiary response"
+    assert calls == ["tertiary"]
+    assert provider.last_successful_key_slot == 3
+
+
 def test_gemini_text_failover_uses_fallback_model_after_quota(monkeypatch):
     import bot
     from urllib.error import HTTPError
