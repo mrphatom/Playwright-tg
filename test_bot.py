@@ -758,6 +758,37 @@ def test_multimodal_request_keeps_gemini_key_out_of_url(monkeypatch, tmp_path):
     assert seen["headers"]["X-goog-api-key"] == "test-gemini-key"
 
 
+def test_provider_alert_manager_suppresses_duplicates_and_notifies_recovery(monkeypatch):
+    import bot
+
+    class FakeBot:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, **kwargs):
+            self.messages.append(kwargs)
+
+    fake_bot = FakeBot()
+    manager = bot.ProviderAlertManager(cooldown_seconds=900)
+    manager.attach_bot(fake_bot)
+    monkeypatch.setattr(bot, "PROVIDER_ALERTS_ENABLED", True)
+    monkeypatch.setattr(bot, "admin_ids", lambda: {6411860985})
+    before = dict(bot.provider_metrics)
+
+    async def exercise():
+        await manager.notify_failure("quota_exhaustion", "gemini-3.6-flash", True)
+        await manager.notify_failure("quota_exhaustion", "gemini-3.6-flash", True)
+        await manager.notify_recovery("gemini-3.6-flash")
+
+    asyncio.run(exercise())
+
+    assert len(fake_bot.messages) == 2
+    assert "gemini-3.6-flash" in fake_bot.messages[0]["text"]
+    assert "API key" not in fake_bot.messages[0]["text"]
+    assert bot.provider_metrics["alerts_suppressed"] == before["alerts_suppressed"] + 1
+    assert bot.provider_metrics["recoveries_sent"] == before["recoveries_sent"] + 1
+
+
 def test_gemini_failover_uses_secondary_after_retryable_primary_failure(monkeypatch):
     import bot
     from urllib.error import HTTPError

@@ -20,6 +20,8 @@ primary_region = "iad"
   GEMINI_MODEL = "gemini-3.6-flash"
   TEXT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
   MULTIMODAL_MODEL = "gemini-3.5-flash-lite"
+  PROVIDER_ALERTS_ENABLED = "true"
+  PROVIDER_ALERT_COOLDOWN_SECONDS = "900"
   MEDIA_TIMEOUT_SECONDS = "45"
   
   PUBLIC_MODE = "true"
