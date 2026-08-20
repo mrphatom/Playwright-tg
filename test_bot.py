@@ -1398,3 +1398,143 @@ def test_task_route_fails_closed_instead_of_falling_back_to_chat(monkeypatch):
 
     assert any("recognized this as a web or browser task" in text for text in message.edits)
     assert not any("can't browse" in text.lower() or "cannot browse" in text.lower() for text in message.edits)
+
+
+def test_private_chat_prompt_is_distinct_from_group_prompt():
+    import bot
+
+    private_prompt = bot.build_chat_prompt("fuck you", [], private_chat=True)
+    shared_prompt = bot.build_chat_prompt("fuck you", [], private_chat=False)
+
+    assert "private chat with the owner" in private_prompt
+    assert "playful clapback" in private_prompt
+    assert "private chat with the owner" not in shared_prompt
+    assert "neutral, respectful tone" in shared_prompt
+
+
+def test_private_chat_micro_replies_handle_short_social_turns_without_provider():
+    import bot
+
+    assert bot.private_chat_micro_reply("Hey") == "Hey. I’m here. What’s up?"
+    assert bot.private_chat_micro_reply("Fuck you")
+    assert bot.private_chat_micro_reply("cry")
+    assert bot.private_chat_micro_reply("Thanks") == "Anytime."
+    assert bot.private_chat_micro_reply("Search for Apple on Google and tell me the current price") is None
+
+
+def test_private_chat_social_turn_is_fast_and_group_chat_keeps_provider_persona(monkeypatch):
+    import bot
+    calls = []
+    class FakeProvider:
+        async def generate_text(self, prompt, generation_config):
+            calls.append(prompt)
+            return "A measured shared-chat answer."
+    monkeypatch.setattr(bot, "gemini_provider", FakeProvider())
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+
+    private_reply = asyncio.run(bot.generate_chat_reply(881, "Fuck you", private_chat=True))
+    shared_reply = asyncio.run(bot.generate_chat_reply(882, "Fuck you", private_chat=False))
+
+    assert private_reply
+    assert shared_reply == "A measured shared-chat answer."
+    assert len(calls) == 1
+    assert "private chat with the owner" not in calls[0]
+
+
+def test_private_chat_personality_never_swallows_agent_routing():
+    import bot
+
+    request = "Search for Apple on Google and tell me the current iPhone 15 price"
+    assert bot.classify_message_route(request) == "task"
+    assert bot.private_chat_micro_reply(request) is None
+
+
+def test_business_connection_update_persists_only_connection_metadata(monkeypatch):
+    import bot
+
+    recorded = []
+    monkeypatch.setattr(bot, "save_business_connection", lambda *args: recorded.append(args))
+    monkeypatch.setattr(bot, "log_audit", lambda *args: None)
+    rights = SimpleNamespace(can_read_messages=True, can_reply=True)
+    connection = SimpleNamespace(
+        id="business-connection-1",
+        user=SimpleNamespace(id=6411860985),
+        user_chat_id=6411860985,
+        is_enabled=True,
+        rights=rights,
+    )
+    update = SimpleNamespace(business_connection=connection)
+
+    asyncio.run(bot.business_connection_update_handler(update, SimpleNamespace()))
+
+    assert recorded == [("business-connection-1", 6411860985, 6411860985, True, True, True)]
+
+
+def test_business_message_routes_to_visible_business_reply_pipeline_as_owner(monkeypatch):
+    import bot
+
+    bot.business_user_cooldowns.clear()
+    calls = []
+    replies = []
+
+    class FakeMessage:
+        business_connection_id = "business-connection-2"
+        chat_id = 987654
+        text = "Fuck you"
+        caption = None
+        from_user = SimpleNamespace(is_bot=False)
+
+        async def reply_text(self, text, **kwargs):
+            replies.append((text, kwargs))
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        business_message=message,
+        message=None,
+        channel_post=None,
+        effective_chat=SimpleNamespace(id=message.chat_id, type="private"),
+        effective_user=SimpleNamespace(id=123456),
+    )
+
+    monkeypatch.setattr(bot, "get_business_connection", lambda connection_id: {
+        "connection_id": connection_id,
+        "owner_user_id": 6411860985,
+        "owner_chat_id": 6411860985,
+        "is_enabled": True,
+        "can_read_messages": True,
+        "can_reply": True,
+    })
+    monkeypatch.setattr(bot, "ensure_user", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "is_allowed_user", lambda user_id: user_id == 6411860985)
+
+    async def fake_process(update, context, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(bot, "_process_natural_language", fake_process)
+    asyncio.run(bot.business_message_handler(update, SimpleNamespace()))
+
+    assert calls == [{"user_id_override": 6411860985}]
+    assert replies == []
+
+
+def test_business_message_rejects_without_reply_permission(monkeypatch):
+    import bot
+
+    calls = []
+    monkeypatch.setattr(bot, "get_business_connection", lambda connection_id: {
+        "connection_id": connection_id,
+        "owner_user_id": 6411860985,
+        "owner_chat_id": 6411860985,
+        "is_enabled": True,
+        "can_read_messages": True,
+        "can_reply": False,
+    })
+    async def fake_process(*args, **kwargs):
+        calls.append(True)
+    monkeypatch.setattr(bot, "_process_natural_language", fake_process)
+    message = SimpleNamespace(business_connection_id="business-connection-3", chat_id=888, text="Hello", caption=None)
+    update = SimpleNamespace(business_message=message)
+
+    asyncio.run(bot.business_message_handler(update, SimpleNamespace()))
+
+    assert calls == []
