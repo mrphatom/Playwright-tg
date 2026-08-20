@@ -9,6 +9,26 @@ Playwright-tg operates using a pipeline syntax. You start with a base command (l
 
 ---
 
+## 💬 Plain-Language Requests
+
+You can send an ordinary sentence instead of a slash command. Include an explicit `http://` or `https://` URL and describe what you want to read or monitor.
+
+For a one-time check:
+
+```text
+Check https://example.com and summarize the page title and main product details
+```
+
+For a persistent watcher:
+
+```text
+Check https://example.com/store and tell me when Apple Pie is in stock
+```
+
+The bot converts the message into a validated plan using Gemini, then reuses the same browser pipeline and persistent SQLite watcher engine as the structured commands. Existing slash commands continue to work unchanged. Plain-language requests are subject to the same authorized-user check, domain whitelist, concurrency limit, and timeout controls.
+
+---
+
 ## 🛠️ Action Glossary
 
 Here are all the building blocks you can use in your pipelines:

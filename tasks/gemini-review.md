@@ -1,0 +1,5 @@
+# Review of Gemini proposal
+
+Gemini’s proposal correctly identifies the right user experience: add a `MessageHandler` for non-command text, parse the request into a structured plan, and keep the existing slash commands as a fallback. It also correctly places authorization before AI/browser execution.
+
+The proposed file is not safe to copy over the current `bot.py`. It replaces the existing application instead of extending it, omits the persistent watcher database and restore logic, omits encrypted session commands, omits the current pipeline action support, and leaves watch mode as a comment rather than connecting it to `watcher_loop`. It also switches from the repository’s pinned `google-generativeai==0.4.1` package to the separate `google-genai` SDK without updating dependencies, uses a preview model name that is not verified for the current deployment, and changes empty-user-list behavior from the current permissive development behavior to deny-all. The implementation will therefore keep the current SDK and runtime architecture, add a narrow JSON intent parser, validate and normalize the plan, and reuse existing check/watch functions.

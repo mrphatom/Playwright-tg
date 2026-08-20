@@ -2,6 +2,8 @@ import pytest
 import os
 import sqlite3
 import json
+import asyncio
+from types import SimpleNamespace
 
 # Set environment variable BEFORE importing bot module so bot uses test_telescout.db
 os.environ["DB_PATH"] = "test_telescout.db"
@@ -13,7 +15,9 @@ from bot import (
     is_domain_allowed,
     save_encrypted_session,
     load_encrypted_session,
-    init_db
+    init_db,
+    normalize_natural_language_plan,
+    mask_sensitive_action
 )
 
 @pytest.fixture(autouse=True)
@@ -57,6 +61,106 @@ def test_encrypted_session_storage():
     # Load & Decrypt
     decrypted = load_encrypted_session(user_id, session_name)
     assert decrypted == dummy_cookies
+
+def test_natural_language_check_plan_normalizes_valid_input(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://example.com/products",
+        "request": "Summarize the product title",
+        "condition": "",
+        "condition_type": "ai",
+        "interval_seconds": 60,
+    })
+
+    assert plan == {
+        "mode": "check",
+        "url": "https://example.com/products",
+        "actions": ["ai_extract:Summarize the product title"],
+        "condition": "",
+        "condition_type": "ai",
+        "interval_seconds": 60,
+    }
+
+
+def test_natural_language_watch_plan_clamps_interval_and_uses_condition(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = normalize_natural_language_plan({
+        "mode": "watch",
+        "url": "https://example.com/products",
+        "request": "",
+        "condition": "Apple Pie is in stock",
+        "condition_type": "contains",
+        "interval_seconds": 5,
+    })
+
+    assert plan["mode"] == "watch"
+    assert plan["actions"] == ["condition_contains:Apple Pie is in stock"]
+    assert plan["interval_seconds"] == 30
+
+
+def test_natural_language_plan_rejects_invalid_or_disallowed_urls(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["allowed.example"])
+
+    assert normalize_natural_language_plan({
+        "mode": "check",
+        "url": "javascript:alert(1)",
+        "request": "read it",
+    }) is None
+    assert normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://blocked.example/page",
+        "request": "read it",
+    }) is None
+
+
+def test_natural_language_parser_accepts_fenced_json(monkeypatch):
+    import bot
+
+    class FakeResponse:
+        text = """```json
+{"mode": "watch", "url": "https://example.com", "request": "", "condition": "Apple Pie is in stock", "condition_type": "contains", "interval_seconds": 60}
+```"""
+
+    class FakeModel:
+        def generate_content(self, prompt, generation_config=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(bot, "ai_model", FakeModel())
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = asyncio.run(bot.parse_natural_language_intent("tell me when Apple Pie is in stock"))
+
+    assert plan["mode"] == "watch"
+    assert plan["actions"] == ["condition_contains:Apple Pie is in stock"]
+
+
+def test_sensitive_natural_language_actions_are_redacted():
+    assert mask_sensitive_action("ai_extract:read my private account") == "ai_extract:***REDACTED***"
+    assert mask_sensitive_action("condition_ai:alert me about my order") == "condition_ai:***REDACTED***"
+    assert mask_sensitive_action("condition_contains:secret phrase") == "condition_contains:***REDACTED***"
+
+
+def test_restricted_handler_fails_closed_without_allowlist(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_USERS", set())
+    called = False
+
+    @bot.restricted
+    async def protected(update, context):
+        nonlocal called
+        called = True
+
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=123), message=None)
+    asyncio.run(protected(update, None))
+
+    assert called is False
+
 
 def test_domain_whitelist_filtering(monkeypatch):
     """Verify domain whitelist correctly permits or blocks URLs."""
