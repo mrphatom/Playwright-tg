@@ -17,6 +17,8 @@ primary_region = "iad"
   MAX_CONCURRENT_TASKS = "3"
   
   COMMAND_TIMEOUT = "90"
+  MULTIMODAL_MODEL = "gemini-3.5-flash-lite"
+  MEDIA_TIMEOUT_SECONDS = "45"
   
   PUBLIC_MODE = "true"
   ALLOWED_DOMAINS = "github.com,amazon.com,news.ycombinator.com,google.com,x.com"

@@ -88,10 +88,11 @@ CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-MULTIMODAL_MODEL = os.getenv("MULTIMODAL_MODEL", GEMINI_MODEL)
+MULTIMODAL_MODEL = os.getenv("MULTIMODAL_MODEL", "gemini-3.5-flash-lite")
 MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", "12000000"))
 MAX_MEDIA_CONTEXT_CHARS = int(os.getenv("MAX_MEDIA_CONTEXT_CHARS", "6000"))
 CHAT_TIMEOUT_SECONDS = int(os.getenv("CHAT_TIMEOUT_SECONDS", "20"))
+MEDIA_TIMEOUT_SECONDS = int(os.getenv("MEDIA_TIMEOUT_SECONDS", "45"))
 
 ALLOWED_USERS = set(int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_USERS", "").split(",") if uid.strip().isdigit())
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
@@ -130,13 +131,22 @@ else:
     ai_model = None
 
 
+class MediaProviderUnavailable(RuntimeError):
+    """Safe user-facing category for exhausted or unavailable media providers."""
+
+
+class MediaProviderTimeout(TimeoutError):
+    """Media-specific timeout that does not imply the input is too large."""
+
+
 class GeminiFailoverProvider:
     """Use one of two Gemini keys per request without restarting caller workflows."""
 
-    def __init__(self, primary_key: Optional[str], secondary_key: Optional[str], model: str, cooldown_seconds: int = 20):
+    def __init__(self, primary_key: Optional[str], secondary_key: Optional[str], model: str, cooldown_seconds: int = 20, media_model: Optional[str] = None):
         self.primary_key = primary_key
         self.secondary_key = secondary_key
         self.model = model
+        self.media_model = media_model or model
         self.cooldown_seconds = max(1, cooldown_seconds)
         self._cooldowns: Dict[str, float] = {}
 
@@ -182,11 +192,11 @@ class GeminiFailoverProvider:
                 {"text": instruction},
                 {"inline_data": {"mime_type": mime_type, "data": encoded}},
             ]}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1200},
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 800},
         }).encode("utf-8")
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.media_model}:generateContent"
         request = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
-        with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=MEDIA_TIMEOUT_SECONDS) as response:
             data = json.loads(response.read().decode("utf-8"))
         parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
         return "\n".join(str(part.get("text", "")) for part in parts if part.get("text")).strip()
@@ -221,22 +231,31 @@ class GeminiFailoverProvider:
         if not keys:
             raise RuntimeError("Gemini is not configured")
         last_error = None
+        retryable_errors = []
         for index, key in enumerate(keys):
             if index < len(keys) - 1 and self._is_cooling_down(key):
                 continue
             try:
-                return await asyncio.wait_for(asyncio.to_thread(self._request_media, key, path, mime_type, instruction), timeout=CHAT_TIMEOUT_SECONDS)
+                return await asyncio.wait_for(
+                    asyncio.to_thread(self._request_media, key, path, mime_type, instruction),
+                    timeout=MEDIA_TIMEOUT_SECONDS,
+                )
             except Exception as error:
                 last_error = error
                 if not self._is_retryable(error) or index == len(keys) - 1:
-                    raise
+                    break
+                retryable_errors.append(error)
                 self._mark_cooldown(key)
+        if isinstance(last_error, (asyncio.TimeoutError, TimeoutError)):
+            raise MediaProviderTimeout("Gemini media interpretation timed out") from last_error
+        if any(getattr(error, "code", None) == 429 for error in retryable_errors + ([last_error] if last_error else [])):
+            raise MediaProviderUnavailable("Gemini media quota is exhausted or the fallback project is unavailable") from last_error
         if last_error:
             raise last_error
-        raise RuntimeError("No healthy Gemini key available")
+        raise MediaProviderUnavailable("No healthy Gemini media provider is available")
 
 
-gemini_provider = GeminiFailoverProvider(GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_MODEL)
+gemini_provider = GeminiFailoverProvider(GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_MODEL, media_model=MULTIMODAL_MODEL)
 
 
 def gemini_configured() -> bool:
@@ -2632,8 +2651,12 @@ async def multimodal_message_handler(update: Update, context: ContextTypes.DEFAU
         except TelegramError:
             pass
         await _process_natural_language(update, context, request_text_override=request_text)
+    except MediaProviderUnavailable:
+        await status.edit_text("Gemini's media quota or provider capacity is currently unavailable. Your media is within the supported size and duration range; please try again shortly.")
+    except MediaProviderTimeout:
+        await status.edit_text("Gemini's media service timed out while processing this input. The media was not too long or too large; please try again shortly.")
     except asyncio.TimeoutError:
-        await status.edit_text("The media interpretation timed out. Please try a shorter voice note or smaller image.")
+        await status.edit_text("The media processing request timed out. Your media was not too long or too large; please try again shortly.")
     except ValueError as exc:
         await status.edit_text(f"I couldn't process that media: {exc}")
     except Exception:
