@@ -24,7 +24,9 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 - **🧩 Developer Mode:** Admin-granted developer access, Telegram approval requests, scoped one-time API keys, revocation, per-key rate limits, integration endpoints, and auditable developer activity.
 - **💳 Entitlements:** Telegram Stars Pro upgrade flow with pre-checkout validation, idempotent receipts, durable entitlements, and an optional external HTTPS crypto checkout adapter.
 - **🎁 Referrals:** Unique Telegram deep links, one-time attribution, self-referral and duplicate protection, verified-payment qualification, auditable quota rewards, user stats, and admin reporting.
-- **📊 Operations Dashboard:** One-time Telegram-issued dashboard links, secure cookie sessions, CSRF-protected admin actions, redacted execution logs, saved-session metadata, health data, and live polling/websocket updates.
+- **📊 Operations Dashboard:** One-time Telegram-issued dashboard links, secure cookie sessions, CSRF-protected admin actions, redacted execution logs, saved-session metadata, health data, analytics, banned-user views, and live polling/websocket updates.
+- **📬 Durable User Notifications:** Ban, unban, and appeal decisions enqueue bounded, secret-free Telegram notifications in an idempotent retryable SQLite outbox delivered by a background worker.
+- **🧰 Confirmation-Gated Administration:** Announcements, private messages, mass ban/unban, and mass appeal decisions use preview-first jobs with bounded target counts, short-lived single-use confirmation tokens, audit records, and per-item success/failure counts.
 - **🧪 Cautious Activity Review:** Advisory AI risk review with confidence calibration. Strong signals create human-review work; the model never automatically bans, suspends, or limits an account.
 - **🐳 Production Docker Ready:** Built-in volume mapping and memory limits for 24/7 VPS hosting.
 
@@ -98,6 +100,7 @@ A voice note is transcribed and then routed as either a normal chat message or a
 | `/devkeys` | Active developer or administrator | List labeled metadata without secret values |
 | `/revokekey <key_id>` | Key owner or authorized administrator | Revoke a key |
 | `/developerstats` | Active developer or administrator | View key activity, request counts, and denied events |
+| `/devevents [after_event_id]` | Active developer or administrator | Read an owner-scoped, cursor-based event feed with secret-like payload keys redacted |
 
 Other Telegram bots use the versioned integration API:
 
@@ -118,7 +121,15 @@ The initial enabled scope is `check`. Keys are not dashboard credentials, and th
 
 ### Administrator command groups
 
-Administrators can search users, inspect account state, ban and unban accounts, review reports and appeals, resolve tickets, inspect referral activity, grant and revoke administrator roles, review developer requests, approve or deny developer access, inspect platform health, and manage the domain policy. The available commands include `/admin`, `/admin_user`, `/grantadmin`, `/revokeadmin`, `/ban`, `/unban`, `/reports`, `/appeals`, `/review`, `/resolveappeal`, `/referrals`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/domains`, `/allowdomain`, `/disallowdomain`, and `/resetdomain`.
+Administrators can search users, inspect account state, ban and unban accounts, review reports and appeals, resolve tickets, inspect referral activity, grant and revoke administrator roles, review developer requests, approve or deny developer access, inspect platform health, and manage the domain policy. The available commands include `/admin`, `/admin_user`, `/grantadmin`, `/revokeadmin`, `/ban`, `/unban`, `/banned`, `/reports`, `/appeals`, `/review`, `/resolveappeal`, `/referrals`, `/analytics`, `/announce`, `/dm`, `/massdm`, `/massban`, `/massunban`, `/massappeals`, `/confirmbulk`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/domains`, `/allowdomain`, `/disallowdomain`, and `/resetdomain`.
+
+### Announcements, private messages, and bulk moderation
+
+`/announce <message>` previews an announcement to active users. `/dm <telegram_id> <message>` previews a private message to one existing user, while `/massdm <id1,id2,...> | <message>` previews a bounded multi-recipient message. These commands do not deliver immediately. The preview includes a job ID and short-lived token; delivery starts only after the administrator sends `/confirmbulk <job_id> <token>`. Confirmation is single-use and expires after ten minutes.
+
+The same workflow protects `/massban <id1,id2,...> | <reason>`, `/massunban <id1,id2,...>`, and `/massappeals <resolved|denied> <appeal_id1,appeal_id2,...> | <resolution>`. Administrator accounts are never valid mass-ban targets. A completed job reports processed, succeeded, and failed items, and every state change is written to the audit trail. `/banned` lists currently banned accounts, and `/analytics` shows banned users, suspicious users awaiting human review, top users by operations, top referrers, and the most risky accounts.
+
+Ban, unban, and appeal decisions send the affected user a bounded notification through the durable outbox. Notifications use unique idempotency keys, bounded retries, exponential backoff, and HTML escaping; internal risk evidence, API keys, cookies, prompts, and administrator-only details are not included.
 
 ### Versatile domain allowlist
 
@@ -163,6 +174,11 @@ They can block a host or family of subdomains immediately:
    MEDIA_TIMEOUT_SECONDS=45
    MEDIA_MAX_BYTES=12000000
    MAX_MEDIA_CONTEXT_CHARS=6000
+   NOTIFICATION_WORKER_ENABLED=true
+   BULK_ACTIONS_ENABLED=true
+   DEVELOPER_EVENTS_ENABLED=true
+   MAX_BULK_TARGETS=200
+   NOTIFICATION_POLL_SECONDS=5
    ALLOWED_TELEGRAM_USERS=123456789,987654321
    # Seed domains; administrators can add exact hosts or *.subdomain patterns at runtime.
    ALLOWED_DOMAINS=github.com,amazon.com,news.ycombinator.com,reddit.com
@@ -292,7 +308,7 @@ Content-Type: application/json
 
 The response contains an operation ID, page title, validated URL, and redacted extraction results. It does not contain browser cookies, saved sessions, credentials, screenshots, or internal stack traces. The API enforces the same public-mode domain allowlist, SSRF protections, platform quota, browser timeout, and concurrency controls as Telegram commands. Each key also has a configurable per-minute limit, defaulting to 30 requests and capped server-side at 120.
 
-Developers can manage keys through the authenticated dashboard at `GET /api/v1/keys`, `POST /api/v1/keys`, and `DELETE /api/v1/keys/{key_id}`. Usage is available at `GET /api/v1/developer/stats`. Dashboard mutations require the existing secure session and CSRF token; bearer keys do not grant dashboard privileges.
+Developers can manage keys through the authenticated dashboard at `GET /api/v1/keys`, `POST /api/v1/keys`, and `DELETE /api/v1/keys/{key_id}`. Usage is available at `GET /api/v1/developer/stats`. The owner-scoped developer event feed is available in Telegram through `/devevents [after_event_id]`; use the last returned event ID as the next cursor. Dashboard mutations require the existing secure session and CSRF token; bearer keys do not grant dashboard privileges.
 
 ## References
 

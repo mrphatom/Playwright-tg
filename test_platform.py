@@ -17,6 +17,72 @@ def platform_db(tmp_path, monkeypatch):
     return path
 
 
+def test_notification_outbox_is_idempotent_and_retryable(platform_db):
+    cp.ensure_user(42)
+    first_id, first_created = cp.enqueue_user_notification(42, "moderation", "Account update", "Your account was reviewed.", "moderation:42:appeal_1")
+    second_id, second_created = cp.enqueue_user_notification(42, "moderation", "Duplicate", "Should not create another row.", "moderation:42:appeal_1")
+
+    assert first_created is True
+    assert (second_id, second_created) == (first_id, False)
+    pending = cp.list_pending_notifications(10)
+    assert len(pending) == 1
+    assert cp.mark_notification_failed(first_id, "temporary delivery error") is True
+    assert cp.mark_notification_delivered(first_id) is True
+    assert cp.list_pending_notifications(10) == []
+
+
+def test_notification_retry_cap_dead_letters_permanent_failures(platform_db):
+    cp.ensure_user(42)
+    notification_id, _ = cp.enqueue_user_notification(42, "system", "Update", "Please review this update.", "retry-cap:42")
+    for _ in range(cp.MAX_NOTIFICATION_ATTEMPTS):
+        assert cp.mark_notification_sending(notification_id) is True
+        assert cp.mark_notification_failed(notification_id, "permanent delivery failure") is True
+    with sqlite3.connect(platform_db) as connection:
+        status = connection.execute("SELECT status, attempt_count FROM user_notifications WHERE notification_id = ?", (notification_id,)).fetchone()
+    assert status == ("dead_letter", cp.MAX_NOTIFICATION_ATTEMPTS)
+    assert cp.list_pending_notifications(10) == []
+
+
+def test_bulk_job_requires_short_lived_confirmation(platform_db):
+    cp.ensure_user(9001)
+    job = cp.create_bulk_job(9001, "mass_ban", {"reason": "abuse"}, [42, 43], ttl_minutes=5)
+    assert job["status"] == "preview"
+    assert cp.confirm_bulk_job(job["job_id"], "wrong-token", 9001) is None
+    confirmed = cp.confirm_bulk_job(job["job_id"], job["confirmation_token"], 9001)
+    assert confirmed is not None
+    assert confirmed["status"] == "confirmed"
+    assert cp.confirm_bulk_job(job["job_id"], job["confirmation_token"], 9001) is None
+
+
+def test_admin_analytics_cover_banned_suspicious_top_users_and_referrers(platform_db):
+    cp.ensure_user(9001)
+    for user_id in (42, 43, 44):
+        cp.ensure_user(user_id)
+    cp.set_user_status(44, cp.STATUS_BANNED, "policy violation")
+    cp.create_operation("op_42", 42, 42, "check", "https://example.com")
+    cp.create_operation("op_42_2", 42, 42, "check", "https://example.com")
+    cp.create_operation("op_43", 43, 43, "check", "https://example.com")
+    cp.record_risk_event(43, None, 0.95, 0.95, "human_review", {"reason": "repeat suspicious pattern"}, "test", True)
+    code = cp.get_or_create_referral_code(42)
+    cp.attribute_referral(43, code)
+    analytics = cp.get_admin_analytics(10)
+
+    assert analytics["banned_users"][0]["telegram_user_id"] == 44
+    assert analytics["suspicious_users"][0]["telegram_user_id"] == 43
+    assert analytics["top_users"][0]["telegram_user_id"] == 42
+    assert analytics["top_referrers"][0]["telegram_user_id"] == 42
+
+
+def test_developer_event_feed_is_owner_scoped_and_cursorable(platform_db):
+    cp.ensure_user(42)
+    cp.ensure_user(43)
+    first = cp.record_developer_event(42, "watcher_alert", {"watcher_id": "w1", "summary": "new post"})
+    cp.record_developer_event(43, "watcher_alert", {"watcher_id": "w2", "summary": "other"})
+    events = cp.list_developer_events(42, limit=10)
+    assert [row["event_id"] for row in events] == [first]
+    assert cp.list_developer_events(42, after_event_id=first, limit=10) == []
+
+
 def test_roles_public_access_and_ban_lifecycle(platform_db):
     admin = cp.ensure_user(9001, "admin", "Admin")
     user = cp.ensure_user(42, "alice", "Alice")
