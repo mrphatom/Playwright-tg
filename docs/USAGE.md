@@ -55,7 +55,14 @@ Open https://example.com/dashboard using the saved session x_login, wait 2 secon
 Create a session called x_login, then log in to https://x.com, Username = 'your_username' Password = 'your_password'
 ```
 
-A named session in a login request is persisted as encrypted browser state after the login pipeline finishes. Sites requiring CAPTCHA or MFA may still require manual completion.
+A named session in a login request is persisted as encrypted browser state after the login pipeline finishes. You can also select a saved session for the next browser operation without repeating the session name:
+
+```text
+Load session 'x_login'
+Open https://example.com/dashboard and summarize the account page
+```
+
+The bot confirms whether the session exists, applies it to the next browser command, and clears the selection when that session is deleted. Each natural-language operation receives a short reference ID in its progress message for troubleshooting. Transient browser failures use a bounded retry policy; permanent validation failures are not retried indefinitely. `/health` and “show system health” report browser readiness, resource usage, active schedules/watchers, command counts, browser attempts, and failures. Sites requiring CAPTCHA or MFA may still require manual completion.
 
 ---
 

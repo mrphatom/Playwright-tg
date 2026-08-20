@@ -196,6 +196,25 @@ def test_combined_session_login_uses_requested_session_name(monkeypatch):
     assert "save_session:x_login" in plan["actions"]
 
 
+def test_natural_language_session_only_commands_are_interpreted():
+    import bot
+
+    assert bot.parse_deterministic_management_request("load session 'x_login'") == {
+        "mode": "load_session",
+        "session_name": "x_login",
+    }
+    assert bot.parse_deterministic_management_request("use saved session x_login") == {
+        "mode": "load_session",
+        "session_name": "x_login",
+    }
+    assert bot.parse_deterministic_management_request("show system health") == {
+        "mode": "health"
+    }
+    assert bot.parse_deterministic_management_request("what can you do") == {
+        "mode": "help"
+    }
+
+
 def test_natural_language_management_commands_are_interpreted():
     import bot
 
@@ -270,6 +289,18 @@ def test_natural_language_parser_falls_back_for_unknown_schedule_output(monkeypa
 
     assert plan["mode"] == "schedule"
     assert plan["schedule"]["urls"] == ["https://google.com/news"]
+
+
+def test_deterministic_web_fallback_uses_selected_session(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = bot.parse_deterministic_web_request(
+        "Open https://example.com/dashboard and summarize it",
+        default_session_name="x_login",
+    )
+
+    assert plan["actions"] == ["load_session:x_login", "ai_extract:it"]
 
 
 def test_deterministic_web_fallback_handles_check_and_watch(monkeypatch):
@@ -556,6 +587,25 @@ def test_sensitive_natural_language_actions_are_redacted():
     assert mask_sensitive_action("ai_extract:read my private account") == "ai_extract:***REDACTED***"
     assert mask_sensitive_action("condition_ai:alert me about my order") == "condition_ai:***REDACTED***"
     assert mask_sensitive_action("condition_contains:secret phrase") == "condition_contains:***REDACTED***"
+
+
+def test_browser_task_retry_recovers_transient_failure(monkeypatch):
+    import bot
+    attempts = []
+
+    async def flaky_task(url, actions, user_id, status_msg=None):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary browser failure")
+        return {"title": "Recovered", "extracted": [], "screenshot": "unused.png"}
+
+    monkeypatch.setattr(bot, "run_browser_task", flaky_task)
+    result = asyncio.run(bot.run_browser_task_with_retry(
+        "https://example.com", [], 7, "operation123", attempts=2
+    ))
+
+    assert result["title"] == "Recovered"
+    assert attempts == ["https://example.com", "https://example.com"]
 
 
 def test_restricted_handler_fails_closed_without_allowlist(monkeypatch):
