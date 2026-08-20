@@ -118,7 +118,28 @@ The initial enabled scope is `check`. Keys are not dashboard credentials, and th
 
 ### Administrator command groups
 
-Administrators can search users, inspect account state, ban and unban accounts, review reports and appeals, resolve tickets, inspect referral activity, grant and revoke administrator roles, review developer requests, approve or deny developer access, and inspect platform health. The available commands are `/admin`, `/admin_user`, `/grantadmin`, `/revokeadmin`, `/ban`, `/unban`, `/reports`, `/appeals`, `/review`, `/resolveappeal`, `/referrals`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, and `/revokedeveloper`.
+Administrators can search users, inspect account state, ban and unban accounts, review reports and appeals, resolve tickets, inspect referral activity, grant and revoke administrator roles, review developer requests, approve or deny developer access, inspect platform health, and manage the domain policy. The available commands include `/admin`, `/admin_user`, `/grantadmin`, `/revokeadmin`, `/ban`, `/unban`, `/reports`, `/appeals`, `/review`, `/resolveappeal`, `/referrals`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/domains`, `/allowdomain`, `/disallowdomain`, and `/resetdomain`.
+
+### Versatile domain allowlist
+
+The public-mode allowlist is no longer limited to a small hard-coded set. It combines deployment-seeded patterns from `ALLOWED_DOMAINS` with persistent administrator-managed runtime policies. An exact pattern such as `example.com` allows the apex domain and its subdomains for backward compatibility. A wildcard pattern such as `*.example.com` allows subdomains but not the apex domain. A deny rule always takes precedence over environment and runtime allow rules.
+
+Administrators can expand access without redeploying:
+
+```text
+/allowdomain docs.python.org
+/allowdomain *.wikipedia.org
+/domains
+```
+
+They can block a host or family of subdomains immediately:
+
+```text
+/disallowdomain tracking.example.com
+/disallowdomain *.untrusted.example
+```
+
+`/resetdomain <pattern>` removes the runtime override and returns to the deployment-seeded policy. Every mutation is normalized, parameterized, administrator-only, and written to the audit log. Patterns cannot contain paths, ports, credentials, IP addresses, or arbitrary wildcards. These controls expand the hostname policy only; HTTPS validation, private-network and SSRF blocking, quotas, timeouts, concurrency limits, and user authorization remain mandatory.
 
 ---
 
@@ -143,6 +164,8 @@ Administrators can search users, inspect account state, ban and unban accounts, 
    MEDIA_MAX_BYTES=12000000
    MAX_MEDIA_CONTEXT_CHARS=6000
    ALLOWED_TELEGRAM_USERS=123456789,987654321
+   # Seed domains; administrators can add exact hosts or *.subdomain patterns at runtime.
+   ALLOWED_DOMAINS=github.com,amazon.com,news.ycombinator.com,reddit.com
    SESSION_ENCRYPTION_KEY=your_aes_encryption_key
    ```
 

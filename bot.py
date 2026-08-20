@@ -200,6 +200,10 @@ async def configure_bot_profile(bot) -> None:
         BotCommand("ask", "Ask GreyAI in a private chat or enabled group"),
         BotCommand("enablegreyai", "Enable GreyAI in a group"),
         BotCommand("disablegreyai", "Disable GreyAI in a group"),
+        BotCommand("domains", "View the domain policy"),
+        BotCommand("allowdomain", "Allow a domain or subdomain pattern"),
+        BotCommand("disallowdomain", "Deny a domain or subdomain pattern"),
+        BotCommand("resetdomain", "Remove a runtime domain override"),
         BotCommand("health", "Check service and browser health"),
         BotCommand("check", "Run a secure browser check"),
         BotCommand("watch", "Monitor a page until a condition is met"),
@@ -664,6 +668,17 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Runtime domain policy. A deny pattern takes precedence over all allow patterns.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS domain_policies (
+                pattern TEXT PRIMARY KEY,
+                effect TEXT NOT NULL CHECK (effect IN ('allow', 'deny')),
+                created_by_user_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
     init_platform_db()
     logger.info("Database initialized successfully.")
@@ -724,6 +739,80 @@ def is_bot_mention_or_reply(message, bot_username: Optional[str]) -> bool:
 
 def channel_is_allowed(chat_id: int) -> bool:
     return CHANNEL_INVOCATION_ENABLED and (chat_id in ALLOWED_CHANNEL_IDS or chat_scope_enabled(chat_id, "channel"))
+
+
+def normalize_domain_pattern(raw_pattern: str) -> str:
+    """Normalize an exact or wildcard domain pattern and reject unsafe host syntax."""
+    pattern = str(raw_pattern or "").strip().lower().rstrip(".")
+    if pattern.startswith("."):
+        pattern = pattern[1:]
+    wildcard = pattern.startswith("*.")
+    base = pattern[2:] if wildcard else pattern
+    if not base or "/" in base or ":" in base or "@" in base or "*" in base:
+        raise ValueError("use a hostname such as example.com or a wildcard such as *.example.com")
+    try:
+        address = ipaddress.ip_address(base)
+        raise ValueError("IP addresses are not valid allowlist patterns; use a public DNS hostname")
+    except ValueError as exc:
+        if str(exc).startswith("IP addresses"):
+            raise
+    labels = base.split(".")
+    if len(labels) < 2 or any(
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels
+    ):
+        raise ValueError("use a valid DNS hostname such as example.com")
+    return ("*." if wildcard else "") + base
+
+
+def domain_pattern_matches(hostname: str, pattern: str) -> bool:
+    host = str(hostname or "").strip().lower().rstrip(".")
+    normalized = normalize_domain_pattern(pattern)
+    wildcard = normalized.startswith("*.")
+    base = normalized[2:] if wildcard else normalized
+    if wildcard:
+        return host != base and host.endswith("." + base)
+    return host == base or host.endswith("." + base)
+
+
+def list_domain_policies() -> List[Dict[str, Any]]:
+    with sqlite3.connect(get_db_path()) as conn:
+        rows = conn.execute(
+            "SELECT pattern, effect, created_by_user_id, created_at, updated_at FROM domain_policies ORDER BY pattern"
+        ).fetchall()
+    return [
+        {
+            "pattern": row[0],
+            "effect": row[1],
+            "created_by_user_id": row[2],
+            "created_at": row[3],
+            "updated_at": row[4],
+        }
+        for row in rows
+    ]
+
+
+def set_domain_policy(pattern: str, effect: str, user_id: int) -> str:
+    normalized = normalize_domain_pattern(pattern)
+    if effect not in {"allow", "deny"}:
+        raise ValueError("domain policy effect must be allow or deny")
+    with sqlite3.connect(get_db_path()) as conn:
+        conn.execute(
+            """INSERT INTO domain_policies (pattern, effect, created_by_user_id, updated_at)
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(pattern) DO UPDATE SET effect=excluded.effect,
+               created_by_user_id=excluded.created_by_user_id, updated_at=CURRENT_TIMESTAMP""",
+            (normalized, effect, user_id),
+        )
+        conn.commit()
+    return normalized
+
+
+def remove_domain_policy(pattern: str) -> str:
+    normalized = normalize_domain_pattern(pattern)
+    with sqlite3.connect(get_db_path()) as conn:
+        conn.execute("DELETE FROM domain_policies WHERE pattern = ?", (normalized,))
+        conn.commit()
+    return normalized
 
 
 def log_audit(user_id: int, command: str, target_url: Optional[str], status: str):
@@ -891,14 +980,22 @@ def is_valid_url(url: str) -> bool:
         return False
 
 def is_domain_allowed(url: str) -> bool:
-    if public_mode() and not ALLOWED_DOMAINS:
-        return False
-    if not ALLOWED_DOMAINS:
-        return True
     try:
-        domain = urlparse(url).netloc.lower()
-        return any(domain == d or domain.endswith("." + d) for d in ALLOWED_DOMAINS)
-    except Exception:
+        hostname = (urlparse(url).hostname or "").rstrip(".").lower()
+        if not hostname:
+            return False
+        policies = list_domain_policies()
+        if any(row["effect"] == "deny" and domain_pattern_matches(hostname, row["pattern"]) for row in policies):
+            return False
+        allow_patterns = list(ALLOWED_DOMAINS) + [
+            row["pattern"] for row in policies if row["effect"] == "allow"
+        ]
+        if public_mode() and not allow_patterns:
+            return False
+        if not allow_patterns:
+            return True
+        return any(domain_pattern_matches(hostname, pattern) for pattern in allow_patterns)
+    except (ValueError, TypeError):
         return False
 
 
@@ -2418,6 +2515,69 @@ async def devrequest_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"Your developer request is already open: {request_id}")
 
 
+def format_domain_policy_listing() -> str:
+    lines = ["GreyAI domain policy", "", "Environment allow patterns:"]
+    if ALLOWED_DOMAINS:
+        lines.extend(f"  • {pattern}" for pattern in ALLOWED_DOMAINS)
+    else:
+        lines.append("  • (none)")
+    lines.extend(["", "Runtime overrides:"])
+    policies = list_domain_policies()
+    if policies:
+        lines.extend(
+            f"  • {'✅' if row['effect'] == 'allow' else '⛔'} {row['pattern']} ({row['effect']})"
+            for row in policies
+        )
+    else:
+        lines.append("  • (none)")
+    lines.extend([
+        "",
+        "Use /allowdomain <domain|*.domain>, /disallowdomain <domain|*.domain>, or /resetdomain <pattern>.",
+    ])
+    return "\n".join(lines)
+
+
+@admin_only
+async def allow_domain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /allowdomain <domain|*.domain>")
+    try:
+        pattern = set_domain_policy(context.args[0], "allow", update.effective_user.id)
+    except ValueError as exc:
+        return await update.message.reply_text(f"Invalid domain pattern: {exc}")
+    log_audit(update.effective_user.id, "/allowdomain", None, f"ALLOWED_{pattern}")
+    await update.message.reply_text(f"✅ Domain pattern allowed: {pattern}. The apex domain and matching subdomains pass the existing URL safety checks.")
+
+
+@admin_only
+async def disallow_domain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /disallowdomain <domain|*.domain>")
+    try:
+        pattern = set_domain_policy(context.args[0], "deny", update.effective_user.id)
+    except ValueError as exc:
+        return await update.message.reply_text(f"Invalid domain pattern: {exc}")
+    log_audit(update.effective_user.id, "/disallowdomain", None, f"DENIED_{pattern}")
+    await update.message.reply_text(f"⛔ Domain pattern denied: {pattern}. Deny rules take precedence over environment and runtime allow rules.")
+
+
+@admin_only
+async def reset_domain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /resetdomain <domain|*.domain>")
+    try:
+        pattern = remove_domain_policy(context.args[0])
+    except ValueError as exc:
+        return await update.message.reply_text(f"Invalid domain pattern: {exc}")
+    log_audit(update.effective_user.id, "/resetdomain", None, f"RESET_{pattern}")
+    await update.message.reply_text(f"↩️ Runtime override removed for {pattern}. Environment configuration, if any, now applies.")
+
+
+@admin_only
+async def domains_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(format_domain_policy_listing())
+
+
 @admin_only
 async def allow_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -2452,7 +2612,7 @@ async def disallow_channel_command(update: Update, context: ContextTypes.DEFAULT
 @admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>, /allowchannel <channel_id>, /disallowchannel <channel_id>"
+        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>, /allowchannel <channel_id>, /disallowchannel <channel_id>, /allowdomain <pattern>, /disallowdomain <pattern>, /resetdomain <pattern>, /domains"
     )
 
 
@@ -3436,7 +3596,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Administrator controls</b>\n"
         "/admin, /admin_user, /ban, /unban, /reports, /appeals, /review, /resolveappeal\n"
         "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n"
-        "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n\n"
+        "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n"
+        "/allowdomain &lt;domain|*.domain&gt;, /disallowdomain &lt;pattern&gt;, /resetdomain &lt;pattern&gt;, /domains\n\n"
         "Never send an API secret again after copying it. If a key is exposed, revoke it immediately with /revokekey.",
         parse_mode="HTML",
     )
@@ -3504,6 +3665,10 @@ def main():
     app.add_handler(CommandHandler("disablegreyai", disable_group_command))
     app.add_handler(CommandHandler("allowchannel", allow_channel_command))
     app.add_handler(CommandHandler("disallowchannel", disallow_channel_command))
+    app.add_handler(CommandHandler("allowdomain", allow_domain_command))
+    app.add_handler(CommandHandler("disallowdomain", disallow_domain_command))
+    app.add_handler(CommandHandler("resetdomain", reset_domain_command))
+    app.add_handler(CommandHandler("domains", domains_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("referral", referral_command))
     app.add_handler(CommandHandler("referrals", referrals_command))
