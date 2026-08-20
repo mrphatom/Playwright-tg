@@ -26,6 +26,11 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 - **🎁 Referrals:** Unique Telegram deep links, one-time attribution, self-referral and duplicate protection, verified-payment qualification, auditable quota rewards, user stats, and admin reporting.
 - **📊 Operations Dashboard:** One-time Telegram-issued dashboard links, secure cookie sessions, CSRF-protected admin actions, redacted execution logs, saved-session metadata, health data, analytics, banned-user views, and live polling/websocket updates.
 - **📬 Durable User Notifications:** Ban, unban, and appeal decisions enqueue bounded, secret-free Telegram notifications in an idempotent retryable SQLite outbox delivered by a background worker.
+- **📰 Current-Fact Verification:** Questions such as “Have Cristiano Ronaldo officially announced his retirement?” are locally classified as verification tasks, converted into an allowlisted Google News search, and answered with extracted text and an optional screenshot instead of a false “I cannot access the internet” response.
+- **📣 Role-Targeted Messaging:** Administrators can preview and confirm messages to users, developers, or administrators through `/massrole`, with server-side role resolution, banned-user exclusion, audit records, and revalidation at delivery time.
+- **🟢 Maintenance Status:** Administrators can publish scheduled, degraded, or hard-maintenance updates with reasons. Users can read the current status and timestamped history through Telegram and the public dashboard status endpoints.
+- **⚖️ Priority Queueing:** Browser work uses a bounded priority queue. Administrators, Max, developers, and Pro users receive progressively higher priority; free users remain accepted fairly with an estimated wait time, while full queues fail safely.
+- **🚨 Crash Failsafe:** Unhandled runtime failures capture a sanitized SQLite snapshot, transition the service to hard maintenance, pause browser work, enqueue a public incident notice, and send administrators a diagnostic incident and snapshot reference without exposing secrets.
 - **🧰 Confirmation-Gated Administration:** Announcements, private messages, mass ban/unban, and mass appeal decisions use preview-first jobs with bounded target counts, short-lived single-use confirmation tokens, audit records, and per-item success/failure counts.
 - **🧪 Cautious Activity Review:** Advisory AI risk review with confidence calibration. Strong signals create human-review work; the model never automatically bans, suspends, or limits an account.
 - **🐳 Production Docker Ready:** Built-in volume mapping and memory limits for 24/7 VPS hosting.
@@ -76,6 +81,8 @@ Summarize the latest Google News headlines
 
 Check https://example.com and tell me whether Apple Pie is in stock
 
+Have Cristiano Ronaldo officially announced his retirement?
+
 Every weekday at 08:00 Europe/London, summarize Google News and send me one briefing
 
 Log in to my saved session and extract the order status
@@ -121,15 +128,21 @@ The initial enabled scope is `check`. Keys are not dashboard credentials, and th
 
 ### Administrator command groups
 
-Administrators can search users, inspect account state, ban and unban accounts, review reports and appeals, resolve tickets, inspect referral activity, grant and revoke administrator roles, review developer requests, approve or deny developer access, inspect platform health, and manage the domain policy. The available commands include `/admin`, `/admin_user`, `/grantadmin`, `/revokeadmin`, `/ban`, `/unban`, `/banned`, `/reports`, `/appeals`, `/review`, `/resolveappeal`, `/referrals`, `/analytics`, `/announce`, `/dm`, `/massdm`, `/massban`, `/massunban`, `/massappeals`, `/confirmbulk`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/domains`, `/allowdomain`, `/disallowdomain`, and `/resetdomain`.
+Administrators can search users, inspect account state, ban and unban accounts, review reports and appeals, resolve tickets, inspect referral activity, grant and revoke administrator roles, review developer requests, approve or deny developer access, inspect platform health, publish maintenance status, and manage the domain policy. The available commands include `/admin`, `/admin_user`, `/grantadmin`, `/revokeadmin`, `/ban`, `/unban`, `/banned`, `/reports`, `/appeals`, `/review`, `/resolveappeal`, `/referrals`, `/analytics`, `/announce`, `/dm`, `/massdm`, `/massrole`, `/maintenance`, `/status`, `/maintenance_log`, `/massban`, `/massunban`, `/massappeals`, `/confirmbulk`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/domains`, `/allowdomain`, `/disallowdomain`, and `/resetdomain`.
 
 ### Announcements, private messages, and bulk moderation
 
-`/announce <message>` previews an announcement to active users. `/dm <telegram_id> <message>` previews a private message to one existing user, while `/massdm <id1,id2,...> | <message>` previews a bounded multi-recipient message. These commands do not deliver immediately. The preview includes a job ID and short-lived token; delivery starts only after the administrator sends `/confirmbulk <job_id> <token>`. Confirmation is single-use and expires after ten minutes.
+`/announce <message>` previews an announcement to active users. `/dm <telegram_id> <message>` previews a private message to one existing user, while `/massdm <id1,id2,...> | <message>` previews a bounded multi-recipient message. `/massrole <users|developers|admins> | <message>` resolves the selected role on the server and previews a role-targeted message. These commands do not deliver immediately. The preview includes a job ID and short-lived token; delivery starts only after the administrator sends `/confirmbulk <job_id> <token>`. Confirmation is single-use and expires after ten minutes.
 
 The same workflow protects `/massban <id1,id2,...> | <reason>`, `/massunban <id1,id2,...>`, and `/massappeals <resolved|denied> <appeal_id1,appeal_id2,...> | <resolution>`. Administrator accounts are never valid mass-ban targets. A completed job reports processed, succeeded, and failed items, and every state change is written to the audit trail. `/banned` lists currently banned accounts, and `/analytics` shows banned users, suspicious users awaiting human review, top users by operations, top referrers, and the most risky accounts.
 
 Ban, unban, and appeal decisions send the affected user a bounded notification through the durable outbox. Notifications use unique idempotency keys, bounded retries, exponential backoff, and HTML escaping; internal risk evidence, API keys, cookies, prompts, and administrator-only details are not included.
+
+### Maintenance, queueing, and incident recovery
+
+Administrators publish status updates with `/maintenance <mode> | <public message> | <reason>`, where mode is `operational`, `scheduled`, `degraded`, or `hard_maintenance`. Users can use `/status` and `/maintenance_log` to view the current state and timestamped history. The public dashboard exposes `GET /api/status` and `GET /api/status/events`; authenticated administrators can inspect queue depth and the latest sanitized crash snapshot at `/api/admin/runtime`.
+
+Browser tasks are admitted to a bounded priority queue. The response includes an estimated wait when work is queued. Chat replies, status reads, and maintenance commands bypass the browser queue. If an unhandled application failure reaches the global error boundary, GreyAI records a sanitized snapshot, enters hard maintenance, pauses browser work, sends a safe incident notice through the notification outbox, and alerts administrators with the incident and snapshot identifiers. Recovery should be performed by an administrator after reviewing the logs and can be published with `/maintenance operational | Service restored | Incident resolved`.
 
 ### Versatile domain allowlist
 
@@ -179,6 +192,13 @@ They can block a host or family of subdomains immediately:
    DEVELOPER_EVENTS_ENABLED=true
    MAX_BULK_TARGETS=200
    NOTIFICATION_POLL_SECONDS=5
+   ROLE_MESSAGING_ENABLED=true
+   MAINTENANCE_FEATURE_ENABLED=true
+   CRASH_FAILSAFE_ENABLED=true
+   QUEUE_ENABLED=true
+   QUEUE_MAX_DEPTH=100
+   QUEUE_POLL_SECONDS=1
+   QUEUE_ETA_FLOOR_SECONDS=5
    ALLOWED_TELEGRAM_USERS=123456789,987654321
    # Seed domains; administrators can add exact hosts or *.subdomain patterns at runtime.
    ALLOWED_DOMAINS=github.com,amazon.com,news.ycombinator.com,reddit.com

@@ -31,6 +31,9 @@ DEFAULT_DEVELOPER_QUOTA = 250
 DEFAULT_API_KEY_RATE_LIMIT = 30
 MAX_API_KEY_RATE_LIMIT = 120
 ALLOWED_STATUSES = {STATUS_ACTIVE, STATUS_LIMITED, STATUS_SUSPENDED, STATUS_BANNED}
+MAINTENANCE_MODES = {"operational", "scheduled", "degraded", "hard_maintenance"}
+QUEUE_STATUSES = {"queued", "running", "succeeded", "failed", "cancelled", "rejected"}
+AUDIENCE_ROLES = {"users": ROLE_USER, "developers": ROLE_DEVELOPER, "admins": ROLE_ADMIN}
 
 
 def utc_now() -> str:
@@ -283,6 +286,56 @@ def init_platform_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_developer_events_owner_time ON developer_events(owner_user_id, created_at, event_id);
 
+            CREATE TABLE IF NOT EXISTS maintenance_state (
+                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                mode TEXT NOT NULL CHECK (mode IN ('operational', 'scheduled', 'degraded', 'hard_maintenance')),
+                message TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                incident_id TEXT,
+                started_at TEXT,
+                ends_at TEXT,
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS maintenance_events (
+                event_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL CHECK (mode IN ('operational', 'scheduled', 'degraded', 'hard_maintenance')),
+                message TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                incident_id TEXT,
+                actor_user_id INTEGER,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_maintenance_events_time ON maintenance_events(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS runtime_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                incident_id TEXT,
+                snapshot_kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_snapshots_time ON runtime_snapshots(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS request_queue (
+                queue_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER,
+                kind TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'rejected')),
+                estimated_wait_seconds INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT,
+                enqueued_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_request_queue_dispatch ON request_queue(status, priority DESC, enqueued_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_request_queue_user ON request_queue(user_id, enqueued_at DESC);
+
             CREATE TABLE IF NOT EXISTS referral_codes (
                 code TEXT PRIMARY KEY,
                 referrer_user_id INTEGER NOT NULL UNIQUE,
@@ -319,6 +372,10 @@ def init_platform_db() -> None:
             """
         )
         _migrate_users_role_constraint(connection)
+        connection.execute(
+            "INSERT OR IGNORE INTO maintenance_state (singleton_id, mode, message, reason, updated_at) VALUES (1, 'operational', '', '', ?)",
+            (utc_now(),),
+        )
         try:
             connection.execute("ALTER TABLE dashboard_login_tokens ADD COLUMN session_secret TEXT")
         except sqlite3.OperationalError:
@@ -666,6 +723,17 @@ def list_users_by_status(status: Optional[str] = None, limit: int = 200) -> List
         return connection.execute("SELECT telegram_user_id, username, display_name, role, status, plan, quota_used, quota_limit, risk_score, strike_count, last_seen_at FROM users WHERE status != 'banned' ORDER BY last_seen_at DESC LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
 
 
+def list_users_by_role(role: str, limit: int = 200) -> List[sqlite3.Row]:
+    audience = str(role or "").strip().lower()
+    if audience not in ALLOWED_ROLES:
+        raise ValueError("invalid user role")
+    with _connect() as connection:
+        return connection.execute(
+            "SELECT telegram_user_id, username, display_name, role, status, plan, quota_used, quota_limit, risk_score, strike_count, last_seen_at FROM users WHERE role = ? AND status != 'banned' ORDER BY last_seen_at DESC LIMIT ?",
+            (audience, max(1, min(int(limit), 500))),
+        ).fetchall()
+
+
 def search_users(query: str, limit: int = 25) -> List[sqlite3.Row]:
     query = (query or "").strip()[:100]
     try:
@@ -682,6 +750,115 @@ def search_users(query: str, limit: int = 25) -> List[sqlite3.Row]:
             """,
             (numeric_id, f"%{query}%", f"%{query}%", max(1, min(limit, 100))),
         ).fetchall()
+
+
+def get_maintenance_state() -> Dict[str, Any]:
+    with _connect() as connection:
+        row = connection.execute("SELECT singleton_id, mode, message, reason, incident_id, started_at, ends_at, updated_at, metadata_json FROM maintenance_state WHERE singleton_id = 1").fetchone()
+    if not row:
+        return {"mode": "operational", "message": "", "reason": "", "incident_id": None, "started_at": None, "ends_at": None, "updated_at": None, "metadata": {}}
+    data = dict(row)
+    try:
+        data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
+    except (TypeError, ValueError):
+        data["metadata"] = {}
+    data.pop("singleton_id", None)
+    return data
+
+
+def set_maintenance_state(mode: str, message: str = "", reason: str = "", actor_user_id: Optional[int] = None, incident_id: Optional[str] = None, ends_at: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    clean_mode = str(mode or "").strip().lower()
+    if clean_mode not in MAINTENANCE_MODES:
+        raise ValueError("invalid maintenance mode")
+    now = utc_now()
+    clean_incident = str(incident_id or "")[:100] or None
+    started_at = now if clean_mode != "operational" else None
+    safe_metadata = json.dumps(metadata or {}, separators=(",", ":"))[:4000]
+    event_id = "mnt_" + secrets.token_urlsafe(8)
+    with _connect() as connection:
+        connection.execute(
+            "UPDATE maintenance_state SET mode = ?, message = ?, reason = ?, incident_id = ?, started_at = ?, ends_at = ?, updated_at = ?, metadata_json = ? WHERE singleton_id = 1",
+            (clean_mode, str(message or "")[:1000], str(reason or "")[:1000], clean_incident, started_at, str(ends_at or "")[:80] or None, now, safe_metadata),
+        )
+        connection.execute(
+            "INSERT INTO maintenance_events (event_id, mode, message, reason, incident_id, actor_user_id, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (event_id, clean_mode, str(message or "")[:1000], str(reason or "")[:1000], clean_incident, actor_user_id, safe_metadata, now),
+        )
+        connection.commit()
+    return get_maintenance_state()
+
+
+def list_maintenance_events(limit: int = 50) -> List[sqlite3.Row]:
+    with _connect() as connection:
+        return connection.execute("SELECT event_id, mode, message, reason, incident_id, actor_user_id, metadata_json, created_at FROM maintenance_events ORDER BY created_at DESC LIMIT ?", (max(1, min(int(limit), 200)),)).fetchall()
+
+
+def save_runtime_snapshot(snapshot_kind: str, payload: Dict[str, Any], incident_id: Optional[str] = None) -> str:
+    snapshot_id = "snp_" + secrets.token_urlsafe(8)
+    safe_payload = json.dumps(payload or {}, separators=(",", ":"), default=str)[:12000]
+    with _connect() as connection:
+        connection.execute("INSERT INTO runtime_snapshots (snapshot_id, incident_id, snapshot_kind, payload_json, created_at) VALUES (?, ?, ?, ?, ?)", (snapshot_id, str(incident_id or "")[:100] or None, str(snapshot_kind or "runtime")[:80], safe_payload, utc_now()))
+        connection.commit()
+    return snapshot_id
+
+
+def get_latest_runtime_snapshot(snapshot_kind: Optional[str] = None) -> Optional[sqlite3.Row]:
+    with _connect() as connection:
+        if snapshot_kind:
+            return connection.execute("SELECT snapshot_id, incident_id, snapshot_kind, payload_json, created_at FROM runtime_snapshots WHERE snapshot_kind = ? ORDER BY created_at DESC LIMIT 1", (str(snapshot_kind)[:80],)).fetchone()
+        return connection.execute("SELECT snapshot_id, incident_id, snapshot_kind, payload_json, created_at FROM runtime_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
+
+
+def create_queue_entry(operation_id: str, user_id: int, chat_id: Optional[int], kind: str, priority: int, estimated_wait_seconds: int = 0) -> bool:
+    now = utc_now()
+    with _connect() as connection:
+        try:
+            connection.execute("INSERT INTO request_queue (queue_id, operation_id, user_id, chat_id, kind, priority, estimated_wait_seconds, enqueued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ("q_" + secrets.token_urlsafe(8), str(operation_id)[:100], user_id, chat_id, str(kind or "browser")[:80], max(0, min(int(priority), 100)), max(0, min(int(estimated_wait_seconds), 86400)), now))
+            connection.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def claim_queue_entry(operation_id: str) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE request_queue SET status = 'running', started_at = ? WHERE operation_id = ? AND status = 'queued'", (utc_now(), str(operation_id)[:100]))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def update_queue_entry(operation_id: str, status: str, error_code: Optional[str] = None) -> bool:
+    clean_status = str(status or "").strip().lower()
+    if clean_status not in QUEUE_STATUSES:
+        raise ValueError("invalid queue status")
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE request_queue SET status = ?, error_code = ?, completed_at = CASE WHEN ? IN ('succeeded', 'failed', 'cancelled', 'rejected') THEN ? ELSE completed_at END WHERE operation_id = ?", (clean_status, str(error_code or "")[:120] or None, clean_status, utc_now(), str(operation_id)[:100]))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def update_queue_eta(operation_id: str, estimated_wait_seconds: int) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE request_queue SET estimated_wait_seconds = ? WHERE operation_id = ? AND status = 'queued'", (max(0, min(int(estimated_wait_seconds), 86400)), str(operation_id)[:100]))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def list_queue_entries(status: Optional[str] = None, limit: int = 100) -> List[sqlite3.Row]:
+    if status and status not in QUEUE_STATUSES:
+        raise ValueError("invalid queue status")
+    with _connect() as connection:
+        if status:
+            return connection.execute("SELECT queue_id, operation_id, user_id, chat_id, kind, priority, status, estimated_wait_seconds, error_code, enqueued_at, started_at, completed_at FROM request_queue WHERE status = ? ORDER BY priority DESC, enqueued_at ASC LIMIT ?", (status, max(1, min(int(limit), 500)))).fetchall()
+        return connection.execute("SELECT queue_id, operation_id, user_id, chat_id, kind, priority, status, estimated_wait_seconds, error_code, enqueued_at, started_at, completed_at FROM request_queue ORDER BY enqueued_at DESC LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
+
+
+def get_queue_stats() -> Dict[str, Any]:
+    with _connect() as connection:
+        counts = {row["status"]: int(row["count"]) for row in connection.execute("SELECT status, COUNT(*) AS count FROM request_queue GROUP BY status").fetchall()}
+        active = connection.execute("SELECT AVG((julianday(completed_at) - julianday(started_at)) * 86400.0) AS seconds FROM request_queue WHERE status = 'succeeded' AND started_at IS NOT NULL AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 100").fetchone()["seconds"]
+        oldest = connection.execute("SELECT enqueued_at FROM request_queue WHERE status = 'queued' ORDER BY priority DESC, enqueued_at ASC LIMIT 1").fetchone()
+    return {"counts": counts, "queued": counts.get("queued", 0), "running": counts.get("running", 0), "oldest_queued_at": oldest["enqueued_at"] if oldest else None, "average_completed_seconds": round(float(active or 0), 2)}
 
 
 def consume_quota(user_id: int, units: int = 1) -> tuple[bool, int, int]:
