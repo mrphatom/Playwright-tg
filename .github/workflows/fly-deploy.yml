@@ -70,11 +70,21 @@ jobs:
 
       - name: Deploy image to Fly.io
       
-        env:
+        env
         
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           
         run: flyctl deploy --config fly.toml --app playwright-tg-mrphatom --image registry.fly.io/playwright-tg-mrphatom:main --yes
+
+      - name: Ensure public IPv4 for dashboard hostname
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          if flyctl ips list --app playwright-tg-mrphatom | grep -Eq '[[:space:]]v4[[:space:]]'; then
+            echo "Fly public IPv4 already allocated"
+          else
+            flyctl ips allocate-v4 --shared --app playwright-tg-mrphatom
+          fi
         
 
 
