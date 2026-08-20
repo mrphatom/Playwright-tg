@@ -13,12 +13,13 @@ import tempfile
 import urllib.request
 import urllib.error
 from pathlib import Path
+from html import escape as html_escape
 from datetime import datetime, timedelta, time as datetime_time
 from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import TelegramError
 
@@ -93,6 +94,14 @@ MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", "12000000"))
 MAX_MEDIA_CONTEXT_CHARS = int(os.getenv("MAX_MEDIA_CONTEXT_CHARS", "6000"))
 CHAT_TIMEOUT_SECONDS = int(os.getenv("CHAT_TIMEOUT_SECONDS", "20"))
 MEDIA_TIMEOUT_SECONDS = int(os.getenv("MEDIA_TIMEOUT_SECONDS", "45"))
+API_KEY_MESSAGE_TTL_SECONDS = max(30, min(300, int(os.getenv("API_KEY_MESSAGE_TTL_SECONDS", "90"))))
+BOT_SHORT_DESCRIPTION = "GreyAI: fast chat, web automation, schedules, monitoring, multimodal input, and Telegram bot integrations."
+BOT_DESCRIPTION = (
+    "GreyAI is a Telegram assistant for fast conversation and authorized web work. "
+    "Send text, voice notes, or screenshots; ask it to browse, summarize, monitor, schedule briefings, "
+    "manage encrypted sessions, or connect another Telegram bot through scoped developer API keys. "
+    "Use /help for commands and permissions."
+)
 
 ALLOWED_USERS = set(int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_USERS", "").split(",") if uid.strip().isdigit())
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
@@ -104,6 +113,97 @@ MAX_PLAN_STARS = int(os.getenv("MAX_PLAN_STARS", "1000"))
 PRO_PLAN_QUOTA = int(os.getenv("PRO_PLAN_QUOTA", "1000"))
 MAX_PLAN_QUOTA = int(os.getenv("MAX_PLAN_QUOTA", "5000"))
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+
+
+def format_api_key_listing(keys: List[Dict[str, Any]]) -> str:
+    if not keys:
+        return "🔐 No developer API keys found. Create one with /newkey <name> check."
+    lines = ["🔐 <b>Your GreyAI developer keys</b>", "", "Secret values are never shown in this list."]
+    for item in keys:
+        status = str(item.get("status", "unknown")).lower()
+        icon = "🟢" if status == "active" else "🔴" if status == "revoked" else "🟡"
+        scopes = ", ".join(item.get("scopes") or []) or "none"
+        last_used = item.get("last_used_at") or "never"
+        lines.extend([
+            "",
+            f"{icon} <b>{html_escape(str(item.get('name') or 'Unnamed key'))}</b>",
+            f"   Key ID: <code>{html_escape(str(item.get('key_id')))}</code>",
+            f"   Status: <b>{html_escape(status)}</b>",
+            f"   Scope: <code>{html_escape(scopes)}</code>",
+            f"   Last used: {html_escape(str(last_used))}",
+            f"   Revoke: <code>/revokekey {html_escape(str(item.get('key_id')))}</code>",
+        ])
+    return "\n".join(lines)
+
+
+async def _delete_message_later(bot, chat_id: int, message_id: int, delay_seconds: int) -> None:
+    await asyncio.sleep(delay_seconds)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except TelegramError:
+        logger.info("ephemeral_message_already_gone chat_id=%s message_id=%s", chat_id, message_id)
+
+
+def schedule_ephemeral_message(context: ContextTypes.DEFAULT_TYPE, message, delay_seconds: int = API_KEY_MESSAGE_TTL_SECONDS) -> None:
+    task = asyncio.create_task(_delete_message_later(context.bot, message.chat_id, message.message_id, delay_seconds))
+    tasks = context.application.bot_data.setdefault("ephemeral_message_tasks", set())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def send_one_time_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE, created: Dict[str, Any], status_message=None) -> None:
+    if status_message is not None:
+        await status_message.edit_text("✅ Key created. I’m sending the one-time secret in a separate message now.")
+    message = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        parse_mode="HTML",
+        text=(
+            "🔐 <b>GreyAI developer API key — copy now</b>\n\n"
+            f"<b>Label:</b> {html_escape(str(created['name']))}\n"
+            f"<b>Key ID:</b> <code>{html_escape(str(created['key_id']))}</code>\n"
+            f"<b>Scope:</b> <code>{html_escape(', '.join(created['scopes']))}</code>\n"
+            f"<b>Rate limit:</b> {int(created['rate_limit_per_minute'])} requests/minute\n\n"
+            "<b>API key secret:</b>\n"
+            f"<code>{html_escape(str(created['key']))}</code>\n\n"
+            f"⏳ This message will self-delete in {API_KEY_MESSAGE_TTL_SECONDS} seconds. "
+            "Copy it into your bot’s secret manager now. It will never be shown again."
+        ),
+    )
+    schedule_ephemeral_message(context, message)
+
+
+async def configure_bot_profile(bot) -> None:
+    commands = [
+        BotCommand("start", "Start GreyAI and see your referral link"),
+        BotCommand("help", "Show the full command and feature guide"),
+        BotCommand("health", "Check service and browser health"),
+        BotCommand("check", "Run a secure browser check"),
+        BotCommand("watch", "Monitor a page until a condition is met"),
+        BotCommand("watchers", "List your active monitors"),
+        BotCommand("stopwatch", "Stop a monitor"),
+        BotCommand("schedule", "Schedule a recurring briefing"),
+        BotCommand("schedules", "List scheduled briefings"),
+        BotCommand("unschedule", "Cancel a scheduled briefing"),
+        BotCommand("sessions", "List encrypted browser sessions"),
+        BotCommand("deletesession", "Delete an encrypted browser session"),
+        BotCommand("dashboard", "Open the secure operations dashboard"),
+        BotCommand("upgrade", "View Pro and Max Telegram Stars plans"),
+        BotCommand("referral", "Create your referral link"),
+        BotCommand("report", "Open a support or safety report"),
+        BotCommand("appeal", "Open an account review appeal"),
+        BotCommand("devrequest", "Request governed developer access"),
+        BotCommand("devkeys", "List your developer key metadata"),
+        BotCommand("newkey", "Create a one-time scoped API key"),
+        BotCommand("revokekey", "Revoke one of your API keys"),
+        BotCommand("developerstats", "View developer API usage"),
+    ]
+    try:
+        await bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
+        await bot.set_my_description(BOT_DESCRIPTION)
+        await bot.set_my_commands(commands)
+    except TelegramError:
+        logger.exception("telegram_bot_profile_configuration_failed")
+
 
 # Domain Whitelist (Comma separated domains, e.g. "github.com,amazon.com". Leave empty to allow all)
 ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAINS", "").split(",") if d.strip()]
@@ -1415,7 +1515,14 @@ async def restore_schedules_from_db(context_bot):
         logger.info("Restored %s scheduled briefing(s) from SQLite.", restored_count)
 
 
+async def post_init(application: Application):
+    await start_browser_pool(application)
+    await configure_bot_profile(application.bot)
+
+
 async def stop_browser_pool(application: Application):
+    for task in application.bot_data.get("ephemeral_message_tasks", set()):
+        task.cancel()
     dashboard_task = application.bot_data.get("dashboard_task")
     if dashboard_task:
         dashboard_task.cancel()
@@ -2191,33 +2298,25 @@ async def resolve_appeal_command(update: Update, context: ContextTypes.DEFAULT_T
 @developer_only
 async def devkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keys = list_api_keys(update.effective_user.id)
-    if not keys:
-        return await update.message.reply_text("You have no API keys. Create one with /newkey <name> check")
-    await update.message.reply_text(
-        "\n\n".join(
-            f"{item['key_id']} | {item['name']} | scopes={','.join(item['scopes'])} | status={item['status']} | last used={item['last_used_at'] or '-'}"
-            for item in keys
-        )
-    )
+    await update.message.reply_text(format_api_key_listing(keys), parse_mode="HTML")
 
 
 @developer_only
 async def newkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        return await update.message.reply_text("Usage: /newkey <name> [scope,...]\nCurrently enabled scope: check")
+        return await update.message.reply_text(
+            "Usage: /newkey <name> [scope,...]\n\n"
+            "Currently enabled scope: check\n"
+            "Example: /newkey news-relay check\n\n"
+            "The secret is delivered once in a separate message and automatically deleted after the copy window."
+        )
     name = context.args[0]
     scopes = [scope.strip().lower() for scope in (" ".join(context.args[1:]) or "check").split(",") if scope.strip()]
     try:
         created = create_api_key(update.effective_user.id, name, scopes)
     except (PermissionError, ValueError) as exc:
         return await update.message.reply_text(f"Unable to create key: {exc}")
-    await update.message.reply_text(
-        "⚠️ This is the only time the secret will be shown. Copy it now and store it in your bot's secret manager. Never send it in chat again.\n\n"
-        f"Key ID: {created['key_id']}\n"
-        f"Scopes: {', '.join(created['scopes'])}\n"
-        f"Rate limit: {created['rate_limit_per_minute']} requests/minute\n\n"
-        f"{created['key']}"
-    )
+    await send_one_time_api_key(update, context, created)
 
 
 @developer_only
@@ -2343,7 +2442,7 @@ async def _process_natural_language(update: Update, context: ContextTypes.DEFAUL
             return
         if plan["mode"] == "developer_keys":
             keys = list_api_keys(user_id)
-            await status_msg.edit_text("No API keys found." if not keys else "\n".join(f"{key['key_id']} [{key['status']}] scopes={','.join(key['scopes'])}" for key in keys))
+            await status_msg.edit_text(format_api_key_listing(keys), parse_mode="HTML")
             return
         if plan["mode"] == "developer_stats":
             stats = get_developer_stats(user_id)
@@ -2354,7 +2453,7 @@ async def _process_natural_language(update: Update, context: ContextTypes.DEFAUL
             return
         try:
             created = create_api_key(user_id, plan["name"], plan.get("scopes", ["check"]))
-            await status_msg.edit_text(f"⚠️ Copy this API key now; it will not be shown again:\n`{created['key']}`", parse_mode="Markdown")
+            await send_one_time_api_key(update, context, created, status_message=status_msg)
         except (PermissionError, ValueError) as exc:
             await status_msg.edit_text(f"Unable to create API key: {exc}")
         return
@@ -2747,7 +2846,41 @@ def build_health_report() -> str:
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Commands: /check /watch /schedule /schedules /unschedule /watchers /stopwatch /sessions /deletesession /dashboard /upgrade /crypto /referral /report /appeal /devrequest /support /paysupport /terms /health\nDeveloper access: after admin approval, /newkey <name> check, /devkeys, /revokekey <key_id>, /developerstats"
+        "<b>GreyAI command guide</b>\n\n"
+        "<b>Conversation and multimodal input</b>\n"
+        "Send an ordinary message for fast chat. Send a voice note or screenshot for transcription and visual identification. Browser-like wording, named websites, schedules, watchers, and management requests enter agent mode.\n\n"
+        "<b>Web agent</b>\n"
+        "/check &lt;url&gt; | actions — Run a secure browser workflow\n"
+        "/watch &lt;interval&gt; &lt;url&gt; | condition — Monitor a page\n"
+        "/watchers — List monitors\n"
+        "/stopwatch &lt;watcher_id&gt; — Stop a monitor\n"
+        "/schedule &lt;time&gt; &lt;url&gt; | briefing — Schedule a recurring briefing\n"
+        "/schedules — List briefings\n"
+        "/unschedule &lt;schedule_id&gt; — Cancel a briefing\n\n"
+        "<b>Encrypted sessions</b>\n"
+        "/sessions — List your saved sessions\n"
+        "/deletesession &lt;name&gt; — Delete a session\n"
+        "Use <code>save_session:name</code> and <code>load_session:name</code> inside browser workflows.\n\n"
+        "<b>Account and platform</b>\n"
+        "/start — Start GreyAI and get your referral link\n"
+        "/dashboard — Open the secure operations dashboard\n"
+        "/health — View service health\n"
+        "/upgrade [pro|max] — View or purchase a plan with Telegram Stars\n"
+        "/referral — Create your invite link\n"
+        "/report &lt;text&gt; — Send a support or safety report\n"
+        "/appeal &lt;text&gt; — Request account review\n\n"
+        "<b>Developer integrations</b>\n"
+        "/devrequest &lt;reason&gt; — Request governed developer access\n"
+        "/newkey &lt;name&gt; check — Create a scoped key; the secret appears once in a self-deleting message\n"
+        "/devkeys — View labeled key metadata without secrets\n"
+        "/revokekey &lt;key_id&gt; — Revoke an owned key\n"
+        "/developerstats — View key usage and denied events\n"
+        "Use <code>POST /api/v1/check</code> with <code>Authorization: Bearer &lt;key&gt;</code> from another Telegram bot.\n\n"
+        "<b>Administrator controls</b>\n"
+        "/admin, /admin_user, /ban, /unban, /reports, /appeals, /review, /resolveappeal\n"
+        "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n\n"
+        "Never send an API secret again after copying it. If a key is exposed, revoke it immediately with /revokekey.",
+        parse_mode="HTML",
     )
 
 
@@ -2804,7 +2937,7 @@ def main():
         logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is missing!")
         return
         
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(start_browser_pool).post_stop(stop_browser_pool).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_stop(stop_browser_pool).build()
     
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))

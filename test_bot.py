@@ -848,3 +848,63 @@ def test_media_timeout_is_distinct_from_input_size(tmp_path):
 
     with pytest.raises(bot.MediaProviderTimeout, match="timed out"):
         asyncio.run(provider.generate_media(str(media), "image/png", "identify"))
+
+
+def test_api_key_listing_is_labeled_and_never_contains_secret():
+    import bot
+
+    secret = "gai_live.key_demo.secret-value"
+    text = bot.format_api_key_listing([
+        {
+            "key_id": "key_demo",
+            "name": "news-relay",
+            "scopes": ["check"],
+            "status": "active",
+            "last_used_at": None,
+        }
+    ])
+
+    assert "news-relay" in text
+    assert "Key ID:" in text
+    assert "Scope:" in text
+    assert "Status:" in text
+    assert secret not in text
+
+
+def test_one_time_api_key_delivery_is_copy_friendly_and_scheduled(monkeypatch):
+    import bot
+    from types import SimpleNamespace
+
+    delivered = {}
+    scheduled = {}
+
+    class FakeMessage:
+        chat_id = 6411860985
+        message_id = 77
+
+    class FakeBot:
+        async def send_message(self, **kwargs):
+            delivered.update(kwargs)
+            return FakeMessage()
+
+    def fake_schedule(context, message, delay_seconds=None):
+        scheduled["delay_seconds"] = bot.API_KEY_MESSAGE_TTL_SECONDS if delay_seconds is None else delay_seconds
+
+    monkeypatch.setattr(bot, "schedule_ephemeral_message", fake_schedule)
+    context = SimpleNamespace(bot=FakeBot(), application=SimpleNamespace(bot_data={}) )
+    update = SimpleNamespace(effective_chat=SimpleNamespace(id=6411860985))
+    created = {
+        "name": "news-relay",
+        "key_id": "key_demo",
+        "scopes": ["check"],
+        "rate_limit_per_minute": 30,
+        "key": "gai_live.key_demo.secret-value",
+    }
+
+    asyncio.run(bot.send_one_time_api_key(update, context, created))
+
+    assert delivered["parse_mode"] == "HTML"
+    assert "API key secret:" in delivered["text"]
+    assert "key_demo" in delivered["text"]
+    assert "gai_live.key_demo.secret-value" in delivered["text"]
+    assert scheduled["delay_seconds"] == bot.API_KEY_MESSAGE_TTL_SECONDS
