@@ -2105,6 +2105,54 @@ def sanitize_session_name(name: str) -> str:
 def truncate_text(text: str, max_length: int = 4000) -> str:
     return text if len(text) <= max_length else text[:max_length - 15] + "\n...[Truncated]"
 
+
+def telegram_safe_html(text: str, max_length: int = 4000) -> str:
+    """Convert common AI Markdown into Telegram-supported HTML without leaking markup."""
+    source = truncate_text(str(text or ""), max_length)
+    tokens: List[str] = []
+
+    def stash(value: str) -> str:
+        token = f"\x00GREYAI_{len(tokens)}\x00"
+        tokens.append(value)
+        return token
+
+    def stash_code(match):
+        return stash(f"<code>{html_escape(match.group(1), quote=False)}</code>")
+
+    def stash_fenced_code(match):
+        language = match.group(1).strip()
+        body = html_escape(match.group(2).strip("\n"), quote=False)
+        label = f"{language}\n" if language else ""
+        return stash(f"<pre>{html_escape(label, quote=False)}{body}</pre>")
+
+    source = re.sub(r"```([^\n`]*)\n(.*?)```", stash_fenced_code, source, flags=re.DOTALL)
+    source = re.sub(r"`([^`\n]+)`", stash_code, source)
+
+    def stash_link(match):
+        label = html_escape(match.group(1), quote=False)
+        url = match.group(2)
+        return stash(f'<a href="{html_escape(url, quote=True)}">{label}</a>')
+
+    source = re.sub(r"\[([^]\n]+)\]\((https?://[^)\s]+)\)", stash_link, source)
+
+    rendered_lines = []
+    for raw_line in source.splitlines():
+        line = re.sub(r"^\s{0,3}#{1,6}\s+", "", raw_line)
+        line = re.sub(r"^\s*[-*+]\s+", "• ", line)
+        line = html_escape(line, quote=False)
+        line = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"<b>\1</b>", line)
+        line = re.sub(r"~~(.+?)~~", r"<s>\1</s>", line)
+        line = re.sub(r"(?<![\w*])\*([^*\n]+?)\*(?![\w*])", r"<i>\1</i>", line)
+        line = re.sub(r"(?<![\w_])_([^_\n]+?)_(?![\w_])", r"<i>\1</i>", line)
+        line = line.replace("**", "").replace("__", "")
+        rendered_lines.append(line)
+
+    rendered = "\n".join(rendered_lines)
+    for index, token_value in enumerate(tokens):
+        rendered = rendered.replace(f"\x00GREYAI_{index}\x00", token_value)
+    return rendered
+
+
 def mask_sensitive_action(action: str) -> str:
     if action.startswith(("type:", "type_username:", "type_password:")):
         parts = action.split("=", 1) if action.startswith("type:") else action.split(":", 1)
@@ -3844,7 +3892,7 @@ async def _process_natural_language(
     contextual_reply = resolve_contextual_watcher_followup(chat_id, request_text)
     if contextual_reply:
         remember_chat_turn(chat_id, request_text, contextual_reply)
-        await source_message.reply_text(contextual_reply, parse_mode="Markdown")
+        await source_message.reply_text(telegram_safe_html(contextual_reply), parse_mode="HTML")
         log_audit(user_id, "agent_context_followup", None, "WATCHER_CONTEXT_RESOLVED")
         return
 
@@ -3853,7 +3901,7 @@ async def _process_natural_language(
     if route == "chat":
         reply = await generate_chat_reply(chat_id, request_text, private_chat=private_chat)
         remember_chat_turn(chat_id, request_text, reply)
-        await source_message.reply_text(reply)
+        await source_message.reply_text(telegram_safe_html(reply), parse_mode="HTML")
         log_audit(user_id, "chat", None, "SUCCESS")
         return
 
@@ -4026,7 +4074,7 @@ async def _process_natural_language(
             return
         reply = await generate_chat_reply(chat_id, request_text, private_chat=private_chat)
         remember_chat_turn(chat_id, request_text, reply)
-        await status_msg.edit_text(reply)
+        await status_msg.edit_text(telegram_safe_html(reply), parse_mode="HTML")
         log_audit(user_id, "chat", None, "SUCCESS")
         update_operation(operation_id, "succeeded")
         return
@@ -4122,15 +4170,15 @@ async def _process_natural_language(
             )
 
             caption = truncate_text(
-                f"📄 *Login flow finished*\n🔗 *URL:* {plan['url']}",
+                f"📄 **Login flow finished**\n🔗 **URL:** {plan['url']}",
                 1024,
             )
             with open(result["screenshot"], "rb") as photo:
-                await source_message.reply_photo(photo=photo, caption=caption, parse_mode="Markdown")
+                await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
             if result["extracted"]:
                 await source_message.reply_text(
-                    truncate_text("\n\n".join(result["extracted"]), 4000),
-                    parse_mode="Markdown",
+                    telegram_safe_html("\n\n".join(result["extracted"]), 4000),
+                    parse_mode="HTML",
                 )
             os.remove(result["screenshot"])
             await status_msg.delete()
@@ -4174,15 +4222,15 @@ async def _process_natural_language(
             )
 
             caption = truncate_text(
-                f"📄 *Title:* {result.get('title')}\n🔗 *URL:* {plan['url']}",
+                f"📄 **Title:** {result.get('title')}\n🔗 **URL:** {plan['url']}",
                 1024,
             )
             with open(result["screenshot"], "rb") as photo:
-                await source_message.reply_photo(photo=photo, caption=caption, parse_mode="Markdown")
+                await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
             if result["extracted"]:
                 await source_message.reply_text(
-                    truncate_text("\n\n".join(result["extracted"]), 4000),
-                    parse_mode="Markdown",
+                    telegram_safe_html("\n\n".join(result["extracted"]), 4000),
+                    parse_mode="HTML",
                 )
             os.remove(result["screenshot"])
             await status_msg.delete()
@@ -4274,7 +4322,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         id=uuid.uuid4().hex,
         title="GreyAI answer",
         description=truncate_text(text.replace("\\n", " "), 180),
-        input_message_content=InputTextMessageContent(text),
+        input_message_content=InputTextMessageContent(telegram_safe_html(text), parse_mode="HTML"),
     )
     await update.inline_query.answer([result], cache_time=5, is_personal=True)
     log_audit(user.id, "inline_query", None, "ANSWERED")

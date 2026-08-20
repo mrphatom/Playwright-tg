@@ -1538,3 +1538,70 @@ def test_business_message_rejects_without_reply_permission(monkeypatch):
     asyncio.run(bot.business_message_handler(update, SimpleNamespace()))
 
     assert calls == []
+
+
+def test_telegram_safe_html_converts_markdown_without_literal_markers():
+    import bot
+
+    rendered = bot.telegram_safe_html(
+        "1. **Sell something**\n* Post on **Facebook Marketplace**\nUse `quick pickup` & stay safe."
+    )
+
+    assert "**" not in rendered
+    assert "<b>Sell something</b>" in rendered
+    assert "<b>Facebook Marketplace</b>" in rendered
+    assert "<code>quick pickup</code>" in rendered
+    assert "&amp;" in rendered
+
+
+def test_telegram_safe_html_escapes_raw_html_and_preserves_line_breaks():
+    import bot
+
+    rendered = bot.telegram_safe_html("<script>alert('x')</script>\n**Ready**")
+
+    assert "<script>" not in rendered
+    assert "&lt;script&gt;" in rendered
+    assert "\n" in rendered
+    assert "<b>Ready</b>" in rendered
+
+
+def test_natural_language_chat_reply_uses_telegram_html(monkeypatch):
+    import bot
+
+    class FakeSourceMessage:
+        text = "Give me a list"
+        caption = None
+        chat_id = 123
+
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kwargs):
+            self.sent.append((text, kwargs))
+
+    source = FakeSourceMessage()
+    update = SimpleNamespace(
+        business_message=None,
+        message=source,
+        channel_post=None,
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_user=SimpleNamespace(id=6411860985),
+    )
+
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "classify_message_route", lambda request: "chat")
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args: None)
+
+    async def fake_chat_reply(chat_id, text, private_chat=False):
+        return "1. **Sell this**\n* Use `cash` & stay safe."
+
+    monkeypatch.setattr(bot, "generate_chat_reply", fake_chat_reply)
+    asyncio.run(bot._process_natural_language(update, SimpleNamespace()))
+
+    rendered, options = source.sent[0]
+    assert options["parse_mode"] == "HTML"
+    assert "**" not in rendered
+    assert "<b>Sell this</b>" in rendered
+    assert "<code>cash</code>" in rendered
+    assert "&amp;" in rendered
