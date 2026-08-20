@@ -1496,36 +1496,67 @@ def parse_deterministic_schedule_request(user_text: str) -> Optional[Dict[str, A
     })
 
 
+def discover_named_web_reference(user_text: str) -> Optional[str]:
+    """Resolve only an explicit subreddit shorthand; never guess arbitrary hosts."""
+    text = str(user_text or "")
+    match = re.search(r"(?:reddit(?:\.com)?\s+)?r/([A-Za-z0-9_]{2,21})\b", text, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"\bsubreddit\s+([A-Za-z0-9_]{2,21})\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return f"https://www.reddit.com/r/{match.group(1).lower()}"
+
+
 def parse_deterministic_web_request(user_text: str, default_session_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Recover common check/watch requests when structured interpretation is unavailable."""
     text = str(user_text or "").strip()
     lowered = text.lower()
     url_match = re.search(r"https?://[^\s,]+|(?<![@\w])(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s,]*)?", text, flags=re.IGNORECASE)
-    if not url_match:
+    discovered_url = discover_named_web_reference(text) if not url_match else None
+    if not url_match and not discovered_url:
         return None
-    url = url_match.group(0).rstrip(".,;!?)")
+    url = url_match.group(0).rstrip(".,;!?)") if url_match else discovered_url
+    reference_text = url_match.group(0) if url_match else re.search(
+        r"(?:reddit(?:\.com)?\s+)?r/([A-Za-z0-9_]{2,21})\b|\bsubreddit\s+[A-Za-z0-9_]{2,21}\b",
+        text,
+        flags=re.IGNORECASE,
+    ).group(0)
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
     if not is_valid_url(url) or not is_domain_allowed(url):
         return None
 
     watch_mode = any(marker in lowered for marker in ("monitor", "watch", "tell me when", "alert me when", "notify me when"))
-    interval_match = re.search(r"\bevery\s+(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?)\b", lowered)
+    interval_match = re.search(r"\bevery\s+(?:(\d+)\s*)?(seconds?|secs?|minutes?|mins?|hours?)\b", lowered)
     interval_seconds = 60
     if interval_match:
-        amount = int(interval_match.group(1))
+        amount = int(interval_match.group(1) or "1")
         unit = interval_match.group(2)
         multiplier = 3600 if unit.startswith("hour") else 60 if unit.startswith("min") else 1
         interval_seconds = max(30, min(amount * multiplier, 86400))
 
     if watch_mode:
-        condition_match = re.search(
-            r"(?:tell me when|alert me when|notify me when|watch for|monitor for)\s+(.+?)(?:\s+every\s+\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?))?\s*$",
-            text,
+        condition_text = re.sub(re.escape(reference_text), " ", text, count=1, flags=re.IGNORECASE)
+        condition_text = re.sub(re.escape(url), " ", condition_text, count=1, flags=re.IGNORECASE)
+        condition_text = re.sub(
+            r"\bevery\s+(?:\d+\s*)?(?:seconds?|secs?|minutes?|mins?|hours?)\b",
+            " ",
+            condition_text,
             flags=re.IGNORECASE,
         )
+        condition_match = re.search(
+            r"(?:tell me when|alert me when|notify me when)\s+(.+?)\s*$",
+            condition_text,
+            flags=re.IGNORECASE,
+        )
+        if not condition_match:
+            condition_match = re.search(
+                r"\b(?:watch|monitor)\s+(?:for\s+)?(.+?)\s*$",
+                condition_text,
+                flags=re.IGNORECASE,
+            )
         condition = condition_match.group(1).strip(" .,!?") if condition_match else "The requested condition is met"
-        return {
+        result = {
             "mode": "watch",
             "url": url,
             "actions": [f"condition_ai:{condition}"],
@@ -1533,13 +1564,19 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
             "condition_type": "ai",
             "interval_seconds": interval_seconds,
         }
+        if discovered_url:
+            result["discovered_url"] = True
+        return result
 
     request = ""
-    summarize_match = re.search(r"\b(?:summarize|summarise|extract|read|describe)\b(.*)$", text, flags=re.IGNORECASE)
+    request_text = re.sub(re.escape(reference_text), " ", text, count=1, flags=re.IGNORECASE)
+    if url_match:
+        request_text = request_text.replace(url_match.group(0), " ")
+    summarize_match = re.search(r"\b(?:summarize|summarise|extract|read|describe)\b(.*)$", request_text, flags=re.IGNORECASE)
     if summarize_match:
-        request = summarize_match.group(1).replace(url_match.group(0), "").strip(" .,!?:;-\")'")
+        request = summarize_match.group(1).strip(" .,!?:;-\")'")
     if not request:
-        request = text[url_match.end():].strip(" .,!?:;-\")'")
+        request = request_text.strip(" .,!?:;-\")'")
     if not request:
         request = "Summarize the important information on this page."
 
@@ -1554,7 +1591,10 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     elif default_session_name:
         actions.append("load_session:" + sanitize_session_name(default_session_name))
     actions.append("ai_extract:" + request[:500])
-    return {"mode": "check", "url": url, "actions": actions, "request": request}
+    result = {"mode": "check", "url": url, "actions": actions, "request": request}
+    if discovered_url:
+        result["discovered_url"] = True
+    return result
 
 
 async def parse_natural_language_intent(user_text: str, default_session_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -3364,6 +3404,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Web agent</b>\n"
         "/check &lt;url&gt; | actions — Run a secure browser workflow\n"
         "/watch &lt;interval&gt; &lt;url&gt; | condition — Monitor a page\n"
+        "Natural language also works: <code>watch r/forhire every 1 hour for a new web developer post</code>. Reddit is resolved to its subreddit URL and stored as a persistent watcher.\n"
         "/watchers — List monitors\n"
         "/stopwatch &lt;watcher_id&gt; — Stop a monitor\n"
         "/schedule &lt;time&gt; &lt;url&gt; | briefing — Schedule a recurring briefing\n"
