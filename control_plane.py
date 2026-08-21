@@ -322,7 +322,9 @@ def init_platform_db() -> None:
                 expires_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 confirmed_at TEXT,
-                completed_at TEXT
+                completed_at TEXT,
+                pause_reason TEXT,
+                paused_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_ad_campaigns_admin_time ON ad_campaigns(admin_user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_ad_campaigns_dispatch ON ad_campaigns(status, next_run_at);
@@ -447,6 +449,14 @@ def init_platform_db() -> None:
             pass
         try:
             connection.execute("ALTER TABLE conversation_turns ADD COLUMN telegram_message_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            connection.execute("ALTER TABLE ad_campaigns ADD COLUMN pause_reason TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            connection.execute("ALTER TABLE ad_campaigns ADD COLUMN paused_at TEXT")
         except sqlite3.OperationalError:
             pass
         connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_telegram_id ON conversation_turns(owner_user_id, chat_id, telegram_message_id, turn_id DESC)")
@@ -1294,7 +1304,7 @@ def get_ad_campaign(campaign_id: str) -> Optional[sqlite3.Row]:
 
 def list_ad_campaigns_for_admin(admin_user_id: int, limit: int = 20) -> List[sqlite3.Row]:
     with _connect() as connection:
-        return connection.execute("SELECT campaign_id, title, repeat_count, next_run_at, status, created_at FROM ad_campaigns WHERE admin_user_id = ? ORDER BY created_at DESC LIMIT ?", (int(admin_user_id), max(1, min(int(limit), 50)))).fetchall()
+        return connection.execute("SELECT campaign_id, title, repeat_count, next_run_at, status, created_at, pause_reason, paused_at FROM ad_campaigns WHERE admin_user_id = ? ORDER BY created_at DESC LIMIT ?", (int(admin_user_id), max(1, min(int(limit), 50)))).fetchall()
 
 
 def list_active_ad_campaigns(limit: int = 50) -> List[sqlite3.Row]:
@@ -1318,6 +1328,50 @@ def update_ad_campaign_next_run(campaign_id: str, next_run_at: Optional[str], st
             cursor = connection.execute("UPDATE ad_campaigns SET status = ?, next_run_at = ?, next_occurrence = ?, completed_at = CASE WHEN ? IN ('completed', 'cancelled', 'failed') THEN ? ELSE completed_at END WHERE campaign_id = ?", (status, next_run_at, int(next_occurrence), status, utc_now(), str(campaign_id)[:100]))
         connection.commit()
         return cursor.rowcount == 1
+
+
+def count_ad_permission_loss_targets(campaign_id: str) -> int:
+    with _connect() as connection:
+        row = connection.execute("SELECT COUNT(DISTINCT target_chat_id) AS count FROM ad_deliveries WHERE campaign_id = ? AND status = 'dead_letter' AND last_error LIKE 'permission_loss:%'", (str(campaign_id)[:100],)).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def pause_ad_campaign_for_permission_loss(campaign_id: str, threshold: int) -> Optional[Dict[str, Any]]:
+    clean_campaign = str(campaign_id or "")[:100]
+    required = max(1, min(int(threshold), 50))
+    if not clean_campaign:
+        return None
+    now = utc_now()
+    reason = f"Automatically paused after {required} or more distinct targets lost permission to receive advertisements."
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT * FROM ad_campaigns WHERE campaign_id = ?", (clean_campaign,)).fetchone()
+        if not row or row["status"] != "active":
+            connection.rollback()
+            return None
+        count_row = connection.execute("SELECT COUNT(DISTINCT target_chat_id) AS count FROM ad_deliveries WHERE campaign_id = ? AND status = 'dead_letter' AND last_error LIKE 'permission_loss:%'", (clean_campaign,)).fetchone()
+        loss_count = int(count_row["count"] if count_row else 0)
+        if loss_count < required:
+            connection.rollback()
+            return None
+        connection.execute("UPDATE ad_campaigns SET status = 'paused', next_run_at = NULL, pause_reason = ?, paused_at = ? WHERE campaign_id = ? AND status = 'active'", (reason, now, clean_campaign))
+        connection.commit()
+    return {"campaign_id": clean_campaign, "permission_loss_count": loss_count, "threshold": required, "reason": reason, "paused_at": now}
+
+
+def resume_ad_campaign(campaign_id: str, admin_user_id: int) -> Optional[Dict[str, Any]]:
+    clean_campaign = str(campaign_id or "")[:100]
+    now = utc_now()
+    with _connect() as connection:
+        row = connection.execute("SELECT * FROM ad_campaigns WHERE campaign_id = ? AND admin_user_id = ? AND status = 'paused'", (clean_campaign, int(admin_user_id))).fetchone()
+        if not row:
+            return None
+        next_occurrence = max(1, int(row["next_occurrence"] or 1))
+        connection.execute("UPDATE ad_deliveries SET status = 'pending', attempt_count = 0, last_error = NULL, updated_at = ? WHERE campaign_id = ? AND occurrence = ? AND status = 'dead_letter' AND last_error LIKE 'permission_loss:%'", (now, clean_campaign, next_occurrence))
+        connection.execute("UPDATE ad_campaigns SET status = 'active', next_run_at = ?, next_occurrence = ?, pause_reason = NULL, paused_at = NULL, completed_at = NULL WHERE campaign_id = ? AND status = 'paused'", (now, next_occurrence, clean_campaign))
+        connection.commit()
+    resumed = get_ad_campaign(clean_campaign)
+    return dict(resumed) if resumed else None
 
 
 def ensure_ad_delivery_rows(campaign_id: str, occurrence: int, target_chat_ids: Iterable[int]) -> None:

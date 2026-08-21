@@ -105,6 +105,8 @@ from control_plane import (
     mark_ad_delivery_failed,
     mark_ad_delivery_dead_letter,
     count_ad_delivery_status,
+    pause_ad_campaign_for_permission_loss,
+    resume_ad_campaign,
     get_ad_delivery,
     get_ad_chat_last_sent_at,
     get_admin_analytics,
@@ -199,6 +201,7 @@ MIN_AD_INTERVAL_SECONDS = max(3600, min(86400, int(os.getenv("MIN_AD_INTERVAL_SE
 AD_CAMPAIGN_POLL_SECONDS = max(10, min(120, int(os.getenv("AD_CAMPAIGN_POLL_SECONDS", "30"))))
 AD_CAMPAIGN_MAX_BODY = max(200, min(3500, int(os.getenv("AD_CAMPAIGN_MAX_BODY", "1200"))))
 AD_CAMPAIGN_COOLDOWN_SECONDS = max(3600, min(7 * 86400, int(os.getenv("AD_CAMPAIGN_COOLDOWN_SECONDS", "3600"))))
+AD_CAMPAIGN_PERMISSION_LOSS_PAUSE_THRESHOLD = max(0, min(50, int(os.getenv("AD_CAMPAIGN_PERMISSION_LOSS_PAUSE_THRESHOLD", "2"))))
 MAINTENANCE_FEATURE_ENABLED = os.getenv("MAINTENANCE_FEATURE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 MAINTENANCE_SCHEDULER_POLL_SECONDS = max(5, min(60, int(os.getenv("MAINTENANCE_SCHEDULER_POLL_SECONDS", "15"))))
 CRASH_FAILSAFE_ENABLED = os.getenv("CRASH_FAILSAFE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -380,6 +383,7 @@ async def configure_bot_profile(bot) -> None:
         BotCommand("confirmad", "Confirm a previewed advertising campaign"),
         BotCommand("adlist", "List administrator advertising campaigns"),
         BotCommand("cancelad", "Cancel an advertising campaign"),
+        BotCommand("resumead", "Resume a paused advertising campaign after permission review"),
         BotCommand("referral", "Create your referral link"),
         BotCommand("report", "Open a support or safety report"),
         BotCommand("appeal", "Open an account review appeal"),
@@ -4667,6 +4671,32 @@ def enqueue_ad_permission_loss_alert(campaign_id: str, target_chat_id: int, reas
             logger.exception("ad_permission_alert_enqueue_failed campaign_id=%s target_chat_id=%s", str(campaign_id)[:100], int(target_chat_id))
 
 
+def maybe_pause_ad_campaign_for_permission_loss(campaign_id: str) -> bool:
+    if AD_CAMPAIGN_PERMISSION_LOSS_PAUSE_THRESHOLD <= 0:
+        return False
+    paused = pause_ad_campaign_for_permission_loss(campaign_id, AD_CAMPAIGN_PERMISSION_LOSS_PAUSE_THRESHOLD)
+    if not paused:
+        return False
+    body = (
+        f"GreyAI automatically paused advertising campaign {paused['campaign_id']} after "
+        f"{paused['permission_loss_count']} distinct targets lost membership or posting permission. "
+        "Review the targets, restore permissions where appropriate, then use /resumead to continue."
+    )[:3500]
+    for administrator_id in admin_ids():
+        try:
+            enqueue_safe_user_notification(
+                int(administrator_id),
+                "advertising",
+                "Advertising campaign paused",
+                body,
+                f"ad-campaign-paused:{paused['campaign_id']}",
+            )
+        except Exception:
+            logger.exception("ad_campaign_pause_alert_enqueue_failed campaign_id=%s", paused["campaign_id"])
+    logger.warning("ad_campaign_paused_permission_loss campaign_id=%s loss_count=%s threshold=%s", paused["campaign_id"], paused["permission_loss_count"], paused["threshold"])
+    return True
+
+
 def _ad_campaign_preview_text(job: Dict[str, Any], labels: Optional[List[str]] = None) -> str:
     target_ids = job.get("target_chat_ids", [])
     target_line = ", ".join(labels or [str(value) for value in target_ids])[:800]
@@ -4768,7 +4798,19 @@ async def list_ad_campaigns_command(update: Update, context: ContextTypes.DEFAUL
     rows = list_ad_campaigns_for_admin(update.effective_user.id, 20)
     if not rows:
         return await update.message.reply_text("No advertising campaigns found.")
-    await update.message.reply_text("\n\n".join(f"{row['campaign_id']} [{row['status']}] repeats={row['repeat_count']} next={row['next_run_at'] or '-'} title={row['title'][:120]}" for row in rows))
+    await update.message.reply_text("\n\n".join(f"{row['campaign_id']} [{row['status']}] repeats={row['repeat_count']} next={row['next_run_at'] or '-'} title={row['title'][:120]}" + (f" pause_reason={row['pause_reason'][:180]}" if row['status'] == 'paused' and row['pause_reason'] else "") for row in rows))
+
+
+@admin_only
+async def resume_ad_campaign_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1:
+        return await update.message.reply_text("Usage: /resumead <campaign_id>")
+    campaign = resume_ad_campaign(context.args[0], update.effective_user.id)
+    if not campaign:
+        return await update.message.reply_text("Campaign not found, not paused, or not owned by this administrator.")
+    start_ad_campaign_task(campaign, context.bot)
+    record_admin_action(update.effective_user.id, "ad_campaign_resumed", None, "advertising campaign resumed after permission review", {"campaign_id": campaign["campaign_id"], "next_occurrence": campaign["next_occurrence"]})
+    await update.message.reply_text(f"▶️ Advertising campaign {campaign['campaign_id']} resumed. Permission-loss deliveries were reset for review on the next occurrence.")
 
 
 @admin_only
@@ -4817,36 +4859,49 @@ async def dispatch_ad_campaign_occurrence(campaign: Dict[str, Any], context_bot)
             chat = await context_bot.get_chat(target_chat_id)
             chat_type = str(getattr(chat, "type", ""))
             if status in {"left", "kicked"}:
-                mark_ad_delivery_dead_letter(row["delivery_id"], "bot removed from target chat")
+                mark_ad_delivery_dead_letter(row["delivery_id"], "permission_loss:bot removed from target chat")
                 enqueue_ad_permission_loss_alert(campaign_id, target_chat_id, "GreyAI is no longer a member")
                 failed += 1
+                if maybe_pause_ad_campaign_for_permission_loss(campaign_id):
+                    break
                 continue
             if chat_type == "channel" and (status not in {"administrator", "creator"} or getattr(member, "can_post_messages", True) is False):
-                mark_ad_delivery_dead_letter(row["delivery_id"], "channel posting permission lost")
+                mark_ad_delivery_dead_letter(row["delivery_id"], "permission_loss:channel posting permission lost")
                 enqueue_ad_permission_loss_alert(campaign_id, target_chat_id, "channel posting permission was removed")
                 failed += 1
+                if maybe_pause_ad_campaign_for_permission_loss(campaign_id):
+                    break
                 continue
             if chat_type in {"group", "supergroup"} and status == "restricted" and getattr(member, "can_send_messages", True) is False:
-                mark_ad_delivery_dead_letter(row["delivery_id"], "group sending permission lost")
+                mark_ad_delivery_dead_letter(row["delivery_id"], "permission_loss:group sending permission lost")
                 enqueue_ad_permission_loss_alert(campaign_id, target_chat_id, "group sending permission was removed")
                 failed += 1
+                if maybe_pause_ad_campaign_for_permission_loss(campaign_id):
+                    break
                 continue
             sent = await context_bot.send_message(chat_id=target_chat_id, text=str(campaign["body"])[:AD_CAMPAIGN_MAX_BODY])
             mark_ad_delivery_sent(row["delivery_id"], getattr(sent, "message_id", None))
             succeeded += 1
         except TelegramError as exc:
             if _is_ad_permission_error(exc):
-                mark_ad_delivery_dead_letter(row["delivery_id"], type(exc).__name__)
+                mark_ad_delivery_dead_letter(row["delivery_id"], f"permission_loss:{type(exc).__name__}")
                 enqueue_ad_permission_loss_alert(campaign_id, target_chat_id, "Telegram rejected the membership or posting permission")
+                maybe_paused = maybe_pause_ad_campaign_for_permission_loss(campaign_id)
             else:
+                maybe_paused = False
                 mark_ad_delivery_failed(row["delivery_id"], type(exc).__name__)
             failed += 1
             logger.warning("ad_delivery_failed campaign_id=%s target_chat_id=%s error_type=%s permission_loss=%s", campaign_id, target_chat_id, type(exc).__name__, _is_ad_permission_error(exc))
+            if maybe_paused:
+                break
         except Exception:
             mark_ad_delivery_failed(row["delivery_id"], "unexpected_delivery_error")
             failed += 1
             logger.exception("ad_delivery_unexpected_failure campaign_id=%s target_chat_id=%s", campaign_id, target_chat_id)
         await asyncio.sleep(0)
+    current_campaign = get_ad_campaign(campaign_id)
+    if current_campaign and current_campaign["status"] == "paused":
+        return {"processed": processed, "succeeded": succeeded, "failed": failed}
     remaining = len(list_pending_ad_deliveries(campaign_id, occurrence, MAX_AD_CAMPAIGN_TARGETS))
     dead_lettered = count_ad_delivery_status(campaign_id, occurrence, "dead_letter")
     if remaining:
@@ -6487,6 +6542,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/adcreate <chat_id|@username,...> | <title> | <copy or ai: brief> | <repeat/timing options> — preview an ad campaign\n"
         "/confirmad <campaign_id> <token> — confirm a campaign and start delivery\n"
         "/adlist — list your campaigns; /cancelad <campaign_id> — cancel one\n"
+        "/resumead <campaign_id> — resume a paused campaign after restoring permissions\n"
         "Admins receive a durable alert when a Pro or Max subscription is successfully purchased.\n"
         "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n"
         "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n"
@@ -6608,6 +6664,7 @@ def main():
     app.add_handler(CommandHandler("confirmad", confirm_ad_campaign_command))
     app.add_handler(CommandHandler("adlist", list_ad_campaigns_command))
     app.add_handler(CommandHandler("cancelad", cancel_ad_campaign_command))
+    app.add_handler(CommandHandler("resumead", resume_ad_campaign_command))
     app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("upgrade", upgrade_command))
     app.add_handler(CallbackQueryHandler(upgrade_plan_callback, pattern=r"^upgrade:(pro|max)$"))

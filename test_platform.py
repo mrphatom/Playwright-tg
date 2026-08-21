@@ -343,3 +343,99 @@ def test_automatic_recovery_does_not_clear_manual_or_scheduled_maintenance(platf
     assert cp.update_maintenance_recovery_progress("inc_scheduled", 6, cp.utc_now(), "healthy") is False
     assert cp.recover_automatic_maintenance("inc_scheduled", 3) is None
     assert cp.get_maintenance_state()["mode"] == scheduled["mode"]
+
+
+def test_ad_campaign_permission_loss_circuit_breaker_pauses_at_distinct_target_threshold(platform_db):
+    cp.ensure_user(9001)
+    campaign = cp.create_ad_campaign(9001, "GreyAI", "Permission-safe ad", [-1001, -1002], 1, 3600)
+    confirmed = cp.confirm_ad_campaign(campaign["campaign_id"], campaign["confirmation_token"], 9001)
+    assert confirmed["status"] == "active"
+    cp.ensure_ad_delivery_rows(campaign["campaign_id"], 1, [-1001, -1002])
+
+    cp.mark_ad_delivery_dead_letter(f"{campaign['campaign_id']}:1:-1001", "permission_loss:bot removed from target chat")
+    assert cp.count_ad_permission_loss_targets(campaign["campaign_id"]) == 1
+    assert cp.pause_ad_campaign_for_permission_loss(campaign["campaign_id"], 2) is None
+    assert cp.get_ad_campaign(campaign["campaign_id"])["status"] == "active"
+
+    cp.mark_ad_delivery_dead_letter(f"{campaign['campaign_id']}:1:-1002", "permission_loss:group sending permission lost")
+    paused = cp.pause_ad_campaign_for_permission_loss(campaign["campaign_id"], 2)
+    assert paused["permission_loss_count"] == 2
+    stored = cp.get_ad_campaign(campaign["campaign_id"])
+    assert stored["status"] == "paused"
+    assert stored["pause_reason"]
+    assert stored["paused_at"]
+
+
+def test_ad_campaign_resume_resets_only_permission_loss_dead_letters(platform_db):
+    cp.ensure_user(9001)
+    campaign = cp.create_ad_campaign(9001, "GreyAI", "Retryable ad", [-1001, -1002], 1, 3600)
+    cp.confirm_ad_campaign(campaign["campaign_id"], campaign["confirmation_token"], 9001)
+    cp.ensure_ad_delivery_rows(campaign["campaign_id"], 1, [-1001, -1002])
+    cp.mark_ad_delivery_dead_letter(f"{campaign['campaign_id']}:1:-1001", "permission_loss:bot removed from target chat")
+    cp.mark_ad_delivery_dead_letter(f"{campaign['campaign_id']}:1:-1002", "permission_loss:channel posting permission lost")
+    assert cp.pause_ad_campaign_for_permission_loss(campaign["campaign_id"], 2)
+
+    resumed = cp.resume_ad_campaign(campaign["campaign_id"], 9001)
+    assert resumed["status"] == "active"
+    assert resumed["next_occurrence"] == 1
+    assert resumed["pause_reason"] is None
+    pending = cp.list_pending_ad_deliveries(campaign["campaign_id"], 1, 10)
+    assert {row["target_chat_id"] for row in pending} == {-1001, -1002}
+    assert all(row["status"] == "pending" and row["attempt_count"] == 0 for row in pending)
+
+
+def test_ad_campaign_permission_loss_pause_requires_distinct_targets(platform_db):
+    cp.ensure_user(9001)
+    campaign = cp.create_ad_campaign(9001, "GreyAI", "Distinct targets only", [-1001], 1, 3600)
+    cp.confirm_ad_campaign(campaign["campaign_id"], campaign["confirmation_token"], 9001)
+    cp.ensure_ad_delivery_rows(campaign["campaign_id"], 1, [-1001])
+    cp.mark_ad_delivery_dead_letter(f"{campaign['campaign_id']}:1:-1001", "permission_loss:bot removed from target chat")
+    assert cp.count_ad_permission_loss_targets(campaign["campaign_id"]) == 1
+    assert cp.pause_ad_campaign_for_permission_loss(campaign["campaign_id"], 2) is None
+    assert cp.get_ad_campaign(campaign["campaign_id"])["status"] == "active"
+
+
+def test_ad_campaign_resume_is_owner_scoped(platform_db):
+    cp.ensure_user(9001)
+    cp.ensure_user(9002)
+    campaign = cp.create_ad_campaign(9001, "GreyAI", "Owner scoped", [-1001, -1002], 1, 3600)
+    cp.confirm_ad_campaign(campaign["campaign_id"], campaign["confirmation_token"], 9001)
+    cp.ensure_ad_delivery_rows(campaign["campaign_id"], 1, [-1001, -1002])
+    for target in (-1001, -1002):
+        cp.mark_ad_delivery_dead_letter(f"{campaign['campaign_id']}:1:{target}", "permission_loss:bot removed from target chat")
+    cp.pause_ad_campaign_for_permission_loss(campaign["campaign_id"], 2)
+    assert cp.resume_ad_campaign(campaign["campaign_id"], 9002) is None
+    assert cp.get_ad_campaign(campaign["campaign_id"])["status"] == "paused"
+
+
+def test_ad_campaign_listing_includes_pause_metadata(platform_db):
+    cp.ensure_user(9001)
+    campaign = cp.create_ad_campaign(9001, "GreyAI", "Listable", [-1001, -1002], 1, 3600)
+    cp.confirm_ad_campaign(campaign["campaign_id"], campaign["confirmation_token"], 9001)
+    cp.ensure_ad_delivery_rows(campaign["campaign_id"], 1, [-1001, -1002])
+    for target in (-1001, -1002):
+        cp.mark_ad_delivery_dead_letter(f"{campaign['campaign_id']}:1:{target}", "permission_loss:bot removed from target chat")
+    cp.pause_ad_campaign_for_permission_loss(campaign["campaign_id"], 2)
+    listed = cp.list_ad_campaigns_for_admin(9001, 10)
+    assert listed[0]["pause_reason"]
+    assert listed[0]["paused_at"]
+
+
+def test_ad_campaign_threshold_zero_is_explicitly_disabled_in_bot(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "AD_CAMPAIGN_PERMISSION_LOSS_PAUSE_THRESHOLD", 0)
+    monkeypatch.setattr(bot, "pause_ad_campaign_for_permission_loss", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("disabled circuit breaker must not call persistence")))
+    assert bot.maybe_pause_ad_campaign_for_permission_loss("ad_disabled") is False
+
+
+def test_ad_campaign_pause_alert_is_idempotent_keyed(monkeypatch):
+    import bot
+    captured = []
+    monkeypatch.setattr(bot, "AD_CAMPAIGN_PERMISSION_LOSS_PAUSE_THRESHOLD", 2)
+    monkeypatch.setattr(bot, "pause_ad_campaign_for_permission_loss", lambda *args, **kwargs: {"campaign_id": "ad_alert", "permission_loss_count": 2, "threshold": 2})
+    monkeypatch.setattr(bot, "admin_ids", lambda: {9001})
+    monkeypatch.setattr(bot, "enqueue_safe_user_notification", lambda *args: captured.append(args))
+    assert bot.maybe_pause_ad_campaign_for_permission_loss("ad_alert") is True
+    assert captured[0][4] == "ad-campaign-paused:ad_alert"
+    assert "2 distinct targets" in captured[0][3]
+    assert "TELEGRAM_BOT_TOKEN" not in captured[0][3]
