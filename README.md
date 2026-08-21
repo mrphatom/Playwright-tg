@@ -78,6 +78,7 @@ When a new key is created, GreyAI sends a separate, clearly labeled message cont
 | `/support` | Request platform support | `/support` |
 | `/paysupport` | Request payment support | `/paysupport` |
 | `/terms` | View the platform terms notice | `/terms` |
+| `/stars` or `/starsbalance` | Administrator-only live bot Stars balance and bounded recent revenue report | `/stars` |
 
 ### Natural-language examples
 
@@ -143,13 +144,13 @@ The initial enabled scope is `check`. Keys are not dashboard credentials, and th
 
 ### Administrator command groups
 
-Administrators can search users, inspect account state, ban and unban accounts, review reports and appeals, resolve tickets, inspect referral activity, grant and revoke administrator roles, review developer requests, approve or deny developer access, inspect platform health, publish maintenance status, and manage the domain policy. The available commands include `/admin`, `/admin_user`, `/grantadmin`, `/revokeadmin`, `/ban`, `/unban`, `/banned`, `/reports`, `/appeals`, `/review`, `/resolveappeal`, `/referrals`, `/analytics`, `/announce`, `/dm`, `/massdm`, `/massrole`, `/maintenance`, `/status`, `/maintenance_log`, `/massban`, `/massunban`, `/massappeals`, `/confirmbulk`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/domains`, `/allowdomain`, `/disallowdomain`, and `/resetdomain`.
+Administrators can search users, inspect account state, ban and unban accounts, review reports and appeals, resolve tickets, inspect referral activity, grant and revoke administrator roles, review developer requests, approve or deny developer access, inspect platform health, publish maintenance status, view the live Telegram Stars balance and a bounded revenue summary, and manage the domain policy. The available commands include `/admin`, `/admin_user`, `/grantadmin`, `/revokeadmin`, `/ban`, `/unban`, `/banned`, `/reports`, `/appeals`, `/review`, `/resolveappeal`, `/referrals`, `/analytics`, `/stars`, `/starsbalance`, `/announce`, `/dm`, `/massdm`, `/massrole`, `/maintenance`, `/status`, `/maintenance_log`, `/massban`, `/massunban`, `/massappeals`, `/confirmbulk`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/domains`, `/allowdomain`, `/disallowdomain`, and `/resetdomain`.
 
 ### Announcements, private messages, and bulk moderation
 
 `/announce <message>` previews an announcement to active users. `/dm <telegram_id> <message>` previews a private message to one existing user, while `/massdm <id1,id2,...> | <message>` previews a bounded multi-recipient message. `/massrole <users|developers|admins> | <message>` resolves the selected role on the server and previews a role-targeted message. These commands do not deliver immediately. The preview includes a job ID and short-lived token; delivery starts only after the administrator sends `/confirmbulk <job_id> <token>`. Confirmation is single-use and expires after ten minutes.
 
-The same workflow protects `/massban <id1,id2,...> | <reason>`, `/massunban <id1,id2,...>`, and `/massappeals <resolved|denied> <appeal_id1,appeal_id2,...> | <resolution>`. Administrator accounts are never valid mass-ban targets. A completed job reports processed, succeeded, and failed items, and every state change is written to the audit trail. `/banned` lists currently banned accounts, and `/analytics` shows banned users, suspicious users awaiting human review, top users by operations, top referrers, and the most risky accounts.
+The same workflow protects `/massban <id1,id2,...> | <reason>`, `/massunban <id1,id2,...>`, and `/massappeals <resolved|denied> <appeal_id1,appeal_id2,...> | <resolution>`. Administrator accounts are never valid mass-ban targets. A completed job reports processed, succeeded, and failed items, and every state change is written to the audit trail. `/banned` lists currently banned accounts, `/analytics` shows banned users, suspicious users awaiting human review, top users by operations, top referrers, and the most risky accounts, and `/stars` shows the bot’s current Telegram Stars balance plus received, outgoing/refund, net, and recent transaction totals for the latest bounded transaction window. The Stars report does not expose payer identities or transaction IDs.
 
 Ban, unban, and appeal decisions send the affected user a bounded notification through the durable outbox. Notifications use unique idempotency keys, bounded retries, exponential backoff, and HTML escaping; internal risk evidence, API keys, cookies, prompts, and administrator-only details are not included.
 

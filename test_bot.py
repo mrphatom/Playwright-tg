@@ -37,6 +37,118 @@ def setup_test_db():
     if os.path.exists("test_telescout.db"):
         os.remove("test_telescout.db")
 
+def test_stars_report_aggregates_balance_and_bounded_transactions():
+    import bot
+
+    transactions = [
+        SimpleNamespace(amount=750, date=datetime(2026, 8, 21, 12, 0), source=SimpleNamespace()),
+        SimpleNamespace(amount=1000, date=datetime(2026, 8, 21, 12, 1), source=SimpleNamespace()),
+        SimpleNamespace(amount=-200, date=datetime(2026, 8, 21, 12, 2), receiver=SimpleNamespace()),
+    ]
+    report = bot.format_stars_report(SimpleNamespace(amount=1550), transactions, inspected_limit=100)
+
+    assert "Current bot balance: 1,550 Stars" in report
+    assert "Received in inspected history: 1,750 Stars" in report
+    assert "Outgoing/refunds in inspected history: 200 Stars" in report
+    assert "Net in inspected history: 1,550 Stars" in report
+    assert "Transactions inspected: 3" in report
+    assert "2026-08-21 12:02 UTC" in report
+    assert "payer" not in report.lower()
+
+
+def test_stars_command_is_admin_only_and_formats_live_api_results(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append((text, kwargs))
+
+    class FakeTelegramBot:
+        async def get_my_star_balance(self):
+            return SimpleNamespace(amount=1550)
+
+        async def get_star_transactions(self, limit=None):
+            return SimpleNamespace(transactions=[SimpleNamespace(amount=1550, date=datetime(2026, 8, 21, 12, 0), source=None)])
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=6411860985, username="admin", full_name="Admin"),
+        message=message,
+    )
+    context = SimpleNamespace(bot=FakeTelegramBot())
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: True)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+
+    asyncio.run(bot.stars_command(update, context))
+
+    assert len(message.replies) == 1
+    assert "Current bot balance: 1,550 Stars" in message.replies[0][0]
+
+
+def test_stars_command_handles_telegram_api_failure_without_details(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    class FailingTelegramBot:
+        async def get_my_star_balance(self):
+            raise bot.TelegramError("sensitive Telegram API diagnostic")
+
+        async def get_star_transactions(self, limit=None):
+            raise bot.TelegramError("another sensitive diagnostic")
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=6411860985, username="admin", full_name="Admin"),
+        message=message,
+    )
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: True)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+
+    asyncio.run(bot.stars_command(update, SimpleNamespace(bot=FailingTelegramBot())))
+
+    assert message.replies == ["⚠️ Telegram Stars data is temporarily unavailable. Please try /stars again shortly."]
+    assert "sensitive" not in message.replies[0]
+
+
+def test_stars_command_denies_non_admin_without_calling_telegram(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    class ExplodingTelegramBot:
+        async def get_my_star_balance(self):
+            raise AssertionError("non-admin must not call Telegram Stars APIs")
+
+        async def get_star_transactions(self, limit=None):
+            raise AssertionError("non-admin must not call Telegram Stars APIs")
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=99, username="user", full_name="User"),
+        message=message,
+    )
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: False)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+
+    asyncio.run(bot.stars_command(update, SimpleNamespace(bot=ExplodingTelegramBot())))
+
+    assert message.replies == ["⛔ Administrator permission is required for this action."]
+
+
 def test_upgrade_menu_lists_benefits_prices_and_selection_buttons():
     import bot
 
