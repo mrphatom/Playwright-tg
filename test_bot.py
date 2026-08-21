@@ -2525,3 +2525,140 @@ def test_reply_context_recovers_outbound_grey_message_from_durable_log():
 
     assert context["source"] == "durable_conversation_log"
     assert context["text"] == "The durable answer Grey sent."
+
+
+def test_ad_campaign_parser_extracts_explicit_targets_and_bounded_schedule():
+    import bot
+    plan = bot.parse_deterministic_ad_campaign_request(
+        "Create an ad campaign to chat IDs -1001234567890 and @greynews | 12 times every 15 minutes | GreyAI helps teams browse the web."
+    )
+    assert plan["mode"] == "ad_campaign"
+    assert plan["targets"] == ["-1001234567890", "@greynews"]
+    assert plan["repeat_count"] == bot.MAX_AD_CAMPAIGN_REPEATS
+    assert plan["interval_seconds"] == bot.MIN_AD_INTERVAL_SECONDS
+    assert plan["ad_text"].startswith("GreyAI helps")
+
+
+def test_ad_campaign_preview_is_admin_only_and_does_not_send(monkeypatch):
+    import bot
+    captured = {}
+
+    class FakeMessage:
+        async def reply_text(self, text, **kwargs):
+            captured["text"] = text
+            return self
+
+    class FakeBot:
+        async def get_me(self):
+            return SimpleNamespace(id=999)
+
+        async def get_chat(self, target):
+            return SimpleNamespace(id=-1001234567890, type="supergroup", title="Grey News")
+
+        async def get_chat_member(self, chat_id, user_id):
+            return SimpleNamespace(status="member", can_send_messages=True)
+
+        async def send_message(self, **kwargs):
+            raise AssertionError("preview must not send an advertisement")
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=6411860985),
+        effective_message=FakeMessage(),
+        message=FakeMessage(),
+    )
+    context = SimpleNamespace(bot=FakeBot())
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: True)
+    monkeypatch.setattr(bot, "create_ad_campaign", lambda *args, **kwargs: {
+        "campaign_id": "ad_test",
+        "confirmation_token": "confirm-token",
+        "title": args[1],
+        "body": args[2],
+        "target_chat_ids": args[3],
+        "repeat_count": args[4],
+        "interval_seconds": args[5],
+    })
+    monkeypatch.setattr(bot, "record_admin_action", lambda *args, **kwargs: "audit_ad")
+
+    asyncio.run(bot.create_ad_campaign_preview(update, context, {
+        "mode": "ad_campaign",
+        "targets": ["-1001234567890"],
+        "title": "GreyAI",
+        "ad_text": "Try GreyAI for web research.",
+        "generate_copy": False,
+        "repeat_count": 2,
+        "interval_seconds": 3600,
+    }))
+
+    assert "Preview only" in captured["text"]
+    assert "/confirmad ad_test confirm-token" in captured["text"]
+    assert "Grey News" in captured["text"]
+
+
+def test_ad_campaign_preview_rejects_non_admin_before_target_lookup(monkeypatch):
+    import bot
+    captured = {}
+
+    class FakeMessage:
+        async def reply_text(self, text, **kwargs):
+            captured["text"] = text
+
+    class FakeBot:
+        async def get_me(self):
+            raise AssertionError("non-admin must be rejected before Telegram lookup")
+
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=77), effective_message=FakeMessage(), message=FakeMessage())
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: False)
+    asyncio.run(bot.create_ad_campaign_preview(update, SimpleNamespace(bot=FakeBot()), {
+        "mode": "ad_campaign", "targets": ["-1001234567890"], "title": "GreyAI", "ad_text": "copy"
+    }))
+    assert "Only a GreyAI administrator" in captured["text"]
+
+
+def test_ad_campaign_natural_language_route_stays_task_and_requires_explicit_targets():
+    import bot
+    plan = asyncio.run(bot.parse_natural_language_intent("Please advertise GreyAI automatically three times every two hours"))
+    assert plan["mode"] == "ad_campaign"
+    assert plan["needs_targets"] is True
+    assert plan["targets"] == []
+
+
+def test_ad_campaign_dispatch_sends_plain_text_and_completes(monkeypatch):
+    import bot
+    sent = []
+    monkeypatch.setattr(bot, "reclaim_stale_ad_deliveries", lambda: 0)
+    monkeypatch.setattr(bot, "ensure_ad_delivery_rows", lambda *args, **kwargs: None)
+    row = {"delivery_id": "ad_test:1:-1001234567890", "target_chat_id": -1001234567890}
+    monkeypatch.setattr(bot, "list_pending_ad_deliveries", lambda *args, **kwargs: [row])
+    monkeypatch.setattr(bot, "get_ad_chat_last_sent_at", lambda target: None)
+    monkeypatch.setattr(bot, "mark_ad_delivery_sending", lambda delivery_id: True)
+    monkeypatch.setattr(bot, "mark_ad_delivery_sent", lambda *args, **kwargs: True)
+    monkeypatch.setattr(bot, "mark_ad_delivery_failed", lambda *args, **kwargs: True)
+    monkeypatch.setattr(bot, "count_ad_delivery_status", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(bot, "update_ad_campaign_next_run", lambda *args, **kwargs: True)
+
+    class FakeBot:
+        async def get_me(self):
+            return SimpleNamespace(id=999)
+
+        async def get_chat_member(self, chat_id, user_id):
+            return SimpleNamespace(status="member", can_send_messages=True)
+
+        async def get_chat(self, chat_id):
+            return SimpleNamespace(type="supergroup")
+
+        async def send_message(self, **kwargs):
+            sent.append(kwargs)
+            return SimpleNamespace(message_id=42)
+
+    campaign = {
+        "campaign_id": "ad_test",
+        "admin_user_id": 6411860985,
+        "body": "GreyAI plain-text ad",
+        "target_chats_json": json.dumps([-1001234567890]),
+        "repeat_count": 1,
+        "next_occurrence": 1,
+        "interval_seconds": 3600,
+    }
+    result = asyncio.run(bot.dispatch_ad_campaign_occurrence(campaign, FakeBot()))
+    assert result == {"processed": 1, "succeeded": 1, "failed": 0}
+    assert sent == [{"chat_id": -1001234567890, "text": "GreyAI plain-text ad"}]

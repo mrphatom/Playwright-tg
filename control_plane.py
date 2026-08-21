@@ -307,6 +307,41 @@ def init_platform_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_bulk_jobs_admin_time ON admin_bulk_jobs(admin_user_id, created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS ad_campaigns (
+                campaign_id TEXT PRIMARY KEY,
+                admin_user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                target_chats_json TEXT NOT NULL DEFAULT '[]',
+                repeat_count INTEGER NOT NULL DEFAULT 1,
+                interval_seconds INTEGER NOT NULL DEFAULT 3600,
+                next_occurrence INTEGER NOT NULL DEFAULT 1,
+                next_run_at TEXT,
+                status TEXT NOT NULL DEFAULT 'preview' CHECK (status IN ('preview', 'active', 'paused', 'completed', 'cancelled', 'failed')),
+                confirmation_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_ad_campaigns_admin_time ON ad_campaigns(admin_user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_ad_campaigns_dispatch ON ad_campaigns(status, next_run_at);
+
+            CREATE TABLE IF NOT EXISTS ad_deliveries (
+                delivery_id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL,
+                occurrence INTEGER NOT NULL,
+                target_chat_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'dead_letter')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                telegram_message_id INTEGER,
+                last_error TEXT,
+                sent_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(campaign_id, occurrence, target_chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ad_deliveries_status ON ad_deliveries(campaign_id, status, updated_at);
+
             CREATE TABLE IF NOT EXISTS developer_events (
                 event_id TEXT PRIMARY KEY,
                 owner_user_id INTEGER NOT NULL,
@@ -449,6 +484,10 @@ def _migrate_users_role_constraint(connection: sqlite3.Connection) -> None:
             )
             """
         )
+        try:
+            connection.execute("ALTER TABLE ad_campaigns ADD COLUMN next_occurrence INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
         connection.execute("INSERT INTO users_migrating SELECT telegram_user_id, username, display_name, role, status, plan, quota_limit, quota_used, quota_reset_at, risk_score, strike_count, banned_until, status_reason, created_at, last_seen_at, updated_at FROM users")
         connection.execute("DROP TABLE users")
         connection.execute("ALTER TABLE users_migrating RENAME TO users")
@@ -1149,6 +1188,138 @@ def update_bulk_job_counts(job_id: str, processed: int, succeeded: int, failed: 
         cursor = connection.execute("UPDATE admin_bulk_jobs SET status = ?, processed_count = ?, succeeded_count = ?, failed_count = ?, completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE completed_at END WHERE job_id = ?", (status, max(0, int(processed)), max(0, int(succeeded)), max(0, int(failed)), status, utc_now(), str(job_id)[:100]))
         connection.commit()
         return cursor.rowcount == 1
+
+
+def create_ad_campaign(admin_user_id: int, title: str, body: str, target_chat_ids: Iterable[int], repeat_count: int, interval_seconds: int, ttl_minutes: int = 15) -> Dict[str, Any]:
+    clean_targets = sorted({int(value) for value in target_chat_ids})
+    if not clean_targets or len(clean_targets) > 50:
+        raise ValueError("ad campaign target limit exceeded")
+    clean_title = str(title or "GreyAI advertisement")[:120]
+    clean_body = str(body or "").strip()[:3500]
+    if not clean_body:
+        raise ValueError("ad campaign body is required")
+    clean_repeat = max(1, min(int(repeat_count), 20))
+    clean_interval = max(3600, min(int(interval_seconds), 30 * 86400))
+    campaign_id = "ad_" + secrets.token_urlsafe(8)
+    token = secrets.token_urlsafe(10)
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=max(1, min(int(ttl_minutes), 30)))).replace(microsecond=0).isoformat()
+    with _connect() as connection:
+        connection.execute(
+            "INSERT INTO ad_campaigns (campaign_id, admin_user_id, title, body, target_chats_json, repeat_count, interval_seconds, confirmation_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (campaign_id, int(admin_user_id), clean_title, clean_body, json.dumps(clean_targets), clean_repeat, clean_interval, _token_hash(token), expires, utc_now()),
+        )
+        connection.commit()
+    return {"campaign_id": campaign_id, "confirmation_token": token, "title": clean_title, "body": clean_body, "target_chat_ids": clean_targets, "repeat_count": clean_repeat, "interval_seconds": clean_interval, "expires_at": expires, "status": "preview"}
+
+
+def confirm_ad_campaign(campaign_id: str, confirmation_token: str, admin_user_id: int) -> Optional[Dict[str, Any]]:
+    now = utc_now()
+    with _connect() as connection:
+        row = connection.execute("SELECT * FROM ad_campaigns WHERE campaign_id = ? AND admin_user_id = ? AND status = 'preview'", (str(campaign_id)[:100], int(admin_user_id))).fetchone()
+        if not row or row["expires_at"] <= now or not hmac.compare_digest(row["confirmation_hash"], _token_hash(str(confirmation_token or ""))):
+            return None
+        connection.execute("UPDATE ad_campaigns SET status = 'active', confirmed_at = ?, next_run_at = ? WHERE campaign_id = ? AND status = 'preview'", (now, now, row["campaign_id"]))
+        connection.commit()
+        confirmed = dict(row)
+        confirmed.update({"status": "active", "confirmed_at": now, "next_run_at": now})
+        return confirmed
+
+
+def get_ad_campaign(campaign_id: str) -> Optional[sqlite3.Row]:
+    with _connect() as connection:
+        return connection.execute("SELECT * FROM ad_campaigns WHERE campaign_id = ?", (str(campaign_id)[:100],)).fetchone()
+
+
+def list_ad_campaigns_for_admin(admin_user_id: int, limit: int = 20) -> List[sqlite3.Row]:
+    with _connect() as connection:
+        return connection.execute("SELECT campaign_id, title, repeat_count, next_run_at, status, created_at FROM ad_campaigns WHERE admin_user_id = ? ORDER BY created_at DESC LIMIT ?", (int(admin_user_id), max(1, min(int(limit), 50)))).fetchall()
+
+
+def list_active_ad_campaigns(limit: int = 50) -> List[sqlite3.Row]:
+    with _connect() as connection:
+        return connection.execute("SELECT * FROM ad_campaigns WHERE status = 'active' AND next_run_at IS NOT NULL ORDER BY next_run_at LIMIT ?", (max(1, min(int(limit), 100)),)).fetchall()
+
+
+def list_due_ad_campaigns(limit: int = 20) -> List[sqlite3.Row]:
+    now = utc_now()
+    with _connect() as connection:
+        return connection.execute("SELECT * FROM ad_campaigns WHERE status = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at LIMIT ?", (now, max(1, min(int(limit), 50)))).fetchall()
+
+
+def update_ad_campaign_next_run(campaign_id: str, next_run_at: Optional[str], status: str = "active", next_occurrence: Optional[int] = None) -> bool:
+    if status not in {"active", "paused", "completed", "cancelled", "failed"}:
+        raise ValueError("invalid ad campaign status")
+    with _connect() as connection:
+        if next_occurrence is None:
+            cursor = connection.execute("UPDATE ad_campaigns SET status = ?, next_run_at = ?, completed_at = CASE WHEN ? IN ('completed', 'cancelled', 'failed') THEN ? ELSE completed_at END WHERE campaign_id = ?", (status, next_run_at, status, utc_now(), str(campaign_id)[:100]))
+        else:
+            cursor = connection.execute("UPDATE ad_campaigns SET status = ?, next_run_at = ?, next_occurrence = ?, completed_at = CASE WHEN ? IN ('completed', 'cancelled', 'failed') THEN ? ELSE completed_at END WHERE campaign_id = ?", (status, next_run_at, int(next_occurrence), status, utc_now(), str(campaign_id)[:100]))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def ensure_ad_delivery_rows(campaign_id: str, occurrence: int, target_chat_ids: Iterable[int]) -> None:
+    now = utc_now()
+    with _connect() as connection:
+        for target_chat_id in sorted({int(value) for value in target_chat_ids}):
+            delivery_id = f"{str(campaign_id)[:100]}:{int(occurrence)}:{int(target_chat_id)}"
+            connection.execute("INSERT OR IGNORE INTO ad_deliveries (delivery_id, campaign_id, occurrence, target_chat_id, updated_at) VALUES (?, ?, ?, ?, ?)", (delivery_id, str(campaign_id)[:100], int(occurrence), int(target_chat_id), now))
+        connection.commit()
+
+
+def reclaim_stale_ad_deliveries(older_than_seconds: int = 600) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max(60, min(int(older_than_seconds), 86400)))).replace(microsecond=0).isoformat()
+    now = utc_now()
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE ad_deliveries SET status = CASE WHEN attempt_count >= 3 THEN 'dead_letter' ELSE 'failed' END, last_error = 'stale delivery lease reclaimed', updated_at = ? WHERE status = 'sending' AND updated_at < ?", (now, cutoff))
+        connection.commit()
+        return cursor.rowcount
+
+
+def list_pending_ad_deliveries(campaign_id: str, occurrence: int, limit: int = 50) -> List[sqlite3.Row]:
+    with _connect() as connection:
+        return connection.execute("SELECT * FROM ad_deliveries WHERE campaign_id = ? AND occurrence = ? AND status IN ('pending', 'failed') AND attempt_count < 3 ORDER BY target_chat_id LIMIT ?", (str(campaign_id)[:100], int(occurrence), max(1, min(int(limit), 50)))).fetchall()
+
+
+def mark_ad_delivery_sending(delivery_id: str) -> bool:
+    now = utc_now()
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE ad_deliveries SET status = 'sending', attempt_count = attempt_count + 1, updated_at = ? WHERE delivery_id = ? AND status IN ('pending', 'failed') AND attempt_count < 3", (now, str(delivery_id)[:160]))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def mark_ad_delivery_sent(delivery_id: str, telegram_message_id: Optional[int]) -> bool:
+    now = utc_now()
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE ad_deliveries SET status = 'sent', telegram_message_id = ?, sent_at = ?, updated_at = ?, last_error = NULL WHERE delivery_id = ? AND status = 'sending'", (telegram_message_id, now, now, str(delivery_id)[:160]))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def mark_ad_delivery_failed(delivery_id: str, error: str) -> bool:
+    now = utc_now()
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE ad_deliveries SET status = CASE WHEN attempt_count >= 3 THEN 'dead_letter' ELSE 'failed' END, last_error = ?, updated_at = ? WHERE delivery_id = ? AND status = 'sending'", (str(error or "delivery failed")[:500], now, str(delivery_id)[:160]))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def count_ad_delivery_status(campaign_id: str, occurrence: int, status: str) -> int:
+    with _connect() as connection:
+        row = connection.execute("SELECT COUNT(*) AS count FROM ad_deliveries WHERE campaign_id = ? AND occurrence = ? AND status = ?", (str(campaign_id)[:100], int(occurrence), str(status)[:30])).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def get_ad_delivery(campaign_id: str, occurrence: int, target_chat_id: int) -> Optional[sqlite3.Row]:
+    with _connect() as connection:
+        return connection.execute("SELECT * FROM ad_deliveries WHERE campaign_id = ? AND occurrence = ? AND target_chat_id = ?", (str(campaign_id)[:100], int(occurrence), int(target_chat_id))).fetchone()
+
+
+def get_ad_chat_last_sent_at(target_chat_id: int) -> Optional[str]:
+    with _connect() as connection:
+        row = connection.execute("SELECT d.sent_at FROM ad_deliveries d JOIN ad_campaigns c ON c.campaign_id = d.campaign_id WHERE d.target_chat_id = ? AND d.status = 'sent' ORDER BY d.sent_at DESC LIMIT 1", (int(target_chat_id),)).fetchone()
+    return row["sent_at"] if row else None
 
 
 def get_payment_order_by_external_id(provider: str, external_id: str) -> Optional[sqlite3.Row]:
