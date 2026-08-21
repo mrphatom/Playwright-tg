@@ -2662,3 +2662,96 @@ def test_ad_campaign_dispatch_sends_plain_text_and_completes(monkeypatch):
     result = asyncio.run(bot.dispatch_ad_campaign_occurrence(campaign, FakeBot()))
     assert result == {"processed": 1, "succeeded": 1, "failed": 0}
     assert sent == [{"chat_id": -1001234567890, "text": "GreyAI plain-text ad"}]
+
+
+def test_ad_target_resolution_allows_member_group_without_admin_role():
+    import bot
+
+    class FakeBot:
+        async def get_me(self):
+            return SimpleNamespace(id=999)
+
+        async def get_chat(self, target):
+            return SimpleNamespace(id=-1001234567890, type="supergroup", title="Member Group")
+
+        async def get_chat_member(self, chat_id, user_id):
+            return SimpleNamespace(status="member", can_send_messages=True)
+
+    resolved, labels, rejected = asyncio.run(bot.resolve_ad_targets(FakeBot(), ["-1001234567890"]))
+    assert resolved == [-1001234567890]
+    assert labels == ["Member Group"]
+    assert rejected == []
+
+
+def test_ad_target_resolution_rejects_channel_without_post_permission():
+    import bot
+
+    class FakeBot:
+        async def get_me(self):
+            return SimpleNamespace(id=999)
+
+        async def get_chat(self, target):
+            return SimpleNamespace(id=-1001234567890, type="channel", title="Grey Channel")
+
+        async def get_chat_member(self, chat_id, user_id):
+            return SimpleNamespace(status="administrator", can_post_messages=False)
+
+    resolved, labels, rejected = asyncio.run(bot.resolve_ad_targets(FakeBot(), ["-1001234567890"]))
+    assert resolved == []
+    assert labels == []
+    assert "posting permission missing" in rejected[0]
+
+
+def test_ad_permission_loss_alert_is_deduplicated_and_secret_free(monkeypatch):
+    import bot
+    captured = []
+    monkeypatch.setattr(bot, "admin_ids", lambda: {6411860985})
+    monkeypatch.setattr(bot, "enqueue_safe_user_notification", lambda *args: captured.append(args))
+    bot.enqueue_ad_permission_loss_alert("ad_perm", -1001234567890, "channel posting permission was removed")
+    assert len(captured) == 1
+    assert captured[0][1] == "advertising"
+    assert captured[0][2] == "Advertising target permission lost"
+    assert "channel posting permission was removed" in captured[0][3]
+    assert captured[0][4] == "ad-permission-loss:ad_perm:-1001234567890"
+    assert "TELEGRAM_BOT_TOKEN" not in captured[0][3]
+
+
+def test_ad_dispatch_permission_loss_dead_letters_and_alerts(monkeypatch):
+    import bot
+    captured = {}
+    monkeypatch.setattr(bot, "reclaim_stale_ad_deliveries", lambda: 0)
+    monkeypatch.setattr(bot, "ensure_ad_delivery_rows", lambda *args, **kwargs: None)
+    row = {"delivery_id": "ad_perm:1:-1001234567890", "target_chat_id": -1001234567890}
+    calls = {"pending": 0}
+    def pending(*args, **kwargs):
+        calls["pending"] += 1
+        return [row] if calls["pending"] == 1 else []
+    monkeypatch.setattr(bot, "list_pending_ad_deliveries", pending)
+    monkeypatch.setattr(bot, "get_ad_chat_last_sent_at", lambda target: None)
+    monkeypatch.setattr(bot, "mark_ad_delivery_sending", lambda delivery_id: True)
+    monkeypatch.setattr(bot, "mark_ad_delivery_dead_letter", lambda *args: captured.setdefault("dead", args) or True)
+    monkeypatch.setattr(bot, "count_ad_delivery_status", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(bot, "update_ad_campaign_next_run", lambda *args, **kwargs: captured.setdefault("status", args) or True)
+    monkeypatch.setattr(bot, "enqueue_ad_permission_loss_alert", lambda *args: captured.setdefault("alert", args))
+
+    class FakeBot:
+        async def get_me(self):
+            return SimpleNamespace(id=999)
+
+        async def get_chat_member(self, chat_id, user_id):
+            return SimpleNamespace(status="left", can_send_messages=False)
+
+        async def get_chat(self, chat_id):
+            return SimpleNamespace(type="channel")
+
+        async def send_message(self, **kwargs):
+            raise AssertionError("removed target must not receive an ad")
+
+    result = asyncio.run(bot.dispatch_ad_campaign_occurrence({
+        "campaign_id": "ad_perm", "body": "copy", "target_chats_json": json.dumps([-1001234567890]),
+        "repeat_count": 2, "next_occurrence": 1, "interval_seconds": 3600,
+    }, FakeBot()))
+    assert result["failed"] == 1
+    assert captured["dead"][0] == row["delivery_id"]
+    assert captured["alert"] == ("ad_perm", -1001234567890, "GreyAI is no longer a member")
+    assert captured["status"][2] == "failed"

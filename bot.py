@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, InlineQueryHandler, ChosenInlineResultHandler, BusinessConnectionHandler, CallbackQueryHandler, filters
-from telegram.error import TelegramError
+from telegram.error import TelegramError, Forbidden
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Browser, Playwright, BrowserContext
 import google.generativeai as genai
@@ -103,6 +103,7 @@ from control_plane import (
     mark_ad_delivery_sending,
     mark_ad_delivery_sent,
     mark_ad_delivery_failed,
+    mark_ad_delivery_dead_letter,
     count_ad_delivery_status,
     get_ad_delivery,
     get_ad_chat_last_sent_at,
@@ -4640,6 +4641,32 @@ def _parse_ad_campaign_options(raw_options: str) -> tuple[int, int]:
     return repeat_count, interval_seconds
 
 
+def _is_ad_permission_error(error: BaseException) -> bool:
+    text = str(error or "").lower()
+    return isinstance(error, Forbidden) or any(marker in text for marker in (
+        "not a member", "kicked", "chat not found", "not enough rights", "can't send", "cannot send", "forbidden", "have no rights",
+    ))
+
+
+def enqueue_ad_permission_loss_alert(campaign_id: str, target_chat_id: int, reason: str) -> None:
+    safe_reason = str(reason or "posting permission is no longer available")[:180]
+    body = (
+        f"GreyAI can no longer deliver campaign {str(campaign_id)[:100]} to target {int(target_chat_id)}. "
+        f"The target was disabled for this campaign occurrence because {safe_reason}."
+    )[:3500]
+    for administrator_id in admin_ids():
+        try:
+            enqueue_safe_user_notification(
+                int(administrator_id),
+                "advertising",
+                "Advertising target permission lost",
+                body,
+                f"ad-permission-loss:{str(campaign_id)[:100]}:{int(target_chat_id)}",
+            )
+        except Exception:
+            logger.exception("ad_permission_alert_enqueue_failed campaign_id=%s target_chat_id=%s", str(campaign_id)[:100], int(target_chat_id))
+
+
 def _ad_campaign_preview_text(job: Dict[str, Any], labels: Optional[List[str]] = None) -> str:
     target_ids = job.get("target_chat_ids", [])
     target_line = ", ".join(labels or [str(value) for value in target_ids])[:800]
@@ -4788,15 +4815,33 @@ async def dispatch_ad_campaign_occurrence(campaign: Dict[str, Any], context_bot)
             member = await context_bot.get_chat_member(target_chat_id, (await context_bot.get_me()).id)
             status = str(getattr(member, "status", ""))
             chat = await context_bot.get_chat(target_chat_id)
-            if status in {"left", "kicked"} or (getattr(chat, "type", "") == "channel" and (status not in {"administrator", "creator"} or getattr(member, "can_post_messages", True) is False)):
-                raise TelegramError("target permission is no longer valid")
+            chat_type = str(getattr(chat, "type", ""))
+            if status in {"left", "kicked"}:
+                mark_ad_delivery_dead_letter(row["delivery_id"], "bot removed from target chat")
+                enqueue_ad_permission_loss_alert(campaign_id, target_chat_id, "GreyAI is no longer a member")
+                failed += 1
+                continue
+            if chat_type == "channel" and (status not in {"administrator", "creator"} or getattr(member, "can_post_messages", True) is False):
+                mark_ad_delivery_dead_letter(row["delivery_id"], "channel posting permission lost")
+                enqueue_ad_permission_loss_alert(campaign_id, target_chat_id, "channel posting permission was removed")
+                failed += 1
+                continue
+            if chat_type in {"group", "supergroup"} and status == "restricted" and getattr(member, "can_send_messages", True) is False:
+                mark_ad_delivery_dead_letter(row["delivery_id"], "group sending permission lost")
+                enqueue_ad_permission_loss_alert(campaign_id, target_chat_id, "group sending permission was removed")
+                failed += 1
+                continue
             sent = await context_bot.send_message(chat_id=target_chat_id, text=str(campaign["body"])[:AD_CAMPAIGN_MAX_BODY])
             mark_ad_delivery_sent(row["delivery_id"], getattr(sent, "message_id", None))
             succeeded += 1
         except TelegramError as exc:
-            mark_ad_delivery_failed(row["delivery_id"], type(exc).__name__)
+            if _is_ad_permission_error(exc):
+                mark_ad_delivery_dead_letter(row["delivery_id"], type(exc).__name__)
+                enqueue_ad_permission_loss_alert(campaign_id, target_chat_id, "Telegram rejected the membership or posting permission")
+            else:
+                mark_ad_delivery_failed(row["delivery_id"], type(exc).__name__)
             failed += 1
-            logger.warning("ad_delivery_failed campaign_id=%s target_chat_id=%s error_type=%s", campaign_id, target_chat_id, type(exc).__name__)
+            logger.warning("ad_delivery_failed campaign_id=%s target_chat_id=%s error_type=%s permission_loss=%s", campaign_id, target_chat_id, type(exc).__name__, _is_ad_permission_error(exc))
         except Exception:
             mark_ad_delivery_failed(row["delivery_id"], "unexpected_delivery_error")
             failed += 1

@@ -322,7 +322,7 @@ Use `/schedules` to list active briefings and `/unschedule <ID>` to stop one.
 
 GreyAI administrators can create bounded advertising campaigns for explicit groups or channels where the bot is already present and has permission to post. This is a separate administrator-controlled path and does not remove the ordinary `/enablegreyai` requirement for user-initiated shared-chat conversations.
 
-Campaigns are previewed first and never post until the administrator confirms the short-lived, single-use token. Each delivery re-checks membership and posting permission. Channels require GreyAI to be an administrator with permission to post; groups and supergroups require GreyAI to remain present and able to send messages. Targets are never discovered automatically.
+Campaigns are previewed first and never post until the administrator confirms the short-lived, single-use token. Each delivery re-checks membership and posting permission. Channels require GreyAI to be an administrator with permission to post; groups and supergroups do not require GreyAI to be a group administrator, but GreyAI must remain a member and be able to send messages. Targets are never discovered automatically. If a channel removes GreyAI, removes its posting permission, or a group removes its send permission, the affected delivery is disabled and administrators receive a dedicated permission-loss alert.
 
 ```text
 /adcreate <chat_id|@username,...> | <title> | <ad copy or ai: brief> | <repeat/timing options>
