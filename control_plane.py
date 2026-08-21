@@ -999,6 +999,24 @@ def list_queue_entries(status: Optional[str] = None, limit: int = 100) -> List[s
         return connection.execute("SELECT queue_id, operation_id, user_id, chat_id, kind, priority, status, estimated_wait_seconds, error_code, enqueued_at, started_at, completed_at FROM request_queue ORDER BY enqueued_at DESC LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
 
 
+def get_platform_activity_summary() -> Dict[str, Any]:
+    """Return bounded operational aggregates; never return user identities."""
+    now = datetime.now(timezone.utc)
+    active_since = (now - timedelta(minutes=5)).replace(microsecond=0).isoformat()
+    with _connect() as connection:
+        active_users = connection.execute("SELECT COUNT(*) AS count FROM users WHERE status != 'banned' AND last_seen_at >= ?", (active_since,)).fetchone()
+        active_operations = connection.execute("SELECT COUNT(*) AS count FROM operations WHERE status IN ('running', 'retrying')").fetchone()
+        queue_rows = connection.execute("SELECT status, COUNT(*) AS count FROM request_queue WHERE status IN ('queued', 'running') GROUP BY status").fetchall()
+    queue = {str(row["status"]): int(row["count"] or 0) for row in queue_rows}
+    queue.setdefault("queued", 0)
+    queue.setdefault("running", 0)
+    return {
+        "active_users_5m": int(active_users["count"] if active_users else 0),
+        "active_operations": int(active_operations["count"] if active_operations else 0),
+        "queue": queue,
+    }
+
+
 def get_queue_stats() -> Dict[str, Any]:
     with _connect() as connection:
         counts = {row["status"]: int(row["count"]) for row in connection.execute("SELECT status, COUNT(*) AS count FROM request_queue GROUP BY status").fetchall()}

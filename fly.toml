@@ -13,6 +13,8 @@ primary_region = "iad"
 [env]
 
   DB_PATH = "/data/telescout.db"
+  GREY_OWNER_TELEGRAM_ID = "6411860985"
+  GREY_OWNER_LABEL = "GreyAI owner and creator"
   
   MAX_CONCURRENT_TASKS = "3"
   

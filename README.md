@@ -9,6 +9,16 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 
 ---
 
+## Native Grey Intelligence
+
+GreyAI’s identity and operating context are owned by the application rather than by the model provider. The runtime maintains a versioned native registry containing Grey’s name, description, owner relationship, commands, capabilities, execution processes, plan benefits, limitations, and current maintenance state. The same registry is used by ordinary chat, natural-language interpretation, multimodal input, inline mode, groups, channels, Secretary Mode, administrative workflows, developer integrations, watchers, schedules, and Agentic execution.
+
+Every model call receives a bounded `grey.context.v1` envelope assembled from application-owned state. It can include the requesting user’s Telegram identity, role, plan, status, quota summary, authorized scopes, chat scope, reply metadata, durable conversation counts, operation receipts, platform health, active-user aggregates, and provider health. Conversation turns and contact logs remain owner-and-chat scoped. Grey can use the requester’s relevant history, but ordinary users never receive another user’s private history or hidden moderation data. Aggregate active-user and active-operation counts are telemetry only.
+
+Gemini is an interchangeable inference provider, not Grey’s identity, memory store, authorization layer, command registry, or execution engine. Provider failover changes only the model/key slot; the native context, operation ID, durable receipt, role, plan, and Agentic state remain unchanged. Model output is untrusted and cannot grant roles, change plans, bypass quotas, reveal secrets, or execute side effects. The application validates the normalized intent and enforces authorization, plan gates, domain policy, confirmations, and Telegram permissions before any browser or messaging action.
+
+> A literal weight-level training or fine-tuning pipeline is a separate concern. This release provides native Grey grounding and orchestration; weight-level tuning requires a curated consented dataset, provider support, evaluation gates, and a rollback plan.
+
 ## ✨ Core Features
 
 - **👀 Continuous Watchers:** Monitor websites in the background. If a condition is met (e.g., "In Stock" or an AI evaluation), the bot alerts you and stops automatically. Watchers survive server reboots!
