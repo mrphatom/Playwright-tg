@@ -150,7 +150,6 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2")
 GEMINI_API_KEY_3 = os.getenv("GEMINI_API_KEY_3")
@@ -542,6 +541,13 @@ ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAINS", "").s
 PROXY_SERVER = os.getenv("PROXY_SERVER")
 PROXY_USERNAME = os.getenv("PROXY_USERNAME")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
+TRANSPARENCY_RESTRICTED_PROXY_HOSTS = {"google.com", "www.google.com", "news.google.com", "reddit.com", "www.reddit.com"}
+
+
+def proxy_routing_allowed_for_url(url: str) -> bool:
+    """Do not use proxy/Tor routing on platforms where it would look like evasion."""
+    hostname = (urlparse(str(url or "")).hostname or "").lower().rstrip(".")
+    return hostname not in TRANSPARENCY_RESTRICTED_PROXY_HOSTS
 
 # Encryption Key for Sessions at Rest
 ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY")
@@ -4349,10 +4355,11 @@ async def execute_pipeline(page, browser_context, actions: List[str], user_id: i
 async def run_browser_task(url: str, actions: List[str], user_id: int, status_msg=None, native_context: Optional[Dict[str, Any]] = None, screenshot_requested: bool = False) -> Dict[str, Any]:
     native_context = native_context or build_native_grey_context(user_id, user_id, "agent", request_text=url)
     context_opts = {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "viewport": {'width': 1280, 'height': 800}
     }
 
+    if ("proxy:tor" in actions or "proxy:on" in actions) and not proxy_routing_allowed_for_url(url):
+        raise PermissionError("explicit proxy routing is disabled for Google and Reddit")
     if "proxy:tor" in actions:
         if not TOR_PROXY_SERVER:
             raise RuntimeError("Tor proxy is not configured")

@@ -3644,3 +3644,11 @@ def test_url_less_artifact_request_is_agent_task_and_works_without_model(monkeyp
     plan = asyncio.run(bot.parse_natural_language_intent(request, user_id=42))
     assert plan["mode"] == "download"
     assert plan["source_candidates"]
+
+
+def test_google_and_reddit_proxy_routing_is_disabled_for_transparent_browsing():
+    import bot
+
+    assert bot.proxy_routing_allowed_for_url("https://www.google.com/search?q=bitcoin") is False
+    assert bot.proxy_routing_allowed_for_url("https://www.reddit.com/r/forhire") is False
+    assert bot.proxy_routing_allowed_for_url("https://archive.org/details/example") is True
