@@ -149,6 +149,84 @@ def test_stars_command_denies_non_admin_without_calling_telegram(monkeypatch):
     assert message.replies == ["⛔ Administrator permission is required for this action."]
 
 
+def test_subscription_purchase_alerts_are_idempotent_per_admin(monkeypatch):
+    import bot
+
+    calls = []
+
+    def fake_enqueue(user_id, kind, title, body, idempotency_key):
+        calls.append((user_id, kind, title, body, idempotency_key))
+        return f"notification-{user_id}", True
+
+    monkeypatch.setattr(bot, "admin_ids", lambda: {8, 7})
+    monkeypatch.setattr(bot, "enqueue_user_notification", fake_enqueue)
+
+    assert bot.enqueue_subscription_purchase_alert(42, "max", 1000, "order_123") == 2
+    assert [call[0] for call in calls] == [7, 8]
+    assert all(call[1] == "payment" for call in calls)
+    assert all("Max" in call[3] and "1,000 Stars" in call[3] and "42" in call[3] for call in calls)
+    assert calls[0][4] != calls[1][4]
+
+
+def test_withdraw_stars_command_shows_owner_handoff_without_collecting_secrets(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append((text, kwargs))
+
+    class FakeTelegramBot:
+        async def get_my_star_balance(self):
+            return SimpleNamespace(amount=1500)
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=6411860985, username="admin", full_name="Admin"),
+        message=message,
+    )
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: True)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+
+    asyncio.run(bot.withdraw_stars_command(update, SimpleNamespace(bot=FakeTelegramBot())))
+
+    assert len(message.replies) == 1
+    text, kwargs = message.replies[0]
+    assert "1,500 Stars" in text
+    assert "official Fragment flow" in text
+    assert "wallet address" in text
+    assert kwargs["reply_markup"].inline_keyboard[0][0].url == "https://fragment.com/"
+    assert "Enter your wallet" not in text
+
+
+def test_withdraw_stars_command_denies_non_admin_before_balance_lookup(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    class ExplodingTelegramBot:
+        async def get_my_star_balance(self):
+            raise AssertionError("non-admin must not call balance API")
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=99, username="user", full_name="User"),
+        message=message,
+    )
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: False)
+
+    asyncio.run(bot.withdraw_stars_command(update, SimpleNamespace(bot=ExplodingTelegramBot())))
+
+    assert message.replies == ["⛔ Administrator permission is required for this action."]
+
+
 def test_upgrade_menu_lists_benefits_prices_and_selection_buttons():
     import bot
 
