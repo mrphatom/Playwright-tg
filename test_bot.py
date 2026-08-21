@@ -163,6 +163,32 @@ def test_encrypted_session_storage():
     decrypted = load_encrypted_session(user_id, session_name)
     assert decrypted == dummy_cookies
 
+def test_crypto_source_candidates_are_ordered_and_allowlisted(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    candidates = bot.source_candidates_for_request("What is the current Bitcoin price?", "https://www.google.com/search?q=bitcoin")
+
+    assert candidates[0] == "https://www.google.com/search?q=bitcoin"
+    assert any("coinmarketcap.com/search" in candidate for candidate in candidates)
+
+
+def test_path_specific_plan_preserves_path_and_does_not_force_screenshot(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = bot.normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://example.com/products/widget",
+        "request": "Extract the price from this product page",
+        "actions": ["ai_extract:Extract the price from this product page"],
+    })
+
+    assert plan["url"] == "https://example.com/products/widget"
+    assert plan["actions"] == ["ai_extract:Extract the price from this product page"]
+    assert plan.get("screenshot_requested") is not True
+
+
 def test_natural_language_check_plan_normalizes_valid_input(monkeypatch):
     import bot
     monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
@@ -724,6 +750,72 @@ def test_sensitive_natural_language_actions_are_redacted():
     assert mask_sensitive_action("ai_extract:read my private account") == "ai_extract:***REDACTED***"
     assert mask_sensitive_action("condition_ai:alert me about my order") == "condition_ai:***REDACTED***"
     assert mask_sensitive_action("condition_contains:secret phrase") == "condition_contains:***REDACTED***"
+
+
+def test_source_fallback_tries_next_provider_after_empty_extraction(monkeypatch):
+    import bot
+    calls = []
+
+    async def fake_retry(url, actions, user_id, operation_id, status_msg=None, attempts=2):
+        calls.append(url)
+        return {
+            "title": "Source",
+            "extracted": [] if len(calls) == 1 else ["**AI extraction:** Bitcoin is $100"],
+            "screenshot": "unused.png",
+            "final_url": url,
+        }
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    monkeypatch.setattr(bot, "run_browser_task_with_retry", fake_retry)
+
+    result = asyncio.run(bot.run_browser_task_with_source_fallback(
+        ["https://www.google.com/search?q=bitcoin", "https://coinmarketcap.com/search/?q=bitcoin"],
+        ["ai_extract:current Bitcoin price"],
+        42,
+        "source-fallback-test",
+    ))
+
+    assert calls == [
+        "https://www.google.com/search?q=bitcoin",
+        "https://coinmarketcap.com/search/?q=bitcoin",
+    ]
+    assert result["source_url"].startswith("https://coinmarketcap.com/")
+
+
+def test_watcher_failure_notifies_and_persists_health(monkeypatch):
+    import bot
+
+    class FakeBot:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, **kwargs):
+            self.messages.append(kwargs)
+
+    fake_bot = FakeBot()
+    async def failing_browser(*args, **kwargs):
+        raise RuntimeError("source unavailable")
+
+    async def stop_after_sleep(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(bot, "run_browser_task_with_source_fallback", failing_browser)
+    monkeypatch.setattr(bot.asyncio, "sleep", stop_after_sleep)
+    health_calls = []
+
+    def record_health(*args, **kwargs):
+        health_calls.append(kwargs)
+        return {"was_failing": False, "consecutive_failures": 1, "last_result_hash": None}
+
+    monkeypatch.setattr(bot, "update_watcher_health", record_health)
+    monkeypatch.setattr(bot, "deactivate_watcher_in_db", lambda watcher_id: None)
+
+    asyncio.run(bot.watcher_loop(7777, "https://example.com/path", ["condition_contains:ready"], 30, "watch_fail", fake_bot))
+
+    assert health_calls and health_calls[0]["success"] is False
+    assert fake_bot.messages
+    assert "watch_fail" in fake_bot.messages[0]["text"]
+    assert "retry automatically" in fake_bot.messages[0]["text"]
 
 
 def test_browser_task_retry_recovers_transient_failure(monkeypatch):

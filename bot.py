@@ -5,6 +5,7 @@ import re
 import time
 import uuid
 import json
+import hashlib
 import sqlite3
 import base64
 import secrets
@@ -861,13 +862,30 @@ def init_db():
                 interval_seconds INTEGER NOT NULL,
                 is_active INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                business_connection_id TEXT
+                business_connection_id TEXT,
+                source_urls_json TEXT NOT NULL DEFAULT '[]',
+                last_checked_at TEXT,
+                last_success_at TEXT,
+                last_error TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                last_result_hash TEXT,
+                last_condition_met_at TEXT
             )
         """)
-        try:
-            cursor.execute("ALTER TABLE watchers ADD COLUMN business_connection_id TEXT")
-        except sqlite3.OperationalError:
-            pass
+        for column, definition in (
+            ("business_connection_id", "TEXT"),
+            ("source_urls_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("last_checked_at", "TEXT"),
+            ("last_success_at", "TEXT"),
+            ("last_error", "TEXT"),
+            ("consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_result_hash", "TEXT"),
+            ("last_condition_met_at", "TEXT"),
+        ):
+            try:
+                cursor.execute(f"ALTER TABLE watchers ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS business_connections (
@@ -1160,15 +1178,61 @@ def get_business_connection(connection_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def save_watcher_to_db(watcher_id: str, chat_id: int, url: str, actions: List[str], interval: int, business_connection_id: Optional[str] = None):
-    """Persists a watcher configuration to SQLite."""
+def save_watcher_to_db(
+    watcher_id: str,
+    chat_id: int,
+    url: str,
+    actions: List[str],
+    interval: int,
+    business_connection_id: Optional[str] = None,
+    source_urls: Optional[List[str]] = None,
+):
+    """Persist a watcher configuration and its ordered, already-validated sources."""
+    safe_sources = list(dict.fromkeys(str(item).strip() for item in (source_urls or [url]) if str(item).strip()))
     with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO watchers (watcher_id, chat_id, url, actions_json, interval_seconds, is_active, business_connection_id)
-            VALUES (?, ?, ?, ?, ?, 1, ?)
-        """, (watcher_id, chat_id, url, json.dumps(actions), interval, business_connection_id))
+            INSERT OR REPLACE INTO watchers (
+                watcher_id, chat_id, url, actions_json, interval_seconds, is_active,
+                business_connection_id, source_urls_json, last_checked_at, last_success_at,
+                last_error, consecutive_failures, last_result_hash, last_condition_met_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL, NULL, 0, NULL, NULL)
+        """, (watcher_id, chat_id, url, json.dumps(actions), interval, business_connection_id, json.dumps(safe_sources)))
         conn.commit()
+
+
+def update_watcher_health(
+    watcher_id: str,
+    *,
+    success: bool,
+    error: Optional[str] = None,
+    result_hash: Optional[str] = None,
+    condition_met: bool = False,
+) -> Dict[str, Any]:
+    """Record bounded watcher health and return the current state for notification decisions."""
+    now = datetime.utcnow().isoformat() + "Z"
+    safe_error = str(error or "")[:500] or None
+    with sqlite3.connect(get_db_path()) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT consecutive_failures, last_result_hash, last_condition_met_at FROM watchers WHERE watcher_id = ?",
+            (watcher_id,),
+        ).fetchone()
+        previous_failures = int(row["consecutive_failures"] or 0) if row else 0
+        next_failures = 0 if success else previous_failures + 1
+        conn.execute(
+            """UPDATE watchers SET last_checked_at = ?, last_success_at = CASE WHEN ? THEN ? ELSE last_success_at END,
+               last_error = ?, consecutive_failures = ?, last_result_hash = COALESCE(?, last_result_hash),
+               last_condition_met_at = CASE WHEN ? THEN ? ELSE last_condition_met_at END
+               WHERE watcher_id = ?""",
+            (now, int(success), now if success else None, safe_error, next_failures, result_hash, int(condition_met), now if condition_met else None, watcher_id),
+        )
+        conn.commit()
+    return {
+        "was_failing": previous_failures > 0,
+        "consecutive_failures": next_failures,
+        "last_result_hash": row["last_result_hash"] if row else None,
+    }
 
 def deactivate_watcher_in_db(watcher_id: str):
     """Marks a watcher as inactive in SQLite."""
@@ -1183,24 +1247,41 @@ def list_watchers_for_chat(chat_id: int, active_only: bool = True) -> List[Dict[
     predicate = "AND is_active = 1" if active_only else ""
     with sqlite3.connect(get_db_path()) as conn:
         rows = conn.execute(
-            f"""SELECT watcher_id, chat_id, url, actions_json, interval_seconds, is_active, created_at
+            f"""SELECT watcher_id, chat_id, url, actions_json, interval_seconds, is_active, created_at,
+                       source_urls_json, last_checked_at, last_success_at, last_error,
+                       consecutive_failures, last_result_hash, last_condition_met_at
                 FROM watchers WHERE chat_id = ? {predicate} ORDER BY created_at DESC LIMIT 20""",
             (chat_id,),
         ).fetchall()
     result = []
-    for watcher_id, owner_chat_id, url, actions_json, interval_seconds, is_active, created_at in rows:
+    for (
+        watcher_id, owner_chat_id, url, actions_json, interval_seconds, is_active, created_at,
+        source_urls_json, last_checked_at, last_success_at, last_error,
+        consecutive_failures, last_result_hash, last_condition_met_at,
+    ) in rows:
         try:
             actions = json.loads(actions_json)
         except (TypeError, json.JSONDecodeError):
             actions = []
+        try:
+            source_urls = json.loads(source_urls_json or "[]")
+        except (TypeError, json.JSONDecodeError):
+            source_urls = [url]
         result.append({
             "watcher_id": watcher_id,
             "chat_id": owner_chat_id,
             "url": url,
+            "source_urls": source_urls[:5] if isinstance(source_urls, list) else [url],
             "actions": actions[:20] if isinstance(actions, list) else [],
             "interval_seconds": int(interval_seconds),
             "is_active": bool(is_active),
             "created_at": created_at,
+            "last_checked_at": last_checked_at,
+            "last_success_at": last_success_at,
+            "last_error": last_error,
+            "consecutive_failures": int(consecutive_failures or 0),
+            "last_condition_met_at": last_condition_met_at,
+            "healthy": not bool(last_error) or int(consecutive_failures or 0) == 0,
         })
     return result
 
@@ -1535,6 +1616,45 @@ def parse_deterministic_management_request(user_text: str) -> Optional[Dict[str,
     return None
 
 
+CRYPTO_ASSET_TERMS = (
+    "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "cardano", "ada",
+    "dogecoin", "doge", "polygon", "matic", "chainlink", "link", "avalanche", "avax",
+    "polkadot", "dot", "litecoin", "ltc", "tether", "usdt", "usd coin", "usdc",
+)
+CRYPTO_PRICE_TERMS = ("price", "worth", "value", "trading", "market cap", "marketcap", "quote")
+
+
+def is_crypto_price_request(user_text: str) -> bool:
+    text = str(user_text or "").lower()
+    return bool(any(term in text for term in CRYPTO_ASSET_TERMS) and any(term in text for term in CRYPTO_PRICE_TERMS))
+
+
+def crypto_source_candidates(user_text: str) -> List[str]:
+    """Return ordered, allowlisted search sources for crypto lookups."""
+    clean = re.sub(r"\s+", " ", str(user_text or "").strip())[:240]
+    if not is_crypto_price_request(clean):
+        return []
+    query = clean or "cryptocurrency price"
+    return [
+        "https://www.google.com/search?q=" + quote_plus(query),
+        "https://coinmarketcap.com/search/?q=" + quote_plus(query),
+    ]
+
+
+def source_candidates_for_request(user_text: str, primary_url: str = "") -> List[str]:
+    """Build an ordered source list without bypassing the existing domain policy."""
+    candidates: List[str] = []
+    for candidate in [primary_url, *crypto_source_candidates(user_text)]:
+        clean = str(candidate or "").strip().rstrip(".,;!?)")
+        if not clean or not clean.lower().startswith(("http://", "https://")):
+            continue
+        if not is_valid_url(clean) or not is_domain_allowed(clean):
+            continue
+        if clean not in candidates:
+            candidates.append(clean)
+    return candidates
+
+
 def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
     """Validate and convert an AI-produced intent into allowlisted pipeline actions."""
     if not isinstance(raw_plan, dict):
@@ -1602,6 +1722,17 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
         "condition_type": condition_type,
         "interval_seconds": interval_seconds,
     }
+    if bool(raw_plan.get("screenshot", False)) or re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", request, flags=re.IGNORECASE):
+        plan["screenshot_requested"] = True
+    request_for_sources = str(raw_plan.get("request", ""))
+    safe_sources = source_candidates_for_request(request_for_sources, url)
+    raw_sources = raw_plan.get("source_candidates")
+    if isinstance(raw_sources, list):
+        for candidate in raw_sources[:5]:
+            if isinstance(candidate, str):
+                safe_sources.extend(source_candidates_for_request(request_for_sources, candidate))
+    if len(safe_sources) > 1:
+        plan["source_candidates"] = list(dict.fromkeys(safe_sources))[:5]
     if discovered_url:
         plan["discovered_url"] = True
     return plan
@@ -1613,6 +1744,7 @@ Use this shape:
 {
   "mode": "chat" | "check" | "search" | "watch" | "schedule" | "unknown",
   "url": "explicit or safely discovered http or https URL for check/watch, or empty string",
+  "source_candidates": ["ordered canonical HTTPS fallback URLs, when multiple sources are useful"],
   "discover_url": "true only when resolving a clearly named website is necessary; never invent a URL",
   "request": "information to extract for a one-time check",
   "condition": "condition to monitor for a watcher",
@@ -1631,7 +1763,7 @@ Use this shape:
 Allowed actions are only: type:<css_selector>=<text>, click:<css_selector>, wait:<seconds from 0 to 30>, extract:<css_selector>, ai_extract:<prompt>, save_session:<name>, load_session:<name>, proxy:on, condition_contains:<text>, and condition_ai:<prompt>.
 Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return {"mode":"chat","reply":"..."} and write the complete conversational answer in reply. Leave reply empty for every other mode.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
-Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL.
+Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL. For crypto price requests, prefer Google Search first and provide CoinMarketCap as an ordered fallback source when it is allowlisted.
 Use mode schedule for a recurring briefing and put every source URL in urls.
 Use condition_type contains only for a literal text match; otherwise use ai.
 Default interval_seconds to 60, never below 30. Default schedule timezone to UTC, days to weekdays, and delivery_mode to combined.
@@ -2329,11 +2461,14 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
             "condition_type": "ai",
             "interval_seconds": interval_seconds,
         }
+        source_urls = source_candidates_for_request(text, url)
+        if len(source_urls) > 1:
+            result["source_candidates"] = source_urls
         if discovered_url:
             result["discovered_url"] = True
         return result
-
     request = ""
+
     request_text = re.sub(re.escape(reference_text), " ", text, count=1, flags=re.IGNORECASE) if reference_text else text
     if url_match:
         request_text = request_text.replace(url_match.group(0), " ")
@@ -2358,13 +2493,21 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     elif default_session_name:
         actions.append("load_session:" + sanitize_session_name(default_session_name))
     actions.append("ai_extract:" + request[:500])
-    result = {"mode": "check", "url": url, "actions": actions, "request": request}
+    result = {
+        "mode": "check",
+        "url": url,
+        "actions": actions,
+        "request": request,
+        "screenshot_requested": bool(re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", lowered)),
+    }
+    source_urls = source_candidates_for_request(text, url)
+    if len(source_urls) > 1:
+        result["source_candidates"] = source_urls
     if discovered_url:
         result["discovered_url"] = True
     return result
-
-
 async def parse_natural_language_intent(
+
     user_text: str,
     default_session_name: Optional[str] = None,
     reply_context: Optional[Dict[str, Any]] = None,
@@ -2420,6 +2563,9 @@ async def parse_natural_language_intent(
         ))
         plan = normalize_natural_language_plan(raw_plan)
         if plan and plan.get("mode") in {"check", "watch"}:
+            ordered_sources = source_candidates_for_request(user_text, plan.get("url", ""))
+            if ordered_sources:
+                plan["source_candidates"] = list(dict.fromkeys(ordered_sources + list(plan.get("source_candidates", []))))[:5]
             if not plan.get("discovered_url") and plan["url"].rstrip("/") not in user_text and plan["url"] not in user_text:
                 return fallback()
             if default_session_name and not any(action.startswith("load_session:") for action in plan["actions"]):
@@ -2566,13 +2712,17 @@ async def restore_watchers_from_db(context_bot):
     try:
         with sqlite3.connect(get_db_path()) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT watcher_id, chat_id, url, actions_json, interval_seconds, business_connection_id FROM watchers WHERE is_active = 1")
+            cursor.execute("SELECT watcher_id, chat_id, url, actions_json, interval_seconds, business_connection_id, source_urls_json FROM watchers WHERE is_active = 1")
             rows = cursor.fetchall()
             
         restored_count = 0
-        for w_id, chat_id, url, actions_json, interval, business_connection_id in rows:
+        for w_id, chat_id, url, actions_json, interval, business_connection_id, source_urls_json in rows:
             actions = json.loads(actions_json)
-            task = asyncio.create_task(watcher_loop(chat_id, url, actions, interval, w_id, context_bot, business_connection_id))
+            try:
+                source_urls = json.loads(source_urls_json or "[]") or [url]
+            except (TypeError, json.JSONDecodeError):
+                source_urls = [url]
+            task = asyncio.create_task(watcher_loop(chat_id, url, actions, interval, w_id, context_bot, business_connection_id, source_urls))
             if chat_id not in active_watchers:
                 active_watchers[chat_id] = {}
             active_watchers[chat_id][w_id] = task
@@ -2582,6 +2732,63 @@ async def restore_watchers_from_db(context_bot):
             logger.info(f"Successfully restored {restored_count} active watcher(s) from SQLite database.")
     except Exception as e:
         logger.error(f"Failed to restore watchers from DB: {e}")
+
+def extraction_result_is_usable(result: Dict[str, Any]) -> bool:
+    extracted = "\n".join(str(item or "") for item in (result or {}).get("extracted", []))
+    if not extracted.strip() or (result or {}).get("action_errors"):
+        return False
+    lowered = extracted.lower()
+    return not any(marker in lowered for marker in ("no information extracted", "action failed:", "gemini is not configured"))
+
+
+async def run_browser_task_with_source_fallback(
+    source_urls: List[str],
+    actions: List[str],
+    user_id: int,
+    operation_id: str,
+    status_msg=None,
+    attempts: int = 2,
+) -> Dict[str, Any]:
+    """Try ordered, already-allowlisted sources and return the first useful extraction."""
+    candidates = list(dict.fromkeys(
+        str(url).strip()
+        for url in source_urls
+        if str(url).strip() and is_valid_url(str(url).strip()) and is_domain_allowed(str(url).strip())
+    ))
+    if not candidates:
+        raise ValueError("no safe source candidates")
+    last_result: Optional[Dict[str, Any]] = None
+    last_error: Optional[BaseException] = None
+    for index, candidate in enumerate(candidates):
+        if index and status_msg:
+            await status_msg.edit_text(
+                f"🔁 The first source did not provide a usable result. Trying fallback source {index + 1}/{len(candidates)}..."
+            )
+        try:
+            result = await run_browser_task_with_retry(candidate, actions, user_id, operation_id, status_msg, attempts)
+            result["source_url"] = candidate
+            last_result = result
+            if extraction_result_is_usable(result) or index == len(candidates) - 1:
+                return result
+            screenshot = result.get("screenshot")
+            if screenshot and os.path.exists(screenshot):
+                os.remove(screenshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "source_candidate_failed operation_id=%s source_index=%s error_type=%s",
+                operation_id,
+                index,
+                type(exc).__name__,
+            )
+            if index == len(candidates) - 1:
+                raise
+    if last_result is not None:
+        return last_result
+    raise last_error or RuntimeError("all source candidates failed")
+
 
 async def run_browser_task_with_retry(url: str, actions: List[str], user_id: int, operation_id: str, status_msg=None, attempts: int = 2) -> Dict[str, Any]:
     """Retry transient browser work with a bounded attempt count and correlation ID."""
@@ -2887,21 +3094,22 @@ async def stop_browser_pool(application: Application):
     if pool.browser: await pool.browser.close()
     if pool.playwright: await pool.playwright.stop()
 
-async def evaluate_ai_condition(prompt: str, page_text: str) -> bool:
-    if not gemini_configured(): return False
+async def evaluate_ai_condition(prompt: str, page_text: str) -> Optional[bool]:
+    if not gemini_configured():
+        return None
     try:
         query = f"Evaluate this condition: '{prompt}'. Return EXACTLY 'TRUE' if met, or 'FALSE' if not.\n\nData:\n{page_text[:30000]}"
         response = await gemini_provider.generate_text(query, {})
         return "TRUE" in response.upper()
-    except Exception as e:
-        logger.error(f"AI Condition Error: {e}")
-        return False
+    except Exception:
+        logger.exception("ai_condition_evaluation_failed")
+        return None
 
 # ==========================================
 # CORE PIPELINE ENGINE
 # ==========================================
 async def execute_pipeline(page, browser_context, actions: List[str], user_id: int, status_msg=None) -> Dict[str, Any]:
-    result = {"extracted": [], "condition_met": False, "screenshot_needed": True}
+    result = {"extracted": [], "condition_met": False, "screenshot_needed": True, "action_errors": []}
     
     for action in actions:
         if not action: continue
@@ -2979,12 +3187,16 @@ async def execute_pipeline(page, browser_context, actions: List[str], user_id: i
             elif action.startswith("condition_ai:"):
                 prompt = action.replace("condition_ai:", "", 1).strip()
                 page_text = await page.evaluate("document.body.innerText")
-                if await evaluate_ai_condition(prompt, page_text):
+                condition_result = await evaluate_ai_condition(prompt, page_text)
+                if condition_result is None:
+                    result["action_errors"].append("condition_evaluation_failed")
+                elif condition_result:
                     result["condition_met"] = True
                     result["extracted"].append(f"🧠🔔 **AI Condition Met:** '{prompt}'")
 
         except Exception as e:
             logger.warning(f"Action Failed [{safe_log}]: {e}")
+            result["action_errors"].append(type(e).__name__)
             result["extracted"].append(f"⚠️ Action failed: `{safe_log}`")
             
     return result
@@ -3017,8 +3229,11 @@ async def run_browser_task(url: str, actions: List[str], user_id: int, status_ms
         await page.wait_for_timeout(2000)
 
         pipeline_res = await execute_pipeline(page, browser_context, actions, user_id, status_msg)
-        
+        pipeline_res["requested_url"] = url
+        pipeline_res["final_url"] = page.url
+
         screenshot_path = f"screenshot_{uuid.uuid4().hex}.png"
+
         await page.mouse.wheel(delta_x=0, delta_y=600)
         pipeline_res["title"] = await page.title()
         await page.screenshot(path=screenshot_path, full_page=True)
@@ -3032,36 +3247,105 @@ async def run_browser_task(url: str, actions: List[str], user_id: int, status_ms
 # ==========================================
 # WATCHER ENGINE
 # ==========================================
-async def watcher_loop(chat_id: int, url: str, actions: List[str], interval: int, watcher_id: str, context_bot, business_connection_id: Optional[str] = None):
-    logger.info(f"Started watcher {watcher_id} for {chat_id} on {url} (Interval: {interval}s)")
-    
+async def watcher_loop(
+    chat_id: int,
+    url: str,
+    actions: List[str],
+    interval: int,
+    watcher_id: str,
+    context_bot,
+    business_connection_id: Optional[str] = None,
+    source_urls: Optional[List[str]] = None,
+):
+    candidates = list(dict.fromkeys(str(item).strip() for item in (source_urls or [url]) if str(item).strip())) or [url]
+    logger.info("Started watcher %s for %s on %s (Interval: %ss, sources=%s)", watcher_id, chat_id, url, interval, len(candidates))
+
+    async def notify(text: str):
+        try:
+            await context_bot.send_message(chat_id=chat_id, text=text, business_connection_id=business_connection_id)
+        except TelegramError:
+            logger.warning("watcher_notification_failed watcher_id=%s", watcher_id)
+        except Exception:
+            logger.exception("watcher_notification_unexpected_failure watcher_id=%s", watcher_id)
+
     try:
         while True:
-            async with task_semaphore:
-                try:
-                    res = await asyncio.wait_for(run_browser_task(url, actions, chat_id), timeout=COMMAND_TIMEOUT)
-                    
-                    if res.get("condition_met"):
-                        caption = truncate_text(f"🚨 *WATCHER ALERT* [{watcher_id}]\n📄 *Title:* {res['title']}\n🔗 {url}", 1024)
-                        with open(res["screenshot"], 'rb') as photo:
-                            await context_bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode='Markdown', business_connection_id=business_connection_id)
-                        if res["extracted"]:
-                            await context_bot.send_message(chat_id=chat_id, text=truncate_text("\n\n".join(res["extracted"]), 4000), parse_mode='Markdown', business_connection_id=business_connection_id)
-                        await context_bot.send_message(chat_id=chat_id, text=f"✅ Condition met. Auto-stopping watcher `{watcher_id}`.", business_connection_id=business_connection_id)
-                        deactivate_watcher_in_db(watcher_id)
-                        break
-                    
-                    if os.path.exists(res.get("screenshot", "")): os.remove(res["screenshot"])
-                        
-                except asyncio.TimeoutError:
-                    logger.warning(f"Watcher {watcher_id} timed out. Retrying next cycle.")
-                except Exception as e:
-                    logger.error(f"Watcher {watcher_id} error: {e}")
-            
-            await asyncio.sleep(interval)
-            
+            screenshot_path = None
+            try:
+                async with task_semaphore:
+                    res = await asyncio.wait_for(
+                        run_browser_task_with_source_fallback(
+                            candidates,
+                            actions,
+                            chat_id,
+                            f"watcher_{watcher_id}",
+                            attempts=1,
+                        ),
+                        timeout=COMMAND_TIMEOUT,
+                    )
+                screenshot_path = res.get("screenshot")
+                extracted_text = "\n".join(str(item or "") for item in res.get("extracted", []))
+                result_hash = hashlib.sha256(
+                    (extracted_text or str(res.get("title") or "") or str(res.get("final_url") or url)).encode("utf-8", "ignore")
+                ).hexdigest()
+                health = update_watcher_health(
+                    watcher_id,
+                    success=True,
+                    result_hash=result_hash,
+                    condition_met=bool(res.get("condition_met")),
+                )
+                if health.get("was_failing"):
+                    await notify(f"✅ Watcher `{watcher_id}` recovered and is checking again.")
+
+                if res.get("condition_met"):
+                    source_url = res.get("source_url") or res.get("final_url") or url
+                    caption = truncate_text(
+                        f"🚨 *WATCHER ALERT* [{watcher_id}]\n📄 *Title:* {res.get('title', 'Web page')}\n🔗 {source_url}",
+                        1024,
+                    )
+                    if screenshot_path and os.path.exists(screenshot_path):
+                        with open(screenshot_path, "rb") as photo:
+                            await context_bot.send_photo(
+                                chat_id=chat_id,
+                                photo=photo,
+                                caption=caption,
+                                parse_mode="Markdown",
+                                business_connection_id=business_connection_id,
+                            )
+                    if res.get("extracted"):
+                        await context_bot.send_message(
+                            chat_id=chat_id,
+                            text=truncate_text("\n\n".join(res["extracted"]), 4000),
+                            parse_mode="Markdown",
+                            business_connection_id=business_connection_id,
+                        )
+                    await notify(f"✅ Condition met. Auto-stopping watcher `{watcher_id}`.")
+                    deactivate_watcher_in_db(watcher_id)
+                    break
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                health = update_watcher_health(watcher_id, success=False, error="poll_timeout")
+                count = int(health.get("consecutive_failures") or 0)
+                logger.warning("Watcher %s timed out; consecutive_failures=%s", watcher_id, count)
+                if count == 1 or count % 5 == 0:
+                    await notify(f"⚠️ Watcher `{watcher_id}` could not complete its latest check (timeout). It will retry automatically. Failure count: {count}.")
+            except Exception as exc:
+                health = update_watcher_health(watcher_id, success=False, error=type(exc).__name__)
+                count = int(health.get("consecutive_failures") or 0)
+                logger.exception("Watcher %s failed; consecutive_failures=%s", watcher_id, count)
+                if count == 1 or count % 5 == 0:
+                    await notify(f"⚠️ Watcher `{watcher_id}` failed its latest check ({type(exc).__name__}). It will retry automatically. Failure count: {count}.")
+            finally:
+                if screenshot_path and os.path.exists(screenshot_path):
+                    try:
+                        os.remove(screenshot_path)
+                    except OSError:
+                        logger.warning("watcher_screenshot_cleanup_failed watcher_id=%s", watcher_id)
+
+            await asyncio.sleep(max(30, min(int(interval), 86400)))
     except asyncio.CancelledError:
-        logger.info(f"Watcher {watcher_id} was cancelled.")
+        logger.info("Watcher %s was cancelled.", watcher_id)
         deactivate_watcher_in_db(watcher_id)
     finally:
         if chat_id in active_watchers and watcher_id in active_watchers[chat_id]:
@@ -3255,9 +3539,10 @@ async def watch_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     watcher_id = uuid.uuid4().hex[:6]
     
-    save_watcher_to_db(watcher_id, chat_id, url, actions, interval)
+    source_urls = source_candidates_for_request(cmd_str, url) or [url]
+    save_watcher_to_db(watcher_id, chat_id, url, actions, interval, source_urls=source_urls)
     
-    task = asyncio.create_task(watcher_loop(chat_id, url, actions, interval, watcher_id, context.bot))
+    task = asyncio.create_task(watcher_loop(chat_id, url, actions, interval, watcher_id, context.bot, source_urls=source_urls))
     
     if chat_id not in active_watchers: active_watchers[chat_id] = {}
     active_watchers[chat_id][watcher_id] = task
@@ -4805,24 +5090,29 @@ async def _process_natural_language(
     if plan["mode"] == "check":
         await status_msg.edit_text(f"🌐 Checking `{plan['url']}`...", parse_mode="Markdown")
         try:
+            source_urls = plan.get("source_candidates") or source_candidates_for_request(request_text, plan["url"]) or [plan["url"]]
             result = await run_browser_request(
                 operation_id, user_id, chat_id, "check",
-                lambda: run_browser_task_with_retry(plan["url"], plan["actions"], user_id, operation_id, status_msg=status_msg),
+                lambda: run_browser_task_with_source_fallback(source_urls, plan["actions"], user_id, operation_id, status_msg=status_msg),
                 status_msg=status_msg,
             )
 
+            source_url = result.get("source_url") or result.get("final_url") or plan["url"]
             caption = truncate_text(
-                f"📄 **Title:** {result.get('title')}\n🔗 **URL:** {plan['url']}",
+                f"📄 **Title:** {result.get('title')}\n🔗 **Requested path:** {plan['url']}\n🔎 **Source used:** {source_url}",
                 1024,
             )
-            with open(result["screenshot"], "rb") as photo:
-                await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
-            if result["extracted"]:
+            if result.get("extracted"):
                 await source_message.reply_text(
                     telegram_safe_html("\n\n".join(result["extracted"]), 4000),
                     parse_mode="HTML",
                 )
-            os.remove(result["screenshot"])
+            if plan.get("screenshot_requested") or not result.get("extracted"):
+                with open(result["screenshot"], "rb") as photo:
+                    await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
+            screenshot_path = result.get("screenshot")
+            if screenshot_path and os.path.exists(screenshot_path):
+                os.remove(screenshot_path)
             await status_msg.delete()
             log_audit(user_id, "natural_language", plan["url"], "SUCCESS")
         except QueueUnavailable:
@@ -4852,6 +5142,7 @@ async def _process_natural_language(
         plan["actions"],
         plan["interval_seconds"],
         business_connection_id=business_connection_id,
+        source_urls=plan.get("source_candidates") or source_candidates_for_request(request_text, plan["url"]) or [plan["url"]],
     )
     task = asyncio.create_task(
         watcher_loop(
@@ -4862,6 +5153,7 @@ async def _process_natural_language(
             watcher_id,
             context.bot,
             business_connection_id,
+            plan.get("source_candidates") or source_candidates_for_request(request_text, plan["url"]) or [plan["url"]],
         )
     )
     active_watchers.setdefault(chat_id, {})[watcher_id] = task
@@ -5170,10 +5462,25 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
 @restricted
 async def list_watchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    watchers = active_watchers.get(chat_id, {})
-    if not watchers: return await update.message.reply_text("You have no active watchers.")
-    msg = "*Active Watchers:*\n" + "\n".join(f"• ID: `{w_id}`" for w_id in watchers.keys())
-    await update.message.reply_markdown(msg)
+    records = list_watchers_for_chat(chat_id, active_only=True)
+    if not records:
+        return await update.message.reply_text("You have no active watchers.")
+    lines = ["*Active Watchers:*"]
+    for row in records[:10]:
+        task = active_watchers.get(chat_id, {}).get(row["watcher_id"])
+        runtime = "running" if task and not task.done() else "persisted/restoring"
+        failures = int(row.get("consecutive_failures") or 0)
+        health = "healthy" if failures == 0 and not row.get("last_error") else f"degraded ({failures} failure(s))"
+        source = (row.get("source_urls") or [row["url"]])[0]
+        lines.append(
+            f"• ID: `{row['watcher_id']}` — {runtime}, {health}\n"
+            f"  Target: `{row['url']}`\n"
+            f"  Source: `{source}`\n"
+            f"  Every: `{row['interval_seconds']}s` | Last check: `{row.get('last_checked_at') or 'not yet'}`"
+        )
+        if row.get("last_error"):
+            lines.append(f"  Last error: `{row['last_error']}`")
+    await update.message.reply_markdown("\n".join(lines)[:3900])
 
 @restricted
 async def stop_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
