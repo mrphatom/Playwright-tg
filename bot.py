@@ -1541,6 +1541,8 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
 
     mode = str(raw_plan.get("mode", "")).strip().lower()
     mode = {"monitor": "watch", "poll": "watch", "track": "watch"}.get(mode, mode)
+    if mode == "chat":
+        return {"mode": "chat"}
     if mode == "schedule":
         schedule_config = normalize_schedule_config(raw_plan)
         return {"mode": "schedule", "schedule": schedule_config} if schedule_config else None
@@ -1604,7 +1606,7 @@ NATURAL_LANGUAGE_SYSTEM_PROMPT = """
 Translate the user's request into one JSON command. Return JSON only; never Markdown, code, credentials, or extra keys.
 Use this shape:
 {
-  "mode": "check" | "search" | "watch" | "schedule" | "unknown",
+  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "unknown",
   "url": "explicit or safely discovered http or https URL for check/watch, or empty string",
   "discover_url": "true only when resolving a clearly named website is necessary; never invent a URL",
   "request": "information to extract for a one-time check",
@@ -1621,6 +1623,7 @@ Use this shape:
   "reply_summary": "short confirmation"
 }
 Allowed actions are only: type:<css_selector>=<text>, click:<css_selector>, wait:<seconds from 0 to 30>, extract:<css_selector>, ai_extract:<prompt>, save_session:<name>, load_session:<name>, proxy:on, condition_contains:<text>, and condition_ai:<prompt>.
+Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return only {"mode":"chat"} for ordinary conversation.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
 Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL.
 Use mode schedule for a recurring briefing and put every source URL in urls.
@@ -1655,8 +1658,13 @@ You are GreyAI in a shared or inline conversation. Be useful, concise, and natur
 ordinary questions, explanations, coding discussions, planning, and role-play. Keep a
 neutral, respectful tone in groups and inline results.
 
-Do not claim that you browsed a page, changed a system, sent a message, or completed an
-action unless the application explicitly did it. Agent task receipts in the conversation
+The application runs a unified intent interpreter before this prompt. Do not answer an
+executable request with a generic “I can’t browse” or “I can’t perform that” disclaimer;
+executable plans are handled by the Agentic pipeline, and this prompt is only reached for
+conversational fallback or clarification. Do not claim that you browsed a page, changed a
+system, sent a message, or completed an action unless the application explicitly did it.
+Agent task receipts in the conversation
+
 are authoritative application state: do not claim this is a first-time conversation or
 that you lack access to a prior GreyAI task when a receipt or watcher context is present.
 For a follow-up about a prior task, use the receipt and clearly distinguish known state
@@ -4329,7 +4337,41 @@ async def _process_natural_language(
         return
 
     private_chat = bool(update.effective_chat and getattr(update.effective_chat, "type", "private") == "private")
-    route = classify_message_route(request_text)
+
+    # Keep obvious private social turns low-latency, but send every other message through
+    # the same validated interpreter before choosing chat or Agentic execution.
+    if private_chat:
+        micro_reply = private_chat_micro_reply(request_text)
+        if micro_reply:
+            sent_reply = await source_message.reply_text(telegram_safe_html(micro_reply), parse_mode="HTML")
+            remember_chat_turn(
+                chat_id,
+                request_text,
+                micro_reply,
+                user_id,
+                getattr(source_message, "message_id", None),
+                reply_to_message_id,
+                business_connection_id,
+                getattr(sent_reply, "message_id", None),
+            )
+            log_audit(user_id, "chat", None, "SUCCESS_MICRO_REPLY")
+            return
+
+    route_hint = classify_message_route(request_text)
+    try:
+        parser_kwargs = {"reply_context": reply_context} if reply_context else {}
+        plan = await parse_natural_language_intent(
+            request_text,
+            None if shared_context else active_session_by_chat.get(chat_id),
+            **parser_kwargs,
+        )
+    except TextProviderUnavailable:
+        # The deterministic route hint still prevents an obvious task from falling
+        # into a misleading chat disclaimer when the interpretation provider is down.
+        plan = None
+
+    interpreted_task = bool(plan and plan.get("mode") not in {"chat", "unknown"})
+    route = "task" if interpreted_task or route_hint == "task" else "chat"
     if route == "chat":
         reply = await generate_chat_reply(chat_id, request_text, private_chat=private_chat, owner_user_id=user_id, reply_context=reply_context)
         sent_reply = await source_message.reply_text(telegram_safe_html(reply), parse_mode="HTML")
@@ -4361,18 +4403,6 @@ async def _process_natural_language(
         getattr(status_msg, "message_id", None),
     )
     update_operation(operation_id, "running", 0)
-
-    try:
-        parser_kwargs = {"reply_context": reply_context} if reply_context else {}
-        plan = await parse_natural_language_intent(
-            request_text,
-            None if shared_context else active_session_by_chat.get(chat_id),
-            **parser_kwargs,
-        )
-    except TextProviderUnavailable:
-        update_operation(operation_id, "failed")
-        await status_msg.edit_text("Gemini text capacity is temporarily unavailable. No browser action was executed; please try again shortly.")
-        return
 
     if shared_context:
         allowed_modes = {"check"} if public_context else {"check", "watch"}

@@ -471,6 +471,23 @@ def test_natural_language_parser_preserves_model_action_pipeline(monkeypatch):
     assert plan["actions"] == ["load_session:x_login", "wait:2", "extract:.headline"]
 
 
+def test_natural_language_parser_accepts_validated_chat_mode(monkeypatch):
+    import bot
+
+    class FakeResponse:
+        text = '{"mode": "chat"}'
+
+    class FakeModel:
+        def generate_content(self, prompt, generation_config=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(bot, "ai_model", FakeModel())
+
+    plan = asyncio.run(bot.parse_natural_language_intent("What is GreyAI?"))
+
+    assert plan == {"mode": "chat"}
+
+
 def test_natural_language_parser_accepts_fenced_json(monkeypatch):
     import bot
 
@@ -1331,6 +1348,8 @@ def test_chat_prompt_preserves_agent_receipt_continuity():
 
     assert "op_receipt" in prompt
     assert "do not claim this is a first-time conversation" in prompt
+    assert "unified intent interpreter" in prompt
+    assert "I can’t browse" in prompt
 
 
 def test_broad_live_web_requests_route_to_agent_without_urls(monkeypatch):
@@ -1413,6 +1432,79 @@ def test_task_route_fails_closed_instead_of_falling_back_to_chat(monkeypatch):
     asyncio.run(bot._process_natural_language(update, SimpleNamespace()))
 
     assert any("recognized this as a web or browser task" in text for text in message.edits)
+    assert not any("can't browse" in text.lower() or "cannot browse" in text.lower() for text in message.edits)
+
+
+def test_llm_unified_gate_overrides_chat_route_for_agent_plan(monkeypatch):
+    import bot
+
+    calls = []
+
+    class FakeStatus:
+        def __init__(self, owner):
+            self.owner = owner
+
+        async def edit_text(self, text, **kwargs):
+            self.owner.edits.append(text)
+
+    class FakeMessage:
+        text = "Can you set up a morning briefing from the web?"
+        caption = None
+        chat_id = 7791
+        message_id = 901
+        business_connection_id = None
+
+        def __init__(self):
+            self.replies = []
+            self.edits = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append((text, kwargs))
+            return FakeStatus(self)
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        message=message,
+        business_message=None,
+        channel_post=None,
+        effective_message=message,
+        effective_chat=SimpleNamespace(id=message.chat_id, type="private"),
+        effective_user=SimpleNamespace(id=42),
+    )
+
+    async def fake_interpreter(*args, **kwargs):
+        calls.append("interpreter")
+        return {
+            "mode": "schedule",
+            "schedule": {
+                "schedule_time": "08:00",
+                "timezone": "UTC",
+                "days": [0, 1, 2, 3, 4],
+                "urls": ["https://example.com"],
+                "delivery_mode": "combined",
+                "summary_prompt": "Summarize the latest updates.",
+            },
+        }
+
+    monkeypatch.setattr(bot, "classify_message_route", lambda request: "chat")
+    monkeypatch.setattr(bot, "parse_natural_language_intent", fake_interpreter)
+    monkeypatch.setattr(bot, "consume_quota", lambda user_id: (True, 0, 100))
+    monkeypatch.setattr(bot, "create_schedule", lambda *args, **kwargs: ("schedule_unified", datetime(2026, 8, 22, 8, 0)))
+    monkeypatch.setattr(bot, "record_contact_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "create_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "update_operation", lambda *args, **kwargs: None)
+
+    async def fail_chat(*args, **kwargs):
+        raise AssertionError("chat generation must not handle an LLM-classified agent task")
+
+    monkeypatch.setattr(bot, "generate_chat_reply", fail_chat)
+
+    asyncio.run(bot._process_natural_language(update, SimpleNamespace(bot=object())))
+
+    assert calls == ["interpreter"]
+    assert any("Scheduled briefing" in text for text in message.edits)
     assert not any("can't browse" in text.lower() or "cannot browse" in text.lower() for text in message.edits)
 
 
@@ -1579,6 +1671,12 @@ def test_telegram_safe_html_escapes_raw_html_and_preserves_line_breaks():
     assert "&lt;script&gt;" in rendered
     assert "\n" in rendered
     assert "<b>Ready</b>" in rendered
+
+
+def test_unified_intent_normalization_accepts_chat_mode():
+    import bot
+
+    assert bot.normalize_natural_language_plan({"mode": "chat"}) == {"mode": "chat"}
 
 
 def test_natural_language_chat_reply_uses_telegram_html(monkeypatch):
