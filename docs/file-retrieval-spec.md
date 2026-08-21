@@ -6,7 +6,7 @@ GreyAI may retrieve and send a file when the user asks for a lawful, user-author
 
 ## Content boundary
 
-The feature must not locate or distribute pirated music, movies, software, books, games, or other copyrighted material without permission. It must not bypass DRM, paywalls, account controls, download restrictions, CAPTCHAs, malware defenses, or platform blocks. Grey may retrieve direct user-provided URLs and files from approved sources when the request is authorized and the source policy permits it. “Find a song/movie/app” must resolve to a lawful source such as an official publisher, an openly licensed repository, a public-domain archive, or another administrator-approved provider; ambiguous or suspicious sources are refused or require clarification.
+The feature must not locate or distribute pirated music, movies, software, books, games, or other copyrighted material without permission. It must not bypass DRM, paywalls, account controls, download restrictions, CAPTCHAs, malware defenses, or platform blocks. Grey may retrieve direct user-provided URLs or discover a source from approved search providers when the request is authorized and the source policy permits it. “Find a song/movie/app” no longer requires a direct URL: Grey searches approved providers, follows bounded result/detail links, and selects the best permitted artifact candidate. Suspicious, private, blocked, or clearly unauthorized sources still fail closed.
 
 ## Plan policy
 
@@ -22,9 +22,9 @@ A download consumes one existing execution quota unit only after entitlement and
 
 ## Pipeline
 
-1. Parse a `download` intent containing a lawful request, optional explicit URL, optional source candidates, and a desired artifact type.
-2. Enforce account status, plan entitlement, download cooldown, active-job limit, global queue capacity, and existing URL/domain/Tor policy.
-3. Resolve an explicit or allowlisted canonical HTTPS source. Do not guess an unapproved marketplace, file host, or dark-web target.
+1. Parse a `download` intent containing a request, optional explicit URL, optional source candidates, and a desired artifact type. URL-less requests create an approved search-first discovery plan.
+2. Enforce account status, plan entitlement, download cooldown, active-job limit, global queue capacity, and existing URL/domain/Tor policy before network retrieval.
+3. Resolve an explicit source or search approved providers, then follow at most two bounded result/detail hops. Do not select an unapproved marketplace, private host, or dark-web target.
 4. Stream the response to a private temporary path with a strict byte cap, total timeout, redirect policy, content-type and extension checks, and progress callbacks.
 5. Validate the final artifact using magic bytes and archive safety checks. Reject path traversal, archive bombs, executable payloads when not requested, suspicious double extensions, oversized decompression ratios, and unknown or mismatched content.
 6. Send the artifact through Telegram using the correct media type and a concise receipt. Never expose the temporary path or source credentials.

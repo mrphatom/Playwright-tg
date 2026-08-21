@@ -2188,6 +2188,34 @@ def public_search_source_candidates(user_text: str) -> List[str]:
     return candidates
 
 
+DOWNLOAD_REQUEST_ACTION_TERMS = ("download", "get", "fetch", "retrieve", "send", "attach", "find", "search", "look for")
+DOWNLOAD_REQUEST_ARTIFACT_TERMS = ("file", "song", "music", "track", "movie", "film", "video", "app", "application", "archive", "zip", "pdf", "document", "installer", "book", "image", "photo")
+
+
+def is_artifact_download_request(user_text: str) -> bool:
+    text = str(user_text or "").strip().lower()
+    if not text or any(marker in text for marker in ("how do i download", "how to download", "what is downloading")):
+        return False
+    has_action = any(re.search(r"\b" + re.escape(term) + r"\b", text) for term in DOWNLOAD_REQUEST_ACTION_TERMS)
+    has_artifact = any(re.search(r"\b" + re.escape(term) + r"\b", text) for term in DOWNLOAD_REQUEST_ARTIFACT_TERMS)
+    return bool(has_action and has_artifact)
+
+
+def artifact_discovery_query(user_text: str) -> str:
+    text = re.sub(r"\s+", " ", str(user_text or "").strip())
+    text = re.sub(r"\b(?:please|can you|could you|find|search|look for|download|get|fetch|retrieve|send|attach|to me|for me|and send it)\b", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip(" .,!?:;-")[:240] or str(user_text or "").strip()[:240]
+
+
+def artifact_discovery_source_candidates(user_text: str, user_id: Optional[int] = None) -> List[str]:
+    query = artifact_discovery_query(user_text)
+    candidates = public_search_source_candidates(query)
+    lowered = str(user_text or "").lower()
+    if re.search(r"\b(?:public[- ]domain|creative commons|open(?:ly)? licensed|archive)\b", lowered):
+        candidates.insert(0, "https://archive.org/search?query=" + quote_plus(query))
+    return [candidate for candidate in dict.fromkeys(candidates) if route_url_allowed(candidate, user_id)][:5]
+
+
 def is_crypto_price_request(user_text: str) -> bool:
     text = str(user_text or "").lower()
     return bool(any(term in text for term in CRYPTO_ASSET_TERMS) and any(term in text for term in CRYPTO_PRICE_TERMS))
@@ -2223,6 +2251,8 @@ def source_candidates_for_request(user_text: str, primary_url: str = "", user_id
         ordered = [primary_url, *crypto_sources] if primary_is_google else [*crypto_sources, primary_url]
     elif primary_url:
         ordered = [primary_url]
+    elif is_artifact_download_request(user_text):
+        ordered = artifact_discovery_source_candidates(user_text, user_id)
     elif is_live_web_lookup_request(user_text):
         ordered = public_search_source_candidates(user_text)
     else:
@@ -2294,13 +2324,19 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: Optional[int] = None
 
     url = str(raw_plan.get("url", "")).strip()
     discovered_url = bool(raw_plan.get("discover_url", False))
+    request = str(raw_plan.get("request", "")).strip()[:500]
     if mode == "search":
         query = re.sub(r"\s+", " ", str(raw_plan.get("query", raw_plan.get("request", ""))).strip())[:500]
         return {"mode": "search", "query": query, "discovered_url": True} if GOOGLE_CUSTOM_SEARCH_ENABLED and query else None
+    if mode == "download" and not url and discovered_url and request:
+        discovered_sources = artifact_discovery_source_candidates(request, user_id)
+        if not discovered_sources:
+            return None
+        url = discovered_sources[0]
+        raw_plan = {**raw_plan, "source_candidates": list(dict.fromkeys([*discovered_sources, *(raw_plan.get("source_candidates") or [])]))[:5]}
     if mode not in {"check", "watch", "download"} or not route_url_allowed(url, user_id):
         return None
 
-    request = str(raw_plan.get("request", "")).strip()[:500]
     if GOOGLE_CUSTOM_SEARCH_ENABLED and mode == "check" and urlparse(url).netloc.lower().removeprefix("www.") in {"google.com", "news.google.com"}:
         query = request or parse_qs(urlparse(url).query).get("q", [""])[0]
         query = re.sub(r"\s+", " ", str(query).strip())[:500]
@@ -2344,6 +2380,8 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: Optional[int] = None
         "condition_type": condition_type,
         "interval_seconds": interval_seconds,
     }
+    if discovered_url:
+        plan["discovered_url"] = True
     if bool(raw_plan.get("screenshot", False)) or re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", request, flags=re.IGNORECASE):
         plan["screenshot_requested"] = True
     request_for_sources = str(raw_plan.get("request", ""))
@@ -2392,7 +2430,7 @@ Use this shape:
   "reply_summary": "short confirmation"
 }
 Allowed actions are only: inspect, navigate:<goal>, search:<query>, click:<visible target>, type:<css_selector>=<text>, wait:<seconds from 0 to 30>, extract:<css_selector>, ai_extract:<prompt>, save_session:<name>, load_session:<name>, proxy:on, condition_contains:<text>, and condition_ai:<prompt>. Navigation actions must be read-only and use semantic targets discovered from the current page; never invent selectors, credentials, or destructive actions.
-Use mode download only for a lawful, user-authorized, public-domain, openly licensed, or otherwise permitted artifact request with a canonical HTTPS or explicitly allowlisted `.onion` source URL. Never use it to bypass DRM, paywalls, CAPTCHAs, platform blocks, malware defenses, or access controls. The application applies plan gates, byte limits, rate limits, archive validation, and temporary-file cleanup before Telegram delivery.
+Use mode download for a user-requested artifact when the request includes either a canonical HTTPS or explicitly allowlisted `.onion` source URL, or `discover_url:true` with a clear artifact request that Grey can resolve through its approved search-source fallbacks. Never use it to bypass DRM, paywalls, CAPTCHAs, platform blocks, malware defenses, or access controls. The application applies plan gates, byte limits, rate limits, archive validation, and temporary-file cleanup before Telegram delivery.
 Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return {"mode":"chat","reply":"..."} and write the complete conversational answer in reply. Leave reply empty for every other mode. Use Grey’s native registry to answer capability or upgrade questions; never claim that Grey is merely Gemini.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
 Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL. For price, availability, news, profile, or entity-search requests that may require an in-site result click, prefer one `navigate:<goal>` action so Grey can inspect the current page, search, click a relevant read-only result, and extract from the resulting page. For crypto price requests, prefer Google Search first and provide CoinMarketCap as an ordered fallback source when it is allowlisted.
@@ -2576,6 +2614,8 @@ def classify_message_route(user_text: str) -> str:
         return "chat"
     lowered = signal_text.lower()
     if parse_deterministic_management_request(signal_text) or parse_deterministic_login_request(signal_text):
+        return "task"
+    if is_artifact_download_request(signal_text):
         return "task"
     if is_web_automation_request(signal_text) or is_live_web_lookup_request(signal_text):
         return "task"
@@ -3067,6 +3107,10 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     lowered = text.lower()
     url_match = re.search(r"https?://[^\s,]+|(?<![@\w])(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s,]*)?", text, flags=re.IGNORECASE)
     watch_mode = any(marker in lowered for marker in ("monitor", "watch", "tell me when", "alert me when", "notify me when"))
+    if not watch_mode and not url_match and is_artifact_download_request(text):
+        discovery_sources = artifact_discovery_source_candidates(text, user_id)
+        if discovery_sources:
+            return {"mode": "download", "url": discovery_sources[0], "source_candidates": discovery_sources, "request": text[:500], "actions": [], "discovered_url": True}
     search_query = custom_search_query_for_request(text) if GOOGLE_CUSTOM_SEARCH_ENABLED and not watch_mode else None
     if search_query:
         return {"mode": "search", "query": search_query, "discovered_url": True}
@@ -3195,6 +3239,8 @@ def _is_unambiguous_deterministic_plan(user_text: str, plan: Dict[str, Any]) -> 
         # therefore stay on the structured interpreter path unless the caller
         # already supplied an explicit condition action.
         return bool(re.search(r"\bcondition_(?:contains|ai)\s*:", str(user_text or ""), flags=re.IGNORECASE))
+    if mode == "download":
+        return is_artifact_download_request(user_text) and bool(plan.get("source_candidates"))
     if mode != "check":
         return False
     if plan.get("discovered_url") and not _contains_url_like_text(user_text):
@@ -6450,52 +6496,64 @@ async def _edit_download_progress(status_msg, text: str) -> None:
 
 
 async def _resolve_direct_download_source(url: str, user_id: int) -> str:
-    """Resolve one approved HTML result page to a direct, allowlisted artifact link."""
+    """Resolve approved search/detail pages to a direct, allowlisted artifact link."""
     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
-    if not route_url_allowed(url, user_id):
-        raise DownloadRejected("source_not_allowlisted")
+    current_url = str(url or "").strip()
     headers = {"User-Agent": "GreyAI/1.0 authorized-file-retrieval", "Accept": "text/html,application/xhtml+xml"}
+    seen_urls = set()
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=headers, auto_decompress=False) as session:
-            async with session.get(url, allow_redirects=False) as response:
-                if response.status in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("Location")
-                    if not location:
-                        raise DownloadRejected("redirect_limit")
-                    redirected = urljoin(url, location)
-                    if not route_url_allowed(redirected, user_id):
-                        raise DownloadRejected("final_source_not_allowlisted")
-                    return redirected
-                if response.status != 200:
-                    raise DownloadRejected(f"http_status_{response.status}")
-                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-                if content_type and content_type not in {"text/html", "application/xhtml+xml"}:
-                    return url
-                body = await response.content.read(2_000_000)
-                html = body.decode("utf-8", errors="replace")
-                candidates: List[tuple[int, str]] = []
-                for href, label in re.findall(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL):
-                    candidate = urljoin(str(response.url), href.strip())
-                    if not route_url_allowed(candidate, user_id):
+            for depth in range(3):
+                if current_url in seen_urls:
+                    raise DownloadRejected("discovery_loop")
+                seen_urls.add(current_url)
+                if not route_url_allowed(current_url, user_id):
+                    raise DownloadRejected("source_not_allowlisted")
+                async with session.get(current_url, allow_redirects=False) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise DownloadRejected("redirect_limit")
+                        current_url = urljoin(current_url, location)
                         continue
-                    parsed = urlparse(candidate)
-                    suffix = Path(parsed.path).suffix.lower()
-                    if suffix in DOWNLOAD_BLOCKED_EXTENSIONS:
+                    if response.status != 200:
+                        raise DownloadRejected(f"http_status_{response.status}")
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                    if content_type and content_type not in {"text/html", "application/xhtml+xml"}:
+                        return current_url
+                    body = await response.content.read(2_000_000)
+                    html = body.decode("utf-8", errors="replace")
+                    direct_candidates: List[tuple[int, str]] = []
+                    page_candidates: List[tuple[int, str]] = []
+                    for href, label in re.findall(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL):
+                        candidate = urljoin(str(response.url), href.strip())
+                        if not route_url_allowed(candidate, user_id):
+                            continue
+                        parsed = urlparse(candidate)
+                        suffix = Path(parsed.path).suffix.lower()
+                        if suffix in DOWNLOAD_BLOCKED_EXTENSIONS:
+                            continue
+                        label_text = re.sub(r"<[^>]+>", " ", label).lower()
+                        score = 0
+                        if suffix in DOWNLOAD_ALLOWED_EXTENSIONS:
+                            score += 8
+                        if "download" in href.lower() or "download" in label_text:
+                            score += 4
+                        if any(term in label_text for term in ("audio", "song", "music", "video", "movie", "file", "archive", "pdf")):
+                            score += 3
+                        if score and suffix in DOWNLOAD_ALLOWED_EXTENSIONS:
+                            direct_candidates.append((score, candidate))
+                        elif score and depth < 2:
+                            page_candidates.append((score, candidate))
+                    if direct_candidates:
+                        direct_candidates.sort(key=lambda item: (-item[0], item[1]))
+                        return direct_candidates[0][1]
+                    if page_candidates and depth < 2:
+                        page_candidates.sort(key=lambda item: (-item[0], item[1]))
+                        current_url = page_candidates[0][1]
                         continue
-                    score = 0
-                    label_text = re.sub(r"<[^>]+>", " ", label).lower()
-                    if suffix in DOWNLOAD_ALLOWED_EXTENSIONS:
-                        score += 5
-                    if "download" in href.lower() or "download" in label_text:
-                        score += 3
-                    if any(term in label_text for term in ("audio", "song", "music", "video", "movie", "file", "archive")):
-                        score += 2
-                    if score:
-                        candidates.append((score, candidate))
-                if not candidates:
                     raise DownloadRejected("no_direct_artifact_found")
-                candidates.sort(key=lambda item: (-item[0], item[1]))
-                return candidates[0][1]
+            raise DownloadRejected("discovery_hop_limit")
     except DownloadRejected:
         raise
     except asyncio.TimeoutError:

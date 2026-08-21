@@ -3559,3 +3559,88 @@ def test_resolve_direct_download_source_follows_approved_result_link(monkeypatch
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_deterministic_download_request_without_url_enters_search_first_discovery(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    plan = bot.parse_deterministic_web_request(
+        "Find me the song Imagine Dragons Believer and send it to me",
+        user_id=42,
+    )
+
+    assert plan["mode"] == "download"
+    assert plan["discovered_url"] is True
+    assert plan["url"].startswith("https://")
+    assert plan["source_candidates"]
+    assert "Imagine Dragons" in plan["request"]
+
+
+def test_model_download_plan_without_url_is_normalized_to_search_source(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    plan = bot.normalize_natural_language_plan(
+        {
+            "mode": "download",
+            "discover_url": True,
+            "request": "Find the public-domain film Metropolis and send the file",
+            "actions": [],
+        },
+        user_id=42,
+    )
+
+    assert plan["mode"] == "download"
+    assert plan["url"].startswith("https://")
+    assert plan["discovered_url"] is True
+    assert plan["source_candidates"]
+
+
+def test_resolve_direct_download_source_allows_bounded_two_hop_result_navigation(monkeypatch):
+    import bot
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/results":
+                body = b'<html><body><a href="/detail">Imagine Dragons song</a></body></html>'
+            elif self.path == "/detail":
+                body = b'<html><body><a href="/files/song.mp3">Download song</a></body></html>'
+            else:
+                body = b"not relevant"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        resolved = asyncio.run(bot._resolve_direct_download_source(
+            f"http://127.0.0.1:{server.server_port}/results",
+            42,
+        ))
+        assert resolved.endswith("/files/song.mp3")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_url_less_artifact_request_is_agent_task_and_works_without_model(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    monkeypatch.setattr(bot, "gemini_configured", lambda: False)
+    request = "Find me the public-domain movie Metropolis and send the file"
+
+    assert bot.classify_message_route(request) == "task"
+    plan = asyncio.run(bot.parse_natural_language_intent(request, user_id=42))
+    assert plan["mode"] == "download"
+    assert plan["source_candidates"]
