@@ -1650,9 +1650,9 @@ def user_can_use_onion(user_id: int) -> bool:
     user = get_user(user_id)
     if not user or user["status"] != "active":
         return False
-    # Green/free users are intentionally excluded; paid and governed roles require
-    # the feature flag and an explicit onion host allowlist as a second boundary.
-    return bool(TOR_ONION_ACCESS_ENABLED and (user["plan"] in {"pro", "max"} or user["role"] in {"developer", "admin"}))
+    # Green/free and Pro users are intentionally excluded; only Max and governed
+    # roles can qualify, still requiring an explicit onion host allowlist.
+    return bool(TOR_ONION_ACCESS_ENABLED and (user["plan"] in {"max"} or user["role"] in {"developer", "admin"}))
 
 
 def tor_route_available() -> bool:
@@ -4857,7 +4857,7 @@ async def _process_natural_language(
     onion_target = str((plan or {}).get("url") or (onion_match.group(0) if onion_match else "")).rstrip(".,;!?)")
     if onion_target and is_onion_url(onion_target):
         if not TOR_ONION_ACCESS_ENABLED or not user_can_use_onion(user_id):
-            await status_msg.edit_text("⛔ Dark-web `.onion` access is not available on the Green/free tier. An eligible paid or governed account must also use an explicitly allowlisted onion host.")
+            await status_msg.edit_text("⛔ Dark-web `.onion` access is unavailable on the Green/free and Pro tiers. Only Max or a governed developer/admin account may qualify, and the host must be explicitly allowlisted.")
             log_audit(user_id, "natural_language", onion_target, "DENIED_ONION_TIER")
             update_operation(operation_id, "denied")
             return

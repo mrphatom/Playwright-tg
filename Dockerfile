@@ -2,6 +2,11 @@
 # Contains all OS-level dependencies (X11, fonts, libnss3) required for headless Chromium.
 FROM mcr.microsoft.com/playwright/python:v1.41.0-jammy
 
+# Tor is used only as a local client SOCKS route; the entrypoint binds it to loopback.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tor \
+    && rm -rf /var/lib/apt/lists/*
+
 # Set environment variables to optimize Python for Docker
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -20,7 +25,8 @@ RUN mkdir -p sessions && chmod 777 sessions
 # Copy the rest of the application code
 COPY . .
 
-# Run the bot
-CMD ["python", "bot.py"]
+# Run Tor (when enabled) and the bot under the supervised entrypoint.
+RUN chmod 755 start.sh
+CMD ["./start.sh"]
 
 
