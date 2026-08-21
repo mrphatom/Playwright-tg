@@ -235,7 +235,16 @@ They can block a host or family of subdomains immediately:
    QUEUE_ETA_FLOOR_SECONDS=5
    ALLOWED_TELEGRAM_USERS=123456789,987654321
    # Seed domains; administrators can add exact hosts or *.subdomain patterns at runtime.
-   ALLOWED_DOMAINS=github.com,amazon.com,news.ycombinator.com,reddit.com
+   ALLOWED_DOMAINS=github.com,amazon.com,news.ycombinator.com,google.com,coinmarketcap.com,duckduckgo.com,bing.com,brave.com,startpage.com,reddit.com
+   DUCKDUCKGO_ENABLED=true
+   BING_SEARCH_ENABLED=true
+   BRAVE_SEARCH_ENABLED=true
+   STARTPAGE_SEARCH_ENABLED=true
+   # Tor requires an externally managed SOCKS5 proxy; keep disabled unless reviewed.
+   TOR_PUBLIC_FALLBACK_ENABLED=false
+   TOR_ONION_ACCESS_ENABLED=false
+   TOR_PROXY_SERVER=
+   TOR_ONION_ALLOWLIST=
    SESSION_ENCRYPTION_KEY=your_aes_encryption_key
    ```
 
@@ -248,7 +257,10 @@ They can block a host or family of subdomains immediately:
    ```
    Then set `GOOGLE_CUSTOM_SEARCH_ENABLED=true` in the deployment environment and redeploy. If the API is enabled but its credentials are missing or its quota is exhausted, GreyAI fails closed and does not retry Google’s HTML search page.
 
-4. **Deploy with Docker Compose**
+4. **Optional Tor routing**
+   GreyAI can use an externally managed Tor SOCKS5 proxy as a last public-web route when `TOR_PUBLIC_FALLBACK_ENABLED=true` and `TOR_PROXY_SERVER` is configured. `.onion` access is a separate feature: it requires `TOR_ONION_ACCESS_ENABLED=true`, an explicit `TOR_ONION_ALLOWLIST`, an eligible Pro/Max/developer/admin account, and the same URL/action safety checks. Green/free users are denied `.onion` access. GreyAI does not start a Tor daemon or infer broad onion access from a normal domain allowlist.
+
+5. **Deploy with Docker Compose**
    ```bash
    docker compose up -d --build
    ```
@@ -260,7 +272,9 @@ They can block a host or family of subdomains immediately:
 Commands are chained using the pipe (`|`) character.
 
 ### Basic & AI Automation (`/check`)
-Execute a one-off pipeline to interact with a page and take a screenshot.
+Execute a one-off pipeline to interact with a page and take a screenshot when requested. Natural-language checks return targeted extraction first and preserve exact URL paths.
+
+For public search tasks, GreyAI can use Google Custom Search when configured, then browser-based DuckDuckGo, Bing, Brave Search, and Startpage fallbacks. Crypto price requests prefer Google and CoinMarketCap before the public search fallbacks.
 
 - **Available Actions:** `type:<css>=<text>`, `click:<css>`, `wait:<sec>`, `extract:<css>`, `ai_extract:<prompt>`, `save_session:<name>`, `load_session:<name>`.
 
@@ -316,7 +330,7 @@ Log in once and reuse the state safely.
 
 ## 🌐 Public Release Configuration
 
-Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and replace the starter `ALLOWED_DOMAINS` list with the domains you are prepared to permit. Public mode rejects private and loopback IP targets and refuses to operate with an empty domain allowlist.
+Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and replace the starter `ALLOWED_DOMAINS` list with the domains you are prepared to permit. Public mode rejects private and loopback IP targets and refuses to operate with an empty domain allowlist. Search-provider fallbacks remain allowlist-controlled; optional Tor routing is disabled by default, and Green/free users cannot access `.onion` hosts.
 
 Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, purchase Pro or Max access with `/upgrade pro` or `/upgrade max` using Telegram Stars, submit `/report` and `/appeal` tickets, request developer access with `/devrequest`, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, chat, and developer-management capabilities. Ordinary conversation is routed directly to the chat path; browser-like wording, named-site requests, schedules, watchers, and management actions remain on the task path. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, `/resolveappeal`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, and `/revokedeveloper`.
 

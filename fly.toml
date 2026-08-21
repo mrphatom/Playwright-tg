@@ -47,7 +47,7 @@ primary_region = "iad"
   MEDIA_TIMEOUT_SECONDS = "45"
   
   PUBLIC_MODE = "true"
-  ALLOWED_DOMAINS = "github.com,amazon.com,news.ycombinator.com,google.com,coinmarketcap.com,x.com,reddit.com"
+  ALLOWED_DOMAINS = "github.com,amazon.com,news.ycombinator.com,google.com,coinmarketcap.com,duckduckgo.com,bing.com,brave.com,startpage.com,x.com,reddit.com"
   DASHBOARD_BASE_URL = "https://playwright-tg-mrphatom.fly.dev"
   PORT = "8080"
   
