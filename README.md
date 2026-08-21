@@ -18,7 +18,7 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 - **💼 Telegram Secretary Mode:** Telegram’s current user-facing label for connected-account automation. An owner can connect GreyAI as a Secretary Bot so Grey can participate directly in selected private chats. The original user message remains visible and Grey’s answer is sent as a separate message in the same conversation, subject to explicit read/reply permissions and the owner allowlist.
 - **🔁 Chat-Agent Continuity:** Follow-up messages resolve the current chat’s durable watcher state before ordinary chat. Questions such as “What about the watch session we had on Reddit?” return the watcher ID, URL, interval, condition, and running or restored state instead of resetting the conversation or claiming that GreyAI has no access to its prior task.
 - **🎙️ Multimodal Telegram Input:** Send voice notes for transcription or photos/screenshots for visual identification, OCR, and image-aware answers. Captions and interpreted media can enter either chat mode or the authorized browser-agent path.
-- **🔎 Website Discovery and Live Lookup:** Say “go to Google News and summarize it”, “search for Apple and tell me the current iPhone price”, “find the latest headlines”, or “check availability” without manually typing a URL. GreyAI routes live-information and browser-work requests to the agent pipeline, converts recognizable sites or generic searches into safe HTTPS search URLs, and still applies the domain allowlist and SSRF-safe browser validation. Ordinary educational questions such as “How does Google search work?” remain conversational.
+- **🔎 Website Discovery and Live Lookup:** Say “go to Google News and summarize it”, “search for Apple and tell me the current iPhone price”, “find the latest headlines”, or “check availability” without manually typing a URL. When configured, generic searches use the approved Google Custom Search JSON API instead of scraping Google Search HTML. Direct website tasks still use the governed Playwright agent path, with domain allowlisting and SSRF-safe URL validation. Ordinary educational questions such as “How does Google search work?” remain conversational.
 - **🧠 AI-Powered Extraction:** Query webpages using conversational prompts instead of fragile CSS selectors.
 - **🔒 AES-Encrypted Sessions:** Login to sites once and save your session. Your cookies and tokens are encrypted at rest inside a local SQLite database.
 - **⚡ Persistent Browser Pooling:** Maintains a warm background Chromium instance. Commands launch isolated tabs in milliseconds.
@@ -29,7 +29,7 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 - **🎁 Referrals:** Unique Telegram deep links, one-time attribution, self-referral and duplicate protection, verified-payment qualification, auditable quota rewards, user stats, and admin reporting.
 - **📊 Operations Dashboard:** One-time Telegram-issued dashboard links, secure cookie sessions, CSRF-protected admin actions, redacted execution logs, saved-session metadata, health data, analytics, banned-user views, and live polling/websocket updates.
 - **📬 Durable User Notifications:** Ban, unban, and appeal decisions enqueue bounded, secret-free Telegram notifications in an idempotent retryable SQLite outbox delivered by a background worker.
-- **📰 Current-Fact Verification:** Questions such as “Have Cristiano Ronaldo officially announced his retirement?” are locally classified as verification tasks, converted into an allowlisted Google News search, and answered with extracted text and an optional screenshot instead of a false “I cannot access the internet” response.
+- **📰 Current-Fact Verification:** Questions such as “Have Cristiano Ronaldo officially announced his retirement?” are locally classified as verification tasks. If Custom Search is configured, GreyAI returns bounded Google API results without opening Google’s HTML search page; otherwise it preserves the legacy browser-search fallback.
 - **📣 Role-Targeted Messaging:** Administrators can preview and confirm messages to users, developers, or administrators through `/massrole`, with server-side role resolution, banned-user exclusion, audit records, and revalidation at delivery time.
 - **🟢 Maintenance Status:** Administrators can publish scheduled, degraded, or hard-maintenance updates with reasons. A scheduled maintenance entry accepts a future local time and IANA timezone; the persistent worker activates hard maintenance automatically at that time, pauses browser work, and enqueues one idempotent notification per user. Users can read the current status and timestamped history through Telegram and the public dashboard status endpoints.
 - **⚖️ Priority Queueing:** Browser work uses a bounded priority queue. Administrators, Max, developers, and Pro users receive progressively higher priority; free users remain accepted fairly with an estimated wait time, while full queues fail safely.
@@ -44,7 +44,7 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 
 ### Description
 
-GreyAI is a fast Telegram assistant for ordinary conversation and authorized web work. Users can send text, short voice notes, or screenshots. Natural-language chat stays on the low-latency chat path, while browsing, named websites, extraction, monitoring, scheduling, login, and account-management requests enter the governed agent path. The agent can discover a clearly named website such as Google News, but every discovered URL still passes HTTPS, domain-allowlist, SSRF, quota, timeout, and concurrency checks before browser execution.
+GreyAI is a fast Telegram assistant for ordinary conversation and authorized web work. Users can send text, short voice notes, or screenshots. Natural-language chat stays on the low-latency chat path, while browsing, named websites, extraction, monitoring, scheduling, login, and account-management requests enter the governed agent path. The agent can discover a clearly named website such as Google News. Generic live searches use the server-side Google Custom Search JSON API when enabled; direct website tasks continue through the browser agent and every discovered URL passes HTTPS, domain-allowlist, SSRF, quota, timeout, and concurrency checks before browser execution.
 
 ### Information and permissions
 
@@ -202,6 +202,12 @@ They can block a host or family of subdomains immediately:
    GEMINI_API_KEY_2=your_optional_fallback_gemini_api_key
    GEMINI_API_KEY_3=your_optional_fallback_gemini_api_key_3
    GEMINI_API_KEY_4=your_optional_fallback_gemini_api_key_4
+   # Optional approved generic search provider; keep the API key server-side.
+   GOOGLE_CUSTOM_SEARCH_ENABLED=true
+   GOOGLE_CUSTOM_SEARCH_API_KEY=your_google_cloud_api_key
+   GOOGLE_CUSTOM_SEARCH_CX=your_programmable_search_engine_id
+   GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS=8
+   GOOGLE_CUSTOM_SEARCH_RESULTS=5
    GEMINI_MODEL=gemini-3.6-flash
    MULTIMODAL_MODEL=gemini-3.5-flash-lite
    CHAT_TIMEOUT_SECONDS=20
@@ -226,7 +232,16 @@ They can block a host or family of subdomains immediately:
    SESSION_ENCRYPTION_KEY=your_aes_encryption_key
    ```
 
-3. **Deploy with Docker Compose**
+3. **Configure Google Custom Search (optional but recommended for generic live search)**
+   Create a [Programmable Search Engine](https://programmablesearchengine.google.com/controlpanel/create), configure the sites or web scope you want it to search, and copy its Search Engine ID (`cx`). In [Google Cloud Console](https://console.cloud.google.com/), enable the Custom Search JSON API and create a restricted API key. Do not commit the key to Git or place it in Telegram messages. The API route is used for generic search and current-fact lookups; direct URLs still use Playwright.
+
+   For Fly.io, inject the two secrets rather than placing them in `fly.toml`:
+   ```bash
+   fly secrets set GOOGLE_CUSTOM_SEARCH_API_KEY="..." GOOGLE_CUSTOM_SEARCH_CX="..." -a playwright-tg-mrphatom
+   ```
+   Then set `GOOGLE_CUSTOM_SEARCH_ENABLED=true` in the deployment environment and redeploy. If the API is enabled but its credentials are missing or its quota is exhausted, GreyAI fails closed and does not retry Google’s HTML search page.
+
+4. **Deploy with Docker Compose**
    ```bash
    docker compose up -d --build
    ```

@@ -12,11 +12,12 @@ import ipaddress
 import tempfile
 import urllib.request
 import urllib.error
+import aiohttp
 from pathlib import Path
 from html import escape as html_escape
 from datetime import datetime, timedelta, time as datetime_time
 from typing import List, Dict, Optional, Any
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote_plus, parse_qs
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent
@@ -159,6 +160,11 @@ INLINE_ENABLED = os.getenv("INLINE_ENABLED", "true").strip().lower() in {"1", "t
 GROUP_INVOCATION_ENABLED = os.getenv("GROUP_INVOCATION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 CHANNEL_INVOCATION_ENABLED = os.getenv("CHANNEL_INVOCATION_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 BUSINESS_MODE_ENABLED = os.getenv("BUSINESS_MODE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+GOOGLE_CUSTOM_SEARCH_ENABLED = os.getenv("GOOGLE_CUSTOM_SEARCH_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+GOOGLE_CUSTOM_SEARCH_API_KEY = os.getenv("GOOGLE_CUSTOM_SEARCH_API_KEY", "").strip()
+GOOGLE_CUSTOM_SEARCH_CX = os.getenv("GOOGLE_CUSTOM_SEARCH_CX", "").strip()
+GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS = max(3, min(20, int(os.getenv("GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS", "8"))))
+GOOGLE_CUSTOM_SEARCH_RESULTS = max(1, min(10, int(os.getenv("GOOGLE_CUSTOM_SEARCH_RESULTS", "5"))))
 INLINE_TIMEOUT_SECONDS = max(3, min(20, int(os.getenv("INLINE_TIMEOUT_SECONDS", "8"))))
 ALLOWED_CHANNEL_IDS = {
     int(value.strip()) for value in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if value.strip().lstrip("-").isdigit()
@@ -176,6 +182,10 @@ provider_metrics = {
     "alerts_sent": 0,
     "alerts_suppressed": 0,
     "recoveries_sent": 0,
+    "search_attempts": 0,
+    "search_successes": 0,
+    "search_failures": 0,
+    "search_quota_failures": 0,
 }
 
 
@@ -369,9 +379,103 @@ class MediaProviderUnavailable(RuntimeError):
 
 class MediaProviderTimeout(TimeoutError):
     """Media-specific timeout that does not imply the input is too large."""
+class SearchProviderUnavailable(RuntimeError):
+    """Google Custom Search is unavailable, unconfigured, or returned an error."""
+class SearchProviderTimeout(TimeoutError):
+    """Google Custom Search did not respond within the bounded timeout."""
+class GoogleCustomSearchProvider:
+    """Small server-side adapter for Google Custom Search JSON API."""
+
+    endpoint = "https://www.googleapis.com/customsearch/v1"
+
+    def __init__(self, api_key: str, cx: str, timeout_seconds: int = GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS):
+        self.api_key = api_key
+        self.cx = cx
+        self.timeout_seconds = timeout_seconds
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key and self.cx)
+
+    async def _request_json(self, query: str) -> Dict[str, Any]:
+        params = {
+            "key": self.api_key,
+            "cx": self.cx,
+            "q": query[:500],
+            "num": GOOGLE_CUSTOM_SEARCH_RESULTS,
+            "safe": "active",
+            "hl": "en",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self.endpoint, params=params) as response:
+                    payload = await response.json(content_type=None)
+                    if response.status == 429 or response.status == 403:
+                        provider_metrics["search_quota_failures"] += 1
+                        raise SearchProviderUnavailable("Google Custom Search quota or authorization is unavailable")
+                    if response.status >= 400:
+                        raise SearchProviderUnavailable(f"Google Custom Search returned HTTP {response.status}")
+                    if not isinstance(payload, dict):
+                        raise SearchProviderUnavailable("Google Custom Search returned an invalid response")
+                    return payload
+        except asyncio.TimeoutError as exc:
+            raise SearchProviderTimeout("Google Custom Search timed out") from exc
+        except aiohttp.ClientError as exc:
+            raise SearchProviderUnavailable("Google Custom Search is unreachable") from exc
+
+    async def search(self, query: str) -> List[Dict[str, str]]:
+        if not self.configured:
+            raise SearchProviderUnavailable("Google Custom Search is not configured")
+        normalized_query = re.sub(r"\s+", " ", str(query or "")).strip()
+        if not normalized_query:
+            return []
+        provider_metrics["search_attempts"] += 1
+        try:
+            payload = await self._request_json(normalized_query)
+            items = payload.get("items", [])
+            if not isinstance(items, list):
+                raise SearchProviderUnavailable("Google Custom Search returned malformed results")
+            results = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                link = str(item.get("link", "")).strip()
+                title = str(item.get("title", "")).strip()
+                snippet = str(item.get("snippet", "")).strip()
+                if not link or not title or urlparse(link).scheme not in {"http", "https"}:
+                    continue
+                results.append({"title": title[:300], "link": link[:2000], "snippet": snippet[:1000]})
+            provider_metrics["search_successes"] += 1
+            return results
+        except (SearchProviderTimeout, SearchProviderUnavailable):
+            provider_metrics["search_failures"] += 1
+            raise
+
+
+google_custom_search_provider = GoogleCustomSearchProvider(
+    GOOGLE_CUSTOM_SEARCH_API_KEY,
+    GOOGLE_CUSTOM_SEARCH_CX,
+)
+
+
+def format_google_search_results(query: str, results: List[Dict[str, str]]) -> str:
+    """Format API results as bounded Markdown for the shared Telegram HTML renderer."""
+    if not results:
+        return f"No search results found for: {query}"
+    lines = [f"Search results for: **{query}**", ""]
+    for index, result in enumerate(results[:GOOGLE_CUSTOM_SEARCH_RESULTS], start=1):
+        lines.extend([
+            f"{index}. **{result['title']}**",
+            result["link"],
+            result["snippet"] or "No snippet was provided.",
+            "",
+        ])
+    return truncate_text("\n".join(lines).strip(), 3900)
 
 
 class ProviderAlertManager:
+
     """Best-effort, rate-limited administrator notifications for provider incidents."""
 
     def __init__(self, cooldown_seconds: int = PROVIDER_ALERT_COOLDOWN_SECONDS):
@@ -1438,10 +1542,18 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
 
     url = str(raw_plan.get("url", "")).strip()
     discovered_url = bool(raw_plan.get("discover_url", False))
+    if mode == "search":
+        query = re.sub(r"\s+", " ", str(raw_plan.get("query", raw_plan.get("request", ""))).strip())[:500]
+        return {"mode": "search", "query": query, "discovered_url": True} if GOOGLE_CUSTOM_SEARCH_ENABLED and query else None
     if mode not in {"check", "watch"} or not is_valid_url(url) or not is_domain_allowed(url):
         return None
 
     request = str(raw_plan.get("request", "")).strip()[:500]
+    if GOOGLE_CUSTOM_SEARCH_ENABLED and mode == "check" and urlparse(url).netloc.lower().removeprefix("www.") in {"google.com", "news.google.com"}:
+        query = request or parse_qs(urlparse(url).query).get("q", [""])[0]
+        query = re.sub(r"\s+", " ", str(query).strip())[:500]
+        if query:
+            return {"mode": "search", "query": query, "discovered_url": True}
     condition = str(raw_plan.get("condition", "")).strip()[:500]
     condition_type = str(raw_plan.get("condition_type", "ai")).strip().lower()
     if condition_type not in {"ai", "contains"}:
@@ -1485,7 +1597,7 @@ NATURAL_LANGUAGE_SYSTEM_PROMPT = """
 Translate the user's request into one JSON command. Return JSON only; never Markdown, code, credentials, or extra keys.
 Use this shape:
 {
-  "mode": "check" | "watch" | "schedule" | "unknown",
+  "mode": "check" | "search" | "watch" | "schedule" | "unknown",
   "url": "explicit or safely discovered http or https URL for check/watch, or empty string",
   "discover_url": "true only when resolving a clearly named website is necessary; never invent a URL",
   "request": "information to extract for a one-time check",
@@ -1931,6 +2043,19 @@ def is_factual_web_verification_request(user_text: str) -> bool:
     return any(term in text for term in currentness) and (question_start or verification_phrase)
 
 
+def custom_search_query_for_request(user_text: str) -> Optional[str]:
+    """Return a generic search query only when the request is not a direct-site task."""
+    raw_text = re.sub(r"\s+", " ", str(user_text or "").strip())
+    text = raw_text.strip(" ?!.")
+    if not text or re.search(r"https?://|(?<![@\w])(?:[a-z0-9-]+\.)+[a-z]{2,}", text, flags=re.IGNORECASE):
+        return None
+    if any(marker in text.lower() for marker in ("monitor", "watch", "tell me when", "alert me when", "notify me when")):
+        return None
+    if is_factual_web_verification_request(raw_text) or is_live_web_lookup_request(raw_text):
+        return text[:500]
+    return None
+
+
 def discover_factual_web_reference(user_text: str) -> Optional[str]:
     if not is_factual_web_verification_request(user_text):
         return None
@@ -1961,6 +2086,10 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     text = str(user_text or "").strip()
     lowered = text.lower()
     url_match = re.search(r"https?://[^\s,]+|(?<![@\w])(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s,]*)?", text, flags=re.IGNORECASE)
+    watch_mode = any(marker in lowered for marker in ("monitor", "watch", "tell me when", "alert me when", "notify me when"))
+    search_query = custom_search_query_for_request(text) if GOOGLE_CUSTOM_SEARCH_ENABLED and not watch_mode else None
+    if search_query:
+        return {"mode": "search", "query": search_query, "discovered_url": True}
     discovered_url = discover_named_web_reference(text) if not url_match else None
     if not url_match and not discovered_url:
         discovered_url = discover_factual_web_reference(text)
@@ -1980,7 +2109,6 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     if not is_valid_url(url) or not is_domain_allowed(url):
         return None
 
-    watch_mode = any(marker in lowered for marker in ("monitor", "watch", "tell me when", "alert me when", "notify me when"))
     interval_match = re.search(r"\bevery\s+(?:(\d+)\s*)?(seconds?|secs?|minutes?|mins?|hours?)\b", lowered)
     interval_seconds = 60
     if interval_match:
@@ -4039,7 +4167,7 @@ async def _process_natural_language(
             update_operation(operation_id, "denied")
             return
 
-    if plan and plan.get("mode") in {"check", "watch", "schedule", "login"}:
+    if plan and plan.get("mode") in {"check", "search", "watch", "schedule", "login"}:
         allowed, used, limit = consume_quota(user_id)
         if not allowed:
             await status_msg.edit_text(f"⏳ Free-plan limit reached ({used}/{limit}). Use /upgrade to view paid access options.")
@@ -4163,6 +4291,37 @@ async def _process_natural_language(
             record_admin_action(user_id, "revoke_developer", plan["target_user_id"], "developer role revoked", {"revoked_keys": revoked})
             await status_msg.edit_text(f"Developer role revoked for {plan['target_user_id']}; {revoked} key(s) revoked.")
             return
+
+    if plan and plan.get("mode") == "search":
+        if not GOOGLE_CUSTOM_SEARCH_ENABLED or not google_custom_search_provider.configured:
+            update_operation(operation_id, "failed")
+            await status_msg.edit_text("Google Custom Search is enabled for this request but is not configured. An administrator must set GOOGLE_CUSTOM_SEARCH_API_KEY and GOOGLE_CUSTOM_SEARCH_CX.")
+            log_audit(user_id, "custom_search", None, "NOT_CONFIGURED")
+            return
+        try:
+            results = await asyncio.wait_for(
+                google_custom_search_provider.search(plan["query"]),
+                timeout=GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS + 1,
+            )
+            await status_msg.edit_text(
+                telegram_safe_html(format_google_search_results(plan["query"], results)),
+                parse_mode="HTML",
+            )
+            update_operation(operation_id, "succeeded")
+            log_audit(user_id, "custom_search", None, "SUCCESS")
+        except SearchProviderTimeout:
+            update_operation(operation_id, "failed")
+            await status_msg.edit_text("Google Custom Search timed out. No browser scraping fallback was attempted; please try again shortly.")
+            log_audit(user_id, "custom_search", None, "TIMEOUT")
+        except asyncio.TimeoutError:
+            update_operation(operation_id, "failed")
+            await status_msg.edit_text("Google Custom Search timed out. No browser scraping fallback was attempted; please try again shortly.")
+            log_audit(user_id, "custom_search", None, "TIMEOUT")
+        except SearchProviderUnavailable:
+            update_operation(operation_id, "failed")
+            await status_msg.edit_text("Google Custom Search is temporarily unavailable or its quota is exhausted. No browser scraping fallback was attempted; please try again later.")
+            log_audit(user_id, "custom_search", None, "UNAVAILABLE")
+        return
 
     if not plan:
         if route == "task":
@@ -4736,6 +4895,7 @@ def build_health_report() -> str:
         f"Commands: `{runtime_metrics['commands_total']}` | Browser attempts: `{runtime_metrics['browser_tasks_total']}`\n"
         f"Failures: `{runtime_metrics['failures_total']}` | Queue rejected: `{runtime_metrics['queue_rejected']}` | Crash failsafe: `{runtime_metrics['crash_failsafe_events']}`\n"
         f"Gemini attempts: `{provider_metrics['text_attempts'] + provider_metrics['media_attempts']}` | Quota failures: `{provider_metrics['quota_failures']}`\n"
+        f"Custom Search: `{'enabled' if GOOGLE_CUSTOM_SEARCH_ENABLED and google_custom_search_provider.configured else 'disabled/not configured'}` | Attempts: `{provider_metrics['search_attempts']}` | Failures: `{provider_metrics['search_failures']}`\n"
         f"Model failures: `{provider_metrics['model_failures']}` | Fallback successes: `{provider_metrics['fallback_successes']}`\n"
         f"Alerts sent: `{provider_metrics['alerts_sent']}` | Suppressed: `{provider_metrics['alerts_suppressed']}` | Recoveries: `{provider_metrics['recoveries_sent']}`"
     )
