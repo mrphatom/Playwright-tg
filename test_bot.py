@@ -3076,3 +3076,61 @@ def test_native_context_uses_authoritative_admin_predicate_not_stored_role_label
     context = bot.build_native_grey_context(42, 42, "chat")
     assert context["requester"]["is_admin"] is True
     assert context["requester"]["is_developer"] is True
+
+
+def test_telegram_bot_starter_archive_contains_runnable_secret_free_project(tmp_path, monkeypatch):
+    import zipfile
+    import bot
+    from starter_templates import build_telegram_bot_starter_archive
+
+    monkeypatch.chdir(tmp_path)
+    archive_path = build_telegram_bot_starter_archive("my-gre-ai-bot", bot.DASHBOARD_BASE_URL)
+    assert archive_path.exists()
+    with zipfile.ZipFile(archive_path) as archive:
+        names = set(archive.namelist())
+        assert "my-gre-ai-bot/bot.py" in names
+        assert "my-gre-ai-bot/requirements.txt" in names
+        assert "my-gre-ai-bot/.env.example" in names
+        source = archive.read("my-gre-ai-bot/bot.py").decode()
+        env_example = archive.read("my-gre-ai-bot/.env.example").decode()
+        assert "/api/v1/check" in source
+        assert "Authorization" in source
+        assert "replace_with_your_greyai_developer_key" in env_example
+        assert "gai_live." not in source
+
+
+def test_management_parser_recognizes_complete_telegram_bot_starter_request():
+    import bot
+    plan = bot.parse_deterministic_management_request(
+        "Generate a quick short code for me for a tg bot with your integration and the file name for my GitHub repository"
+    )
+    assert plan == {
+        "mode": "developer_bot_starter",
+        "language": "python",
+        "project_name": "greyai-telegram-integration",
+    }
+
+
+def test_management_parser_preserves_requested_starter_project_name_and_language():
+    import bot
+    plan = bot.parse_deterministic_management_request(
+        "Generate a complete JavaScript Telegram bot project named stock-alerts using GreyAI integration"
+    )
+    assert plan == {
+        "mode": "developer_bot_starter",
+        "language": "javascript",
+        "project_name": "stock-alerts",
+    }
+
+
+def test_telegram_bot_starter_python_entrypoint_compiles(tmp_path, monkeypatch):
+    import py_compile
+    import zipfile
+    from starter_templates import build_telegram_bot_starter_archive
+
+    monkeypatch.chdir(tmp_path)
+    archive_path = build_telegram_bot_starter_archive("compile-check", "https://playwright-tg-mrphatom.fly.dev", output_dir=tmp_path)
+    extract_dir = tmp_path / "extracted"
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(extract_dir)
+    py_compile.compile(str(extract_dir / "compile-check" / "bot.py"), doraise=True)

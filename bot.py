@@ -11,6 +11,8 @@ import base64
 import secrets
 import ipaddress
 import tempfile
+import shutil
+import zipfile
 import urllib.request
 import urllib.error
 import aiohttp
@@ -22,7 +24,7 @@ from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse, quote_plus, parse_qs
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, InlineQueryHandler, ChosenInlineResultHandler, BusinessConnectionHandler, ChatMemberHandler, CallbackQueryHandler, filters
 from telegram.error import TelegramError, Forbidden
 
@@ -35,6 +37,7 @@ from telegram.ext import PreCheckoutQueryHandler
 
 from dashboard import serve_dashboard
 from api_contract import developer_api_contract, format_developer_api_example
+from starter_templates import build_telegram_bot_starter_archive
 
 from control_plane import (
     init_platform_db,
@@ -155,6 +158,7 @@ CHAT_CONTEXT_TURNS = max(8, min(100, int(os.getenv("CHAT_CONTEXT_TURNS", "32")))
 ROUTER_MAX_OUTPUT_TOKENS = max(256, min(1024, int(os.getenv("ROUTER_MAX_OUTPUT_TOKENS", "768"))))
 MEDIA_TIMEOUT_SECONDS = int(os.getenv("MEDIA_TIMEOUT_SECONDS", "45"))
 API_KEY_MESSAGE_TTL_SECONDS = max(30, min(300, int(os.getenv("API_KEY_MESSAGE_TTL_SECONDS", "90"))))
+DEVELOPER_ARTIFACT_TTL_SECONDS = max(120, min(900, int(os.getenv("DEVELOPER_ARTIFACT_TTL_SECONDS", "600"))))
 BOT_SHORT_DESCRIPTION = "GreyAI: fast chat, inline questions, group mentions, web automation, schedules, monitoring, and multimodal input."
 BOT_DESCRIPTION = (
     "GreyAI is a Telegram assistant for fast conversation and authorized web work. "
@@ -1976,6 +1980,14 @@ def parse_deterministic_management_request(
         return {"mode": "developer_revoke_key", "key_id": revoke_key_match.group(1)}
     if re.search(r"\b(?:developer|api)\s+(?:usage|statistics|stats)\b", text):
         return {"mode": "developer_stats"}
+    starter_request = bool(
+        re.search(r"\b(?:full|complete|entire|starter|template|quick|short)\b.*\b(?:telegram|tg)\s+bot\b", text)
+        and re.search(r"\b(?:code|repo(?:sitory)?|project|files?|github|integration)\b", text)
+    )
+    if starter_request:
+        language = "javascript" if re.search(r"\b(?:javascript|typescript|node(?:\.js)?)\b", text) else "python"
+        project_match = re.search(r"\b(?:project|repository|repo|folder|package)\s+(?:name|called|named)\s*[:=]?\s*([a-z0-9][a-z0-9._-]{2,80})", text)
+        return {"mode": "developer_bot_starter", "language": language, "project_name": project_match.group(1) if project_match else "greyai-telegram-integration"}
     api_example_request = bool(
         re.search(r"\b(?:example|sample|code|snippet|integration|integrate|how\s+do\s+i)\b", text)
         and re.search(r"\b(?:developer\s+)?api\s*(?:key|integration|endpoint)?\b", text)
@@ -2155,6 +2167,14 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: Optional[int] = None
     if mode == "schedule":
         schedule_config = normalize_schedule_config(raw_plan)
         return {"mode": "schedule", "schedule": schedule_config} if schedule_config else None
+    if mode == "developer_bot_starter":
+        language = str(raw_plan.get("language", "python") or "python").strip().lower()
+        if language in {"js", "node", "typescript", "ts"}:
+            language = "javascript"
+        else:
+            language = "python"
+        project_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(raw_plan.get("project_name", "greyai-telegram-integration") or "greyai-telegram-integration")).strip(".-_").lower()[:80] or "greyai-telegram-integration"
+        return {"mode": "developer_bot_starter", "language": language, "project_name": project_name}
     if mode == "developer_api_example":
         language = str(raw_plan.get("language", "python") or "python").strip().lower()
         if language in {"js", "node", "typescript", "ts"}:
@@ -2256,7 +2276,7 @@ You are the routing component of GreyAI, a native application-owned Telegram ass
 Translate the user's request into one JSON command. Return JSON only; never Markdown, code, credentials, or extra keys.
 Use this shape:
 {
-  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "ad_campaign" | "developer_api_example" | "unknown",
+  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "ad_campaign" | "developer_api_example" | "developer_bot_starter" | "unknown",
   "url": "explicit or safely discovered http or https URL for check/watch, or empty string",
   "source_candidates": ["ordered canonical HTTPS fallback URLs, when multiple sources are useful"],
   "discover_url": "true only when resolving a clearly named website is necessary; never invent a URL",
@@ -2284,7 +2304,7 @@ Allowed actions are only: type:<css_selector>=<text>, click:<css_selector>, wait
 Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return {"mode":"chat","reply":"..."} and write the complete conversational answer in reply. Leave reply empty for every other mode. Use Grey’s native registry to answer capability or upgrade questions; never claim that Grey is merely Gemini.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
 Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL. For crypto price requests, prefer Google Search first and provide CoinMarketCap as an ordered fallback source when it is allowlisted.
-Use mode schedule for a recurring briefing and put every source URL in urls. Use mode developer_api_example only when the user asks how to integrate GreyAI’s developer API into another bot or application. Do not invent an endpoint, base URL, scope, payload, response, or feature: return the exact contract supplied by the native application registry, or return mode unknown. Use mode ad_campaign only when the unquoted outer request clearly asks an administrator to create a bounded advertising campaign; include explicit Telegram target IDs or @usernames, title, ad_text or generate_copy=true with a brief, repeat_count, and interval_seconds. This mode only creates a preview and never posts by itself.
+Use mode schedule for a recurring briefing and put every source URL in urls. Use mode developer_api_example only when the user asks how to integrate GreyAI’s developer API into another bot or application. Use mode developer_bot_starter when the user asks for a complete, full, starter, or repository-ready Telegram bot project using GreyAI; return only the requested language and project name, and let the application generate the files from its verified template. Do not invent an endpoint, base URL, scope, payload, response, or feature: return the exact contract supplied by the native application registry, or return mode unknown. Use mode ad_campaign only when the unquoted outer request clearly asks an administrator to create a bounded advertising campaign; include explicit Telegram target IDs or @usernames, title, ad_text or generate_copy=true with a brief, repeat_count, and interval_seconds. This mode only creates a preview and never posts by itself.
 Use condition_type contains only for a literal text match; otherwise use ai.
 Default interval_seconds to 60, never below 30. For ad_campaign, default repeat_count to 1 and interval_seconds to 3600. Default schedule timezone to UTC, days to weekdays, and delivery_mode to combined.
 Do not invent URLs, selectors, identifiers, or actions. If the user names a recognizable website without a URL, resolve only its canonical HTTPS URL and set discover_url true; otherwise return mode unknown. Credentialed login requests are handled outside this prompt and must not be represented here. Never use model output to grant a role, change a plan, bypass a quota, reveal another user, or execute a side effect; the application validates and enforces those decisions.
@@ -6203,6 +6223,39 @@ async def _process_natural_language(
             await status_msg.edit_text(f"✅ Developer access request submitted: `{request_id}`.", parse_mode="Markdown")
         else:
             await status_msg.edit_text(f"Your developer request is already open: `{request_id}`.", parse_mode="Markdown")
+        return
+
+    if plan and plan.get("mode") == "developer_bot_starter":
+        if not is_developer(user_id):
+            await status_msg.edit_text("⛔ An active developer role is required to generate a GreyAI integration starter. Use /devrequest to ask an administrator for access.")
+            update_operation(operation_id, "denied")
+            log_audit(user_id, "developer_bot_starter", None, "DENIED_NOT_DEVELOPER")
+            return
+        artifact_dir = tempfile.mkdtemp(prefix="greyai-starter-")
+        archive_path = None
+        try:
+            archive_path = build_telegram_bot_starter_archive(
+                plan.get("project_name", "greyai-telegram-integration"),
+                DASHBOARD_BASE_URL,
+                output_dir=artifact_dir,
+            )
+            await status_msg.edit_text("✅ I’m packaging the complete Telegram bot starter now. It will contain the files, requirements, environment template, README, and verified GreyAI integration.")
+            with archive_path.open("rb") as artifact:
+                document = await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(artifact, filename=archive_path.name),
+                    caption="✅ Complete GreyAI Telegram bot starter attached. No Telegram token or GreyAI secret is included. Copy values into .env from your secret manager, then follow README.md.",
+                )
+            schedule_ephemeral_message(context, document, delay_seconds=DEVELOPER_ARTIFACT_TTL_SECONDS)
+            update_operation(operation_id, "succeeded")
+            log_audit(user_id, "developer_bot_starter", None, "SUCCESS")
+        except Exception:
+            update_operation(operation_id, "failed")
+            log_audit(user_id, "developer_bot_starter", None, "DELIVERY_FAILED")
+            logger.exception("developer_starter_delivery_failed user_id=%s", user_id)
+            await status_msg.edit_text("⚠️ I couldn’t deliver the starter archive this time. No key was exposed. Check Grey’s status and try again.")
+        finally:
+            shutil.rmtree(artifact_dir, ignore_errors=True)
         return
 
     if plan and plan.get("mode") == "developer_api_example":
