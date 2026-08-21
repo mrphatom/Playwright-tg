@@ -37,6 +37,51 @@ def setup_test_db():
     if os.path.exists("test_telescout.db"):
         os.remove("test_telescout.db")
 
+def test_upgrade_menu_lists_benefits_prices_and_selection_buttons():
+    import bot
+
+    text = bot.upgrade_plan_menu_text()
+    assert f"Pro — {bot.PRO_PLAN_STARS} Stars / 30 days" in text
+    assert f"Max — {bot.MAX_PLAN_STARS} Stars / 30 days" in text
+    assert "1,000 monthly execution units" in text
+    assert "5,000 monthly execution units" in text
+    assert "Pro does not include .onion browsing" in text
+    assert "Eligible for explicitly allowlisted .onion browsing" in text
+
+    keyboard = bot.upgrade_plan_keyboard()
+    assert keyboard.inline_keyboard[0][0].callback_data == "upgrade:pro"
+    assert keyboard.inline_keyboard[1][0].callback_data == "upgrade:max"
+
+
+def test_upgrade_button_callback_enforces_access_and_selects_plan(monkeypatch):
+    import bot
+
+    class FakeQuery:
+        data = "upgrade:max"
+        from_user = SimpleNamespace(id=42, username="buyer", full_name="Buyer")
+        message = object()
+
+        def __init__(self):
+            self.answers = []
+
+        async def answer(self, text, **kwargs):
+            self.answers.append((text, kwargs))
+
+    query = FakeQuery()
+    captured = {}
+    monkeypatch.setattr(bot, "ensure_user", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "is_allowed_user", lambda user_id: True)
+
+    async def fake_send_invoice(target, user_id, plan, audit_action="/upgrade"):
+        captured.update(target=target, user_id=user_id, plan=plan, audit_action=audit_action)
+
+    monkeypatch.setattr(bot, "_send_upgrade_invoice", fake_send_invoice)
+    asyncio.run(bot.upgrade_plan_callback(SimpleNamespace(callback_query=query), SimpleNamespace()))
+
+    assert captured == {"target": query.message, "user_id": 42, "plan": "max", "audit_action": "upgrade_button"}
+    assert query.answers[0][0].startswith("Preparing your Max invoice")
+
+
 def test_shared_chat_invocation_normalization_and_group_opt_in(monkeypatch):
     import bot
 
