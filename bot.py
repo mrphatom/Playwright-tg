@@ -142,6 +142,7 @@ BOT_DESCRIPTION = (
 ALLOWED_USERS = set(int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_USERS", "").split(",") if uid.strip().isdigit())
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "90"))
+PROGRESS_FEEDBACK_DELAY_SECONDS = max(0.5, min(3.0, float(os.getenv("PROGRESS_FEEDBACK_DELAY_SECONDS", "1.2"))))
 CRYPTO_CHECKOUT_URL = os.getenv("CRYPTO_CHECKOUT_URL")
 DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "")
 PRO_PLAN_STARS = int(os.getenv("PRO_PLAN_STARS", "750"))
@@ -2446,6 +2447,22 @@ def truncate_text(text: str, max_length: int = 4000) -> str:
     return text if len(text) <= max_length else text[:max_length - 15] + "\n...[Truncated]"
 
 
+async def _send_delayed_thinking_feedback(source_message, state: Dict[str, Any], delay_seconds: Optional[float] = None):
+    """Show explicit progress only when interpretation takes long enough to be noticeable."""
+    try:
+        delay = PROGRESS_FEEDBACK_DELAY_SECONDS if delay_seconds is None else delay_seconds
+        await asyncio.sleep(max(0.0, float(delay)))
+        state["message"] = await source_message.reply_text(
+            "🧠 I’m still here — thinking through your request…"
+        )
+    except asyncio.CancelledError:
+        return
+    except TelegramError:
+        logger.debug("delayed_thinking_feedback_send_failed", exc_info=True)
+    except Exception:
+        logger.exception("delayed_thinking_feedback_failed")
+
+
 def telegram_safe_html(text: str, max_length: int = 4000) -> str:
     """Convert common AI Markdown into Telegram-supported HTML without leaking markup."""
     source = truncate_text(str(text or ""), max_length)
@@ -4379,6 +4396,8 @@ async def _process_natural_language(
             log_audit(user_id, "chat", None, "SUCCESS_MICRO_REPLY")
             return
 
+    progress_state: Dict[str, Any] = {}
+    progress_task = asyncio.create_task(_send_delayed_thinking_feedback(source_message, progress_state))
     route_hint = classify_message_route(request_text)
     chat_history: List[Dict[str, str]] = []
     if route_hint == "chat":
@@ -4397,6 +4416,12 @@ async def _process_natural_language(
         # The deterministic route hint still prevents an obvious task from falling
         # into a misleading chat disclaimer when the interpretation provider is down.
         plan = None
+    finally:
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
 
     interpreted_task = bool(plan and plan.get("mode") not in {"chat", "unknown"})
     route = "task" if interpreted_task or route_hint == "task" else "chat"
@@ -4410,7 +4435,12 @@ async def _process_natural_language(
                 owner_user_id=user_id,
                 reply_context=reply_context,
             )
-        sent_reply = await source_message.reply_text(telegram_safe_html(reply), parse_mode="HTML")
+        progress_message = progress_state.get("message")
+        if progress_message:
+            await progress_message.edit_text(telegram_safe_html(reply), parse_mode="HTML")
+            sent_reply = progress_message
+        else:
+            sent_reply = await source_message.reply_text(telegram_safe_html(reply), parse_mode="HTML")
         remember_chat_turn(
             chat_id,
             request_text,
@@ -4426,7 +4456,13 @@ async def _process_natural_language(
 
     runtime_metrics["commands_total"] += 1
     operation_id = uuid.uuid4().hex[:12]
-    status_msg = await source_message.reply_text(f"🧠 Thinking...\nRef: `{operation_id}`", parse_mode="Markdown")
+    status_text = f"🧠 Thinking...\nRef: `{operation_id}`"
+    progress_message = progress_state.get("message")
+    if progress_message:
+        await progress_message.edit_text(status_text, parse_mode="Markdown")
+        status_msg = progress_message
+    else:
+        status_msg = await source_message.reply_text(status_text, parse_mode="Markdown")
     create_operation(operation_id, user_id, chat_id, "natural_language")
     remember_chat_turn(
         chat_id,
