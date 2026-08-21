@@ -93,6 +93,7 @@ def init_platform_db() -> None:
                 role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
                 text TEXT NOT NULL,
                 source_message_id INTEGER,
+                telegram_message_id INTEGER,
                 reply_to_message_id INTEGER,
                 business_connection_id TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -409,6 +410,11 @@ def init_platform_db() -> None:
             connection.execute("ALTER TABLE dashboard_login_tokens ADD COLUMN session_secret TEXT")
         except sqlite3.OperationalError:
             pass
+        try:
+            connection.execute("ALTER TABLE conversation_turns ADD COLUMN telegram_message_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_telegram_id ON conversation_turns(owner_user_id, chat_id, telegram_message_id, turn_id DESC)")
         connection.commit()
 
 
@@ -1367,6 +1373,7 @@ def record_conversation_turn(
     role: str,
     text: str,
     source_message_id: Optional[int] = None,
+    telegram_message_id: Optional[int] = None,
     reply_to_message_id: Optional[int] = None,
     business_connection_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -1377,15 +1384,16 @@ def record_conversation_turn(
     with _connect() as connection:
         cursor = connection.execute(
             """INSERT INTO conversation_turns
-               (owner_user_id, chat_id, role, text, source_message_id, reply_to_message_id,
-                business_connection_id, metadata_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (owner_user_id, chat_id, role, text, source_message_id, telegram_message_id,
+                reply_to_message_id, business_connection_id, metadata_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(owner_user_id),
                 int(chat_id),
                 clean_role,
                 _safe_contact_text(text, 6000),
                 int(source_message_id) if source_message_id is not None else None,
+                int(telegram_message_id) if telegram_message_id is not None else None,
                 int(reply_to_message_id) if reply_to_message_id is not None else None,
                 str(business_connection_id or "")[:200] or None,
                 json.dumps(metadata or {}, separators=(",", ":"), default=str)[:2000],
@@ -1396,12 +1404,24 @@ def record_conversation_turn(
         return int(cursor.lastrowid)
 
 
+def get_conversation_turn_by_telegram_message_id(owner_user_id: int, chat_id: int, telegram_message_id: int) -> Optional[sqlite3.Row]:
+    with _connect() as connection:
+        return connection.execute(
+            """SELECT turn_id, owner_user_id, chat_id, role, text, source_message_id,
+                      telegram_message_id, reply_to_message_id, business_connection_id, metadata_json, created_at
+               FROM conversation_turns
+               WHERE owner_user_id = ? AND chat_id = ? AND telegram_message_id = ?
+               ORDER BY turn_id DESC LIMIT 1""",
+            (int(owner_user_id), int(chat_id), int(telegram_message_id)),
+        ).fetchone()
+
+
 def list_conversation_turns(owner_user_id: int, chat_id: int, limit: int = 24) -> List[sqlite3.Row]:
     bounded_limit = max(1, min(int(limit), 200))
     with _connect() as connection:
         rows = connection.execute(
             """SELECT turn_id, owner_user_id, chat_id, role, text, source_message_id,
-                      reply_to_message_id, business_connection_id, metadata_json, created_at
+                      telegram_message_id, reply_to_message_id, business_connection_id, metadata_json, created_at
                FROM conversation_turns
                WHERE owner_user_id = ? AND chat_id = ?
                ORDER BY turn_id DESC LIMIT ?""",
