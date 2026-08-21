@@ -1359,6 +1359,13 @@ def mark_ad_delivery_sent(delivery_id: str, telegram_message_id: Optional[int]) 
         return cursor.rowcount == 1
 
 
+def mark_ad_delivery_dead_letter(delivery_id: str, error: str) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE ad_deliveries SET status = 'dead_letter', attempt_count = MAX(attempt_count, 3), last_error = ?, updated_at = ? WHERE delivery_id = ? AND status IN ('pending', 'sending', 'failed')", (str(error or "non_retryable_delivery_failure")[:200], utc_now(), str(delivery_id)[:160]))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
 def mark_ad_delivery_failed(delivery_id: str, error: str) -> bool:
     now = utc_now()
     with _connect() as connection:
