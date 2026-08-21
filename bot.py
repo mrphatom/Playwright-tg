@@ -345,6 +345,7 @@ async def configure_bot_profile(bot) -> None:
         BotCommand("dashboard", "Open the secure operations dashboard"),
         BotCommand("upgrade", "View Pro and Max Telegram Stars plans"),
         BotCommand("stars", "View the bot Telegram Stars balance and revenue"),
+        BotCommand("withdrawstars", "Open the owner-side Telegram Stars withdrawal flow"),
         BotCommand("referral", "Create your referral link"),
         BotCommand("report", "Open a support or safety report"),
         BotCommand("appeal", "Open an account review appeal"),
@@ -3778,6 +3779,31 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer(ok=False, error_message="This invoice is no longer valid. Please create a new one with /upgrade.")
 
 
+def enqueue_subscription_purchase_alert(user_id: int, payment_plan: str, amount: int, order_id: str) -> int:
+    body = (
+        "A Telegram Stars subscription purchase was completed.\n"
+        f"Plan: {str(payment_plan).title()}\n"
+        f"Amount: {int(amount):,} Stars\n"
+        f"Customer Telegram ID: {int(user_id)}\n"
+        f"Order: {str(order_id)[:120]}"
+    )
+    queued = 0
+    for administrator_id in sorted(admin_ids()):
+        try:
+            _, created = enqueue_user_notification(
+                administrator_id,
+                "payment",
+                "New GreyAI subscription purchase",
+                body,
+                f"payment-admin-alert:{administrator_id}:{str(order_id)[:120]}",
+            )
+            if created:
+                queued += 1
+        except Exception:
+            logger.exception("subscription_admin_alert_enqueue_failed admin_id=%s order_id=%s", administrator_id, str(order_id)[:120])
+    return queued
+
+
 @restricted
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payment = update.message.successful_payment
@@ -3806,6 +3832,8 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         if referral_id:
             log_audit(user_id, "referral", None, f"QUALIFIED_{referral_id}")
         log_audit(user_id, "successful_payment", None, f"GRANTED_{payment_plan.upper()}_{order['order_id']}")
+        queued_alerts = enqueue_subscription_purchase_alert(user_id, payment_plan, payment.total_amount, order["order_id"])
+        log_audit(user_id, "successful_payment", None, f"ADMIN_ALERTS_QUEUED_{queued_alerts}")
         await update.message.reply_text(f"✅ {payment_plan.title()} access activated for 30 days. Your quota has been increased.")
     else:
         await update.message.reply_text("✅ This payment was already processed.")
@@ -4284,9 +4312,39 @@ async def stars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def withdraw_stars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        balance = await context.bot.get_my_star_balance()
+        balance_stars = _star_amount_value(balance)
+    except TelegramError as exc:
+        logger.warning("telegram_stars_withdrawal_balance_failed error_type=%s", type(exc).__name__)
+        log_audit(update.effective_user.id, "/withdrawstars", None, "TELEGRAM_API_ERROR")
+        return await update.message.reply_text("⚠️ The bot’s Stars balance is temporarily unavailable. Please try /withdrawstars again shortly.")
+    except Exception as exc:
+        logger.exception("telegram_stars_withdrawal_balance_unexpected_failure error_type=%s", type(exc).__name__)
+        log_audit(update.effective_user.id, "/withdrawstars", None, "UNEXPECTED_ERROR")
+        return await update.message.reply_text("⚠️ The withdrawal handoff could not be prepared. The failure was logged without exposing payment or wallet details.")
+
+    if balance_stars <= 0:
+        log_audit(update.effective_user.id, "/withdrawstars", None, "NO_STARS_AVAILABLE")
+        return await update.message.reply_text("⭐ The bot currently has no Stars available for withdrawal.")
+
+    log_audit(update.effective_user.id, "/withdrawstars", None, f"WITHDRAWAL_HANDOFF_PRESENTED_{balance_stars}")
+    await update.message.reply_text(
+        "⭐ <b>Telegram Stars withdrawal handoff</b>\n\n"
+        f"Current bot balance: <b>{balance_stars:,} Stars</b>\n\n"
+        "Telegram does not expose the owner withdrawal operation through the Bot API. GreyAI therefore cannot transfer Stars, collect your wallet address, request your Telegram 2FA password, or store a seed phrase.\n\n"
+        "To withdraw, open the bot owner’s Telegram Balance/Monetization page, choose the bot, select <b>Withdraw</b>, and complete the official Fragment flow. Select the amount and enter the TON wallet directly on Telegram/Fragment.\n\n"
+        "Never send a wallet seed phrase, private key, recovery code, or Telegram 2FA password to GreyAI.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open Fragment", url="https://fragment.com/")]]),
+    )
+
+
+@admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /banned, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /announce <message>, /dm <id> <message>, /massdm <ids> | <message>, /massrole <users|developers|admins> | <message>, /massban <ids> | <reason>, /massunban <ids>, /massappeals <resolved|denied> <ids> | <resolution>, /confirmbulk <job_id> <token>, /analytics, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>, /allowchannel <channel_id>, /disallowchannel <channel_id>, /allowdomain <pattern>, /disallowdomain <pattern>, /resetdomain <pattern>, /domains"
+        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /banned, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /announce <message>, /dm <id> <message>, /massdm <ids> | <message>, /massrole <users|developers|admins> | <message>, /massban <ids> | <reason>, /massunban <ids>, /massappeals <resolved|denied> <ids> | <resolution>, /confirmbulk <job_id> <token>, /analytics, /stars, /starsbalance, /withdrawstars, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>, /allowchannel <channel_id>, /disallowchannel <channel_id>, /allowdomain <pattern>, /disallowdomain <pattern>, /resetdomain <pattern>, /domains"
     )
 
 
@@ -5849,6 +5907,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status, /maintenance_log — view current status and timestamped status history\n"
         "/analytics — top users, top referrers, suspicious queue, and most risky accounts\n"
         "/stars or /starsbalance — view the bot’s current Telegram Stars balance and recent revenue summary\n"
+        "/withdrawstars — open the owner-side Telegram/Fragment withdrawal handoff\n"
+        "Admins receive a durable alert when a Pro or Max subscription is successfully purchased.\n"
         "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n"
         "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n"
         "/allowdomain &lt;domain|*.domain&gt;, /disallowdomain &lt;pattern&gt;, /resetdomain &lt;pattern&gt;, /domains\n\n"
@@ -5964,6 +6024,7 @@ def main():
     app.add_handler(CommandHandler("analytics", analytics_command))
     app.add_handler(CommandHandler("stars", stars_command))
     app.add_handler(CommandHandler("starsbalance", stars_command))
+    app.add_handler(CommandHandler("withdrawstars", withdraw_stars_command))
     app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("upgrade", upgrade_command))
     app.add_handler(CallbackQueryHandler(upgrade_plan_callback, pattern=r"^upgrade:(pro|max)$"))
