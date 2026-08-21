@@ -111,6 +111,8 @@ from control_plane import (
     list_developer_events,
     get_maintenance_state,
     set_maintenance_state,
+    update_maintenance_recovery_progress,
+    recover_automatic_maintenance,
     list_maintenance_events,
     save_runtime_snapshot,
     create_queue_entry,
@@ -199,6 +201,10 @@ AD_CAMPAIGN_COOLDOWN_SECONDS = max(3600, min(7 * 86400, int(os.getenv("AD_CAMPAI
 MAINTENANCE_FEATURE_ENABLED = os.getenv("MAINTENANCE_FEATURE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 MAINTENANCE_SCHEDULER_POLL_SECONDS = max(5, min(60, int(os.getenv("MAINTENANCE_SCHEDULER_POLL_SECONDS", "15"))))
 CRASH_FAILSAFE_ENABLED = os.getenv("CRASH_FAILSAFE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_RECOVERY_ENABLED = os.getenv("AUTO_RECOVERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_RECOVERY_POLL_SECONDS = max(10, min(300, int(os.getenv("AUTO_RECOVERY_POLL_SECONDS", "30"))))
+AUTO_RECOVERY_STABILITY_CHECKS = max(2, min(20, int(os.getenv("AUTO_RECOVERY_STABILITY_CHECKS", "3"))))
+AUTO_RECOVERY_PROBE_TIMEOUT_SECONDS = max(2, min(30, int(os.getenv("AUTO_RECOVERY_PROBE_TIMEOUT_SECONDS", "8"))))
 QUEUE_ENABLED = os.getenv("QUEUE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 QUEUE_MAX_DEPTH = max(1, min(1000, int(os.getenv("QUEUE_MAX_DEPTH", "100"))))
 QUEUE_POLL_SECONDS = max(0.2, min(10.0, float(os.getenv("QUEUE_POLL_SECONDS", "1"))))
@@ -229,6 +235,7 @@ ALLOWED_CHANNEL_IDS = {
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 notification_worker_task = None
 maintenance_scheduler_task = None
+recovery_monitor_task = None
 provider_metrics = {
     "text_attempts": 0,
     "media_attempts": 0,
@@ -885,6 +892,9 @@ runtime_metrics = {
     "queue_rejected": 0,
     "queue_failures": 0,
     "crash_failsafe_events": 0,
+    "recovery_probes": 0,
+    "recovery_probe_failures": 0,
+    "automatic_recoveries": 0,
 }
 
 # ==========================================
@@ -3262,8 +3272,106 @@ async def restore_schedules_from_db(context_bot):
         logger.info("Restored %s scheduled briefing(s) from SQLite.", restored_count)
 
 
+def _is_automatic_failsafe_state(state: Dict[str, Any]) -> bool:
+    if state.get("mode") != "hard_maintenance":
+        return False
+    metadata = state.get("metadata") or {}
+    if metadata.get("source") == "automatic_failsafe":
+        return True
+    return str(state.get("reason") or "").strip() == "An unexpected runtime failure triggered the automatic safety stop."
+
+
+async def _probe_recovery_dependencies(application: Application) -> tuple[bool, str]:
+    async def probe() -> tuple[bool, str]:
+        get_queue_stats()
+        get_maintenance_state()
+        if not pool.browser or not pool.browser.is_connected():
+            if pool.browser:
+                try:
+                    await pool.browser.close()
+                except Exception:
+                    pass
+            if pool.playwright:
+                try:
+                    await pool.playwright.stop()
+                except Exception:
+                    pass
+            pool.browser = None
+            pool.playwright = await async_playwright().start()
+            pool.browser = await pool.playwright.chromium.launch(
+                headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            await restore_watchers_from_db(application.bot)
+            await restore_schedules_from_db(application.bot)
+        if not pool.browser or not pool.browser.is_connected():
+            return False, "browser_unavailable"
+        await application.bot.get_me()
+        return True, "healthy"
+
+    try:
+        return await asyncio.wait_for(probe(), timeout=AUTO_RECOVERY_PROBE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return False, "probe_timeout"
+    except TelegramError:
+        return False, "telegram_unavailable"
+    except Exception as exc:
+        logger.warning("automatic_recovery_probe_failed error_type=%s", type(exc).__name__)
+        return False, type(exc).__name__
+
+
+async def automatic_recovery_worker(application: Application) -> None:
+    logger.info("automatic_recovery_monitor_started")
+    consecutive_healthy = 0
+    try:
+        while True:
+            if not AUTO_RECOVERY_ENABLED or not MAINTENANCE_FEATURE_ENABLED:
+                await asyncio.sleep(AUTO_RECOVERY_POLL_SECONDS)
+                continue
+            state = get_maintenance_state()
+            if not _is_automatic_failsafe_state(state):
+                consecutive_healthy = 0
+                await asyncio.sleep(AUTO_RECOVERY_POLL_SECONDS)
+                continue
+            incident_id = str(state.get("incident_id") or "")
+            if not incident_id:
+                logger.warning("automatic_recovery_skipped_without_incident_id")
+                await asyncio.sleep(AUTO_RECOVERY_POLL_SECONDS)
+                continue
+            runtime_metrics["recovery_probes"] += 1
+            healthy, probe_status = await _probe_recovery_dependencies(application)
+            if healthy:
+                consecutive_healthy += 1
+                runtime_metrics["recovery_probe_failures"] = max(0, runtime_metrics["recovery_probe_failures"])
+                update_maintenance_recovery_progress(incident_id, consecutive_healthy, datetime.now(timezone.utc).replace(microsecond=0).isoformat(), probe_status)
+                recovered = recover_automatic_maintenance(incident_id, AUTO_RECOVERY_STABILITY_CHECKS)
+                if recovered:
+                    runtime_metrics["automatic_recoveries"] += 1
+                    public_body = "GreyAI has automatically recovered after consecutive health checks passed. Browser and task services are available again."
+                    for row in list_users_by_status(None, 500):
+                        try:
+                            user_id = int(row["telegram_user_id"])
+                            enqueue_safe_user_notification(user_id, "maintenance", "GreyAI service restored", public_body, f"recovery:{incident_id}:user:{user_id}")
+                        except Exception:
+                            logger.exception("recovery_user_notification_enqueue_failed")
+                    for administrator_id in admin_ids():
+                        try:
+                            await application.bot.send_message(chat_id=administrator_id, text=f"✅ GreyAI automatically recovered. Incident: {incident_id}. The service passed {AUTO_RECOVERY_STABILITY_CHECKS} consecutive health checks and returned to operational mode.")
+                        except TelegramError:
+                            logger.warning("recovery_admin_notification_failed incident_id=%s", incident_id)
+                    logger.warning("automatic_recovery_completed incident_id=%s stability_checks=%s", incident_id, AUTO_RECOVERY_STABILITY_CHECKS)
+                    consecutive_healthy = 0
+            else:
+                consecutive_healthy = 0
+                runtime_metrics["recovery_probe_failures"] += 1
+                update_maintenance_recovery_progress(incident_id, 0, datetime.now(timezone.utc).replace(microsecond=0).isoformat(), "failed", probe_status)
+            await asyncio.sleep(AUTO_RECOVERY_POLL_SECONDS)
+    except asyncio.CancelledError:
+        logger.info("automatic_recovery_monitor_stopped")
+        raise
+
+
 async def post_init(application: Application):
-    global notification_worker_task, maintenance_scheduler_task
+    global notification_worker_task, maintenance_scheduler_task, recovery_monitor_task
     provider_alerts.attach_bot(application.bot)
     try:
         await start_browser_pool(application)
@@ -3279,17 +3387,22 @@ async def post_init(application: Application):
         application.bot_data["maintenance_scheduler_task"] = maintenance_scheduler_task
     if AD_CAMPAIGNS_ENABLED:
         await restore_ad_campaigns_from_db(application.bot)
+    if AUTO_RECOVERY_ENABLED and MAINTENANCE_FEATURE_ENABLED:
+        recovery_monitor_task = asyncio.create_task(automatic_recovery_worker(application))
+        application.bot_data["recovery_monitor_task"] = recovery_monitor_task
     await configure_bot_profile(application.bot)
 
 
 async def stop_browser_pool(application: Application):
-    global notification_worker_task, maintenance_scheduler_task
+    global notification_worker_task, maintenance_scheduler_task, recovery_monitor_task
     provider_alerts.shutdown()
     await stop_queue_dispatcher()
     if notification_worker_task and not notification_worker_task.done():
         notification_worker_task.cancel()
     if maintenance_scheduler_task and not maintenance_scheduler_task.done():
         maintenance_scheduler_task.cancel()
+    if recovery_monitor_task and not recovery_monitor_task.done():
+        recovery_monitor_task.cancel()
     for task in application.bot_data.get("ephemeral_message_tasks", set()):
         task.cancel()
     dashboard_task = application.bot_data.get("dashboard_task")
@@ -4068,6 +4181,7 @@ def _runtime_snapshot_payload(operation_id: Optional[str] = None) -> Dict[str, A
         "queue": queue,
         "active_watchers": sum(len(items) for items in active_watchers.values()),
         "active_schedules": len(active_schedules),
+        "active_ad_campaigns": len(active_ad_campaigns),
         "operation_id": str(operation_id or "")[:100] or None,
         "browser_ready": bool(pool.browser),
     }
@@ -4103,7 +4217,7 @@ async def enter_hard_maintenance(bot, error: Any, operation_id: Optional[str] = 
             "GreyAI is temporarily unavailable while the service is being stabilized. Existing chats remain safe; browser tasks are paused.",
             "An unexpected runtime failure triggered the automatic safety stop.",
             incident_id=incident_id,
-            metadata={"snapshot_id": snapshot_id, "error_type": type(error).__name__},
+            metadata={"source": "automatic_failsafe", "recovery_state": "awaiting_probe", "consecutive_healthy_checks": 0, "snapshot_id": snapshot_id, "error_type": type(error).__name__},
         )
         runtime_metrics["crash_failsafe_events"] += 1
         public_body = f"GreyAI has entered hard maintenance after an unexpected service failure. Browser tasks are paused while the issue is investigated. Incident: {incident_id}."
@@ -6266,7 +6380,7 @@ def build_health_report() -> str:
         f"Active schedules: `{len(active_schedules)}`\n"
         f"Queue: `{queue.get('queued', 0)} queued / {queue.get('running', 0)} running` | Avg task: `{queue.get('average_completed_seconds', 0)}s`\n"
         f"Commands: `{runtime_metrics['commands_total']}` | Browser attempts: `{runtime_metrics['browser_tasks_total']}`\n"
-        f"Failures: `{runtime_metrics['failures_total']}` | Queue rejected: `{runtime_metrics['queue_rejected']}` | Crash failsafe: `{runtime_metrics['crash_failsafe_events']}`\n"
+        f"Failures: `{runtime_metrics['failures_total']}` | Queue rejected: `{runtime_metrics['queue_rejected']}` | Crash failsafe: `{runtime_metrics['crash_failsafe_events']}` | Recovery probes: `{runtime_metrics['recovery_probes']}` | Probe failures: `{runtime_metrics['recovery_probe_failures']}` | Auto recoveries: `{runtime_metrics['automatic_recoveries']}`\n"
         f"Gemini attempts: `{provider_metrics['text_attempts'] + provider_metrics['media_attempts']}` | Quota failures: `{provider_metrics['quota_failures']}`\n"
         f"Custom Search: `{'enabled' if GOOGLE_CUSTOM_SEARCH_ENABLED and google_custom_search_provider.configured else 'disabled/not configured'}` | Attempts: `{provider_metrics['search_attempts']}` | Failures: `{provider_metrics['search_failures']}`\n"
         f"Model failures: `{provider_metrics['model_failures']}` | Fallback successes: `{provider_metrics['fallback_successes']}`\n"

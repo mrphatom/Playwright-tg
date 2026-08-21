@@ -862,6 +862,68 @@ def set_maintenance_state(mode: str, message: str = "", reason: str = "", actor_
     return get_maintenance_state()
 
 
+def update_maintenance_recovery_progress(incident_id: str, consecutive_successes: int, last_probe_at: str, last_probe_status: str, probe_error_type: Optional[str] = None) -> bool:
+    clean_incident = str(incident_id or "")[:100]
+    if not clean_incident:
+        return False
+    with _connect() as connection:
+        row = connection.execute("SELECT mode, incident_id, metadata_json FROM maintenance_state WHERE singleton_id = 1").fetchone()
+        if not row or row["mode"] != "hard_maintenance" or row["incident_id"] != clean_incident:
+            return False
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        source = str(metadata.get("source") or "")
+        if source in {"telegram_command", "scheduled_maintenance_worker"}:
+            return False
+        metadata.update({
+            "source": "automatic_failsafe",
+            "recovery_state": "probing",
+            "consecutive_healthy_checks": max(0, min(int(consecutive_successes), 100)),
+            "last_probe_at": str(last_probe_at or "")[:80],
+            "last_probe_status": str(last_probe_status or "unknown")[:40],
+        })
+        if probe_error_type:
+            metadata["last_probe_error_type"] = str(probe_error_type)[:100]
+        else:
+            metadata.pop("last_probe_error_type", None)
+        cursor = connection.execute("UPDATE maintenance_state SET metadata_json = ?, updated_at = ? WHERE singleton_id = 1 AND mode = 'hard_maintenance' AND incident_id = ?", (json.dumps(metadata, separators=(",", ":"))[:4000], utc_now(), clean_incident))
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def recover_automatic_maintenance(incident_id: str, stability_checks: int) -> Optional[Dict[str, Any]]:
+    clean_incident = str(incident_id or "")[:100]
+    required_checks = max(1, min(int(stability_checks), 100))
+    if not clean_incident:
+        return None
+    now = utc_now()
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT mode, message, reason, incident_id, started_at, ends_at, metadata_json FROM maintenance_state WHERE singleton_id = 1").fetchone()
+        if not row or row["mode"] != "hard_maintenance" or row["incident_id"] != clean_incident:
+            connection.rollback()
+            return None
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        source = str(metadata.get("source") or "")
+        healthy_checks = int(metadata.get("consecutive_healthy_checks", 0) or 0)
+        if source in {"telegram_command", "scheduled_maintenance_worker"} or healthy_checks < required_checks:
+            connection.rollback()
+            return None
+        metadata.update({"source": "automatic_recovery", "recovery_state": "recovered", "recovered_at": now, "stability_checks": required_checks})
+        message = "GreyAI has automatically recovered after the service passed its stability checks."
+        reason = "Automatic failsafe recovery completed after consecutive healthy probes."
+        connection.execute("UPDATE maintenance_state SET mode = 'operational', message = ?, reason = ?, started_at = NULL, ends_at = NULL, updated_at = ?, metadata_json = ? WHERE singleton_id = 1 AND mode = 'hard_maintenance' AND incident_id = ?", (message, reason, now, json.dumps(metadata, separators=(",", ":"))[:4000], clean_incident))
+        event_id = "mnt_" + secrets.token_urlsafe(8)
+        connection.execute("INSERT INTO maintenance_events (event_id, mode, message, reason, incident_id, actor_user_id, metadata_json, created_at) VALUES (?, 'operational', ?, ?, ?, NULL, ?, ?)", (event_id, message, reason, clean_incident, json.dumps(metadata, separators=(",", ":"))[:4000], now))
+        connection.commit()
+    return get_maintenance_state()
+
+
 def list_maintenance_events(limit: int = 50) -> List[sqlite3.Row]:
     with _connect() as connection:
         return connection.execute("SELECT event_id, mode, message, reason, incident_id, actor_user_id, metadata_json, created_at FROM maintenance_events ORDER BY created_at DESC LIMIT ?", (max(1, min(int(limit), 200)),)).fetchall()
