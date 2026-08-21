@@ -439,3 +439,15 @@ def test_ad_campaign_pause_alert_is_idempotent_keyed(monkeypatch):
     assert captured[0][4] == "ad-campaign-paused:ad_alert"
     assert "2 distinct targets" in captured[0][3]
     assert "TELEGRAM_BOT_TOKEN" not in captured[0][3]
+
+
+def test_platform_activity_summary_is_aggregate_only(platform_db):
+    cp.ensure_user(101, "alice", "Alice")
+    cp.ensure_user(102, "bob", "Bob")
+    summary = cp.get_platform_activity_summary()
+    assert summary["active_users_5m"] >= 2
+    assert summary["active_operations"] == 0
+    assert summary["queue"]["queued"] == 0
+    assert summary["queue"]["running"] == 0
+    assert "users" not in summary
+    assert "identities" not in summary
