@@ -671,12 +671,12 @@ def test_scheme_less_schedule_is_web_automation_request():
 def test_chat_prompt_includes_bounded_history_and_current_message():
     history = [
         {"role": "user", "text": f"old-{index}"}
-        for index in range(20)
+        for index in range(60)
     ]
     prompt = build_chat_prompt("What should I do next?", history)
 
     assert "What should I do next?" in prompt
-    assert "old-19" in prompt
+    assert "old-59" in prompt
     assert "old-0" not in prompt
     assert len(prompt) < 12000
 
@@ -1593,7 +1593,7 @@ def test_natural_language_chat_reply_uses_telegram_html(monkeypatch):
     monkeypatch.setattr(bot, "remember_chat_turn", lambda *args: None)
     monkeypatch.setattr(bot, "log_audit", lambda *args: None)
 
-    async def fake_chat_reply(chat_id, text, private_chat=False):
+    async def fake_chat_reply(chat_id, text, private_chat=False, **kwargs):
         return "1. **Sell this**\n* Use `cash` & stay safe."
 
     monkeypatch.setattr(bot, "generate_chat_reply", fake_chat_reply)
@@ -1772,3 +1772,93 @@ def test_enabled_custom_search_normalizes_google_model_url(monkeypatch):
     })
 
     assert plan == {"mode": "search", "query": "latest headlines", "discovered_url": True}
+
+
+def test_chat_turn_survives_in_memory_reset_and_is_shared_by_owner(monkeypatch):
+    import bot
+
+    bot.chat_histories.clear()
+    bot.remember_chat_turn(
+        7001,
+        "We were planning the launch timeline",
+        "Right, the next step was drafting the checklist.",
+        owner_user_id=6411860985,
+        source_message_id=101,
+    )
+    bot.chat_histories.clear()
+
+    history = bot.load_chat_history(6411860985, 7001, limit=10)
+
+    assert [turn["text"] for turn in history] == [
+        "We were planning the launch timeline",
+        "Right, the next step was drafting the checklist.",
+    ]
+
+
+def test_generate_chat_reply_loads_durable_context_after_provider_failover(monkeypatch):
+    import bot
+
+    bot.chat_histories.clear()
+    bot.remember_chat_turn(7002, "The project is called GreyAI", "Got it.", owner_user_id=6411860985)
+    captured = {}
+
+    async def fake_generate(prompt, config):
+        captured["prompt"] = prompt
+        return "I remember GreyAI."
+
+    monkeypatch.setattr(bot.gemini_provider, "generate_text", fake_generate)
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+    bot.gemini_provider.last_successful_key_slot = 3
+
+    reply = asyncio.run(bot.generate_chat_reply(7002, "What is the project called?", owner_user_id=6411860985))
+
+    assert reply == "I remember GreyAI."
+    assert "The project is called GreyAI" in captured["prompt"]
+
+
+def test_reply_target_context_is_available_to_prompt_and_contact_log():
+    import bot
+
+    replied = SimpleNamespace(
+        message_id=77,
+        text="The checklist has three steps.",
+        caption=None,
+        from_user=SimpleNamespace(id=6411860985, is_bot=True, username="GreyBrowserBot"),
+    )
+    message = SimpleNamespace(
+        message_id=78,
+        text="Which step should I do first?",
+        caption=None,
+        reply_to_message=replied,
+    )
+
+    context = bot.extract_reply_context(message)
+    prompt = bot.build_chat_prompt(
+        "Which step should I do first?",
+        [],
+        reply_context=context,
+    )
+    bot.record_contact_log(6411860985, 7003, "message", "Which step should I do first?", 78, reply_to_message_id=77)
+
+    assert context["text"] == "The checklist has three steps."
+    assert "The checklist has three steps." in prompt
+    assert bot.list_contact_logs(6411860985, 7003, limit=10)[0]["reply_to_message_id"] == 77
+
+
+def test_contact_log_redacts_credentials_and_keeps_reply_metadata():
+    import bot
+
+    bot.record_contact_log(
+        6411860985,
+        7004,
+        "message",
+        "Use api_key=super-secret-value for the next step",
+        message_id=88,
+        reply_to_message_id=87,
+    )
+
+    row = bot.list_contact_logs(6411860985, 7004, limit=1)[0]
+
+    assert "super-secret-value" not in row["message_text"]
+    assert "[redacted]" in row["message_text"]
+    assert row["reply_to_message_id"] == 87
