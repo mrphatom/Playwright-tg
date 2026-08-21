@@ -1508,6 +1508,52 @@ def test_llm_unified_gate_overrides_chat_route_for_agent_plan(monkeypatch):
     assert not any("can't browse" in text.lower() or "cannot browse" in text.lower() for text in message.edits)
 
 
+def test_unified_chat_reply_avoids_second_model_round_trip(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        text = "What should we work on today?"
+        caption = None
+        chat_id = 7792
+        message_id = 902
+        business_connection_id = None
+
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kwargs):
+            self.sent.append((text, kwargs))
+            return SimpleNamespace(message_id=903)
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        message=message,
+        business_message=None,
+        channel_post=None,
+        effective_message=message,
+        effective_chat=SimpleNamespace(id=message.chat_id, type="private"),
+        effective_user=SimpleNamespace(id=42),
+    )
+
+    async def fake_interpreter(*args, **kwargs):
+        return {"mode": "chat", "reply": "Let’s focus on the next useful thing."}
+
+    async def fail_second_chat_call(*args, **kwargs):
+        raise AssertionError("chat mode must not make a second model round-trip")
+
+    monkeypatch.setattr(bot, "parse_natural_language_intent", fake_interpreter)
+    monkeypatch.setattr(bot, "classify_message_route", lambda request: "chat")
+    monkeypatch.setattr(bot, "generate_chat_reply", fail_second_chat_call)
+    monkeypatch.setattr(bot, "record_contact_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+
+    asyncio.run(bot._process_natural_language(update, SimpleNamespace()))
+
+    assert message.sent
+    assert "next useful thing" in message.sent[0][0]
+
+
 def test_private_chat_prompt_is_distinct_from_group_prompt():
     import bot
 
@@ -1704,6 +1750,9 @@ def test_natural_language_chat_reply_uses_telegram_html(monkeypatch):
 
     monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
     monkeypatch.setattr(bot, "classify_message_route", lambda request: "chat")
+    async def no_interpreted_chat_reply(*args, **kwargs):
+        return None
+    monkeypatch.setattr(bot, "parse_natural_language_intent", no_interpreted_chat_reply)
     monkeypatch.setattr(bot, "remember_chat_turn", lambda *args: None)
     monkeypatch.setattr(bot, "log_audit", lambda *args: None)
 
