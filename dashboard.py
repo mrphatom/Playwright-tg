@@ -14,6 +14,8 @@ from typing import Any, Dict, Optional
 
 from aiohttp import web
 
+from api_contract import developer_api_contract
+
 from control_plane import (
     admin_ids,
     ensure_user,
@@ -58,6 +60,15 @@ CSRF_COOKIE = "greyai_csrf"
 
 def _json_rows(rows):
     return [dict(row) for row in rows]
+
+
+def developer_api_docs() -> Dict[str, Any]:
+    """Return the redacted, authoritative contract used by Grey’s API guidance."""
+    return developer_api_contract(os.getenv("DASHBOARD_BASE_URL"))
+
+
+async def developer_api_docs_handler(request: web.Request):
+    return web.json_response(developer_api_docs())
 
 
 def _session_from_request(request: web.Request):
@@ -451,6 +462,7 @@ def create_dashboard_app() -> web.Application:
         web.get("/api/status/events", public_maintenance_events_handler),
         web.get("/api/health", health_handler),
         web.post("/api/v1/check", api_check_handler),
+        web.get("/api/v1/docs", developer_api_docs_handler),
         web.get("/api/v1/keys", developer_keys_handler),
         web.post("/api/v1/keys", developer_key_create_handler),
         web.delete("/api/v1/keys/{key_id}", developer_key_revoke_handler),

@@ -2980,3 +2980,99 @@ def test_group_membership_onboarding_explains_enable_flow(monkeypatch):
     assert settings == [(-100555, "supergroup", False, 777)]
     assert replies and "/enablegreyai" in replies[0]
     assert "@GreyBrowserBot" in replies[0]
+
+
+def test_natural_language_parser_skips_provider_for_unambiguous_web_request(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+
+    class Provider:
+        async def generate_text(self, *args, **kwargs):
+            raise AssertionError("unambiguous browser requests should use the deterministic fast path")
+
+    monkeypatch.setattr(bot, "gemini_provider", Provider())
+    plan = asyncio.run(bot.parse_natural_language_intent("Summarize https://example.com/news"))
+    assert plan["mode"] == "check"
+    assert plan["url"] == "https://example.com/news"
+
+
+def test_clean_grey_response_suppresses_adjacent_repetition():
+    import bot
+    cleaned = bot.clean_grey_response("The page is available.\n\nThe page is available.\n\nNext, I can extract the price.")
+    assert cleaned == "The page is available.\n\nNext, I can extract the price."
+    assert bot.clean_grey_response("GreyAI: GreyAI: Ready.") == "Ready."
+
+
+def test_management_parser_recognizes_verified_developer_api_example_request():
+    import bot
+    plan = bot.parse_deterministic_management_request(
+        "Give me example code for integrating my GreyAI API key with the bot I am developing"
+    )
+    assert plan == {"mode": "developer_api_example", "language": "python"}
+
+
+def test_developer_api_example_uses_shipped_contract_not_fabricated_endpoint():
+    import bot
+    example = bot.format_developer_api_example("python")
+    assert "POST" in example
+    assert "/api/v1/check" in example
+    assert "Authorization: Bearer" in example
+    assert "https://api.greybrowserbot.com/v1/endpoint" not in example
+    assert '"url"' in example
+    assert '"extract"' in example
+
+
+def test_native_context_exposes_verified_api_contract_only_to_developers(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "get_user", lambda user_id: {
+        "telegram_user_id": user_id,
+        "role": "developer",
+        "plan": "developer",
+        "status": "active",
+        "quota_used": 0,
+        "quota_limit": 250,
+    })
+    monkeypatch.setattr(bot, "is_developer", lambda user_id: True)
+    monkeypatch.setattr(bot, "get_platform_activity_summary", lambda: {"active_users_5m": 1, "active_operations": 0, "queue": {}})
+    monkeypatch.setattr(bot, "get_maintenance_state", lambda: {"mode": "operational"})
+    monkeypatch.setattr(bot, "_native_context_contact_summary", lambda *_: [])
+    monkeypatch.setattr(bot, "_native_context_operations", lambda *_: [])
+    context = bot.build_native_grey_context(42, 42, "developer_api_example")
+    contract = context["grey"]["developer_api_contract"]
+    assert contract["base_url"].endswith("playwright-tg-mrphatom.fly.dev")
+    assert contract["endpoints"][0]["path"] == "/api/v1/check"
+    assert contract["enabled_scopes"] == ["check"]
+
+
+def test_management_parser_resolves_api_example_followup_from_recent_context():
+    import bot
+    plan = bot.parse_deterministic_management_request(
+        "Give me an example code",
+        chat_history=[
+            {"role": "user", "text": "How do I integrate my GreyAI developer API key?"},
+            {"role": "assistant", "text": "Use POST /api/v1/check with the check scope."},
+        ],
+    )
+    assert plan == {"mode": "developer_api_example", "language": "python"}
+
+
+def test_native_context_uses_authoritative_admin_predicate_not_stored_role_label(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "get_user", lambda user_id: {
+        "telegram_user_id": user_id,
+        "role": "developer",
+        "plan": "developer",
+        "status": "active",
+        "quota_used": 0,
+        "quota_limit": 250,
+    })
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: True)
+    monkeypatch.setattr(bot, "is_developer", lambda user_id: True)
+    monkeypatch.setattr(bot, "get_platform_activity_summary", lambda: {"active_users_5m": 1, "active_operations": 0, "queue": {}})
+    monkeypatch.setattr(bot, "get_maintenance_state", lambda: {"mode": "operational"})
+    monkeypatch.setattr(bot, "_native_context_contact_summary", lambda *_: [])
+    monkeypatch.setattr(bot, "_native_context_operations", lambda *_: [])
+    context = bot.build_native_grey_context(42, 42, "chat")
+    assert context["requester"]["is_admin"] is True
+    assert context["requester"]["is_developer"] is True

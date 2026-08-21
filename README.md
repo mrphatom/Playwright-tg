@@ -422,10 +422,10 @@ Developer access is granted only by an administrator. Configured administrators 
 
 After approval, a developer can create a scoped integration key with `/newkey <name> check`, list metadata with `/devkeys`, revoke a key with `/revokekey <key_id>`, and view usage with `/developerstats`. The plaintext key is shown once only. The database stores a keyed digest, never the secret itself, and all key lifecycle and authorization events are audited. The initial release enables only the `check` scope; `watch`, `schedule`, and `sessions` remain reserved until their ownership and delivery semantics are reviewed.
 
-Other Telegram bots should send the key as a bearer credential to the versioned dashboard API:
+Other Telegram bots should send the key as a bearer credential to Grey’s versioned API. The live origin is `https://playwright-tg-mrphatom.fly.dev`; a redacted machine-readable contract is available at [`GET /api/v1/docs`](https://playwright-tg-mrphatom.fly.dev/api/v1/docs).
 
 ```http
-POST /api/v1/check
+POST https://playwright-tg-mrphatom.fly.dev/api/v1/check
 Authorization: Bearer gai_live.key_...
 Content-Type: application/json
 ```
@@ -439,7 +439,7 @@ Content-Type: application/json
 
 The response contains an operation ID, page title, validated URL, and redacted extraction results. It does not contain browser cookies, saved sessions, credentials, screenshots, or internal stack traces. The API enforces the same public-mode domain allowlist, SSRF protections, platform quota, browser timeout, and concurrency controls as Telegram commands. Each key also has a configurable per-minute limit, defaulting to 30 requests and capped server-side at 120.
 
-Developers can manage keys through the authenticated dashboard at `GET /api/v1/keys`, `POST /api/v1/keys`, and `DELETE /api/v1/keys/{key_id}`. Usage is available at `GET /api/v1/developer/stats`. The owner-scoped developer event feed is available in Telegram through `/devevents [after_event_id]`; use the last returned event ID as the next cursor. Dashboard mutations require the existing secure session and CSRF token; bearer keys do not grant dashboard privileges.
+Developers can ask Grey directly for a verified integration example with natural language, such as “give me Python code to integrate my GreyAI API key,” or use the administrator-approved `/help` and `/newkey` flows. Grey returns examples from the application-owned API contract rather than asking Gemini to invent an endpoint. Developers can manage keys through the authenticated dashboard at `GET /api/v1/keys`, `POST /api/v1/keys`, and `DELETE /api/v1/keys/{key_id}`. Usage is available at `GET /api/v1/developer/stats`. The owner-scoped developer event feed is available in Telegram through `/devevents [after_event_id]`; use the last returned event ID as the next cursor. Dashboard mutations require the existing secure session and CSRF token; bearer keys do not grant dashboard privileges. The only currently enabled bearer-key scope is `check`; watcher, schedule, session, login, form-filling, screenshot, and arbitrary Telegram endpoints are not part of the public API contract.
 
 ## References
 
