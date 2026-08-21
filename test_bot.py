@@ -2947,3 +2947,36 @@ def test_multimodal_provider_receives_native_grey_context(monkeypatch, tmp_path)
     assert result == "transcribed"
     assert "NATIVE GREY CONTEXT" in captured["instruction"]
     assert "untrusted user data" in captured["instruction"]
+
+
+def test_group_membership_onboarding_explains_enable_flow(monkeypatch):
+    import bot
+    replies = []
+    settings = []
+
+    class FakeMessage:
+        async def reply_text(self, text, **kwargs):
+            replies.append(text)
+
+    class FakeBot:
+        username = "GreyBrowserBot"
+
+        async def send_message(self, chat_id, text, **kwargs):
+            replies.append(text)
+
+    update = SimpleNamespace(
+        my_chat_member=SimpleNamespace(
+            chat=SimpleNamespace(id=-100555, type="supergroup", title="Test Group"),
+            old_chat_member=SimpleNamespace(status="left"),
+            new_chat_member=SimpleNamespace(status="member"),
+            from_user=SimpleNamespace(id=777, is_bot=False),
+        ),
+        message=FakeMessage(),
+        effective_chat=SimpleNamespace(id=-100555, type="supergroup"),
+    )
+    monkeypatch.setattr(bot, "get_chat_setting", lambda chat_id: None)
+    monkeypatch.setattr(bot, "set_chat_setting", lambda *args: settings.append(args))
+    asyncio.run(bot.group_membership_update_handler(update, SimpleNamespace(bot=FakeBot())))
+    assert settings == [(-100555, "supergroup", False, 777)]
+    assert replies and "/enablegreyai" in replies[0]
+    assert "@GreyBrowserBot" in replies[0]
