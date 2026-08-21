@@ -3810,3 +3810,55 @@ def test_resolve_direct_download_source_decompresses_gzip_html(monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_public_source_fallback_does_not_inject_tor_proxy(monkeypatch):
+    import bot
+
+    recorded_attempts = []
+
+    async def fake_retry(url, actions, user_id, operation_id, status_msg=None, attempts=2):
+        recorded_attempts.append((url, list(actions)))
+        return {
+            "title": "Search result",
+            "extracted": ["usable result"],
+            "screenshot": None,
+            "final_url": url,
+        }
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    monkeypatch.setattr(bot, "TOR_PUBLIC_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(bot, "tor_route_available", lambda: True)
+    monkeypatch.setattr(bot, "run_browser_task_with_retry", fake_retry)
+
+    asyncio.run(bot.run_browser_task_with_source_fallback(
+        ["https://duckduckgo.com/?q=google", "https://www.google.com/search?q=google"],
+        ["ai_extract:current result"],
+        42,
+        "public-source-tor-regression",
+    ))
+
+    assert recorded_attempts
+    assert all("proxy:tor" not in actions for _, actions in recorded_attempts)
+
+
+def test_proxy_routing_is_disabled_for_public_search_providers():
+    import bot
+
+    for url in (
+        "https://duckduckgo.com/?q=google",
+        "https://html.duckduckgo.com/html/?q=google",
+        "https://www.bing.com/search?q=google",
+        "https://search.brave.com/search?q=google",
+        "https://www.startpage.com/sp/search?query=google",
+    ):
+        assert bot.proxy_routing_allowed_for_url(url) is False
+
+
+def test_browser_failure_message_is_specific_and_safe():
+    import bot
+
+    assert "rate-limiting" in bot.browser_failure_message(RuntimeError("HTTP 429 Too Many Requests"))
+    assert "automated-traffic challenge" in bot.browser_failure_message(RuntimeError("HTTP 418 automated challenge"))
+    assert "Transparent browsing is required" in bot.browser_failure_message(PermissionError("explicit proxy routing is disabled for search providers"))
+    assert "No unsafe action was executed" in bot.browser_failure_message(RuntimeError("unexpected provider failure"))

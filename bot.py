@@ -541,13 +541,23 @@ ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAINS", "").s
 PROXY_SERVER = os.getenv("PROXY_SERVER")
 PROXY_USERNAME = os.getenv("PROXY_USERNAME")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
-TRANSPARENCY_RESTRICTED_PROXY_HOSTS = {"google.com", "www.google.com", "news.google.com", "reddit.com", "www.reddit.com"}
+TRANSPARENCY_RESTRICTED_PROXY_HOSTS = {
+    "google.com",
+    "reddit.com",
+    "duckduckgo.com",
+    "bing.com",
+    "brave.com",
+    "startpage.com",
+}
 
 
 def proxy_routing_allowed_for_url(url: str) -> bool:
-    """Do not use proxy/Tor routing on platforms where it would look like evasion."""
+    """Keep proxy/Tor routing off for search providers and other transparency-sensitive hosts."""
     hostname = (urlparse(str(url or "")).hostname or "").lower().rstrip(".")
-    return hostname not in TRANSPARENCY_RESTRICTED_PROXY_HOSTS
+    return not any(
+        hostname == root or hostname.endswith("." + root)
+        for root in TRANSPARENCY_RESTRICTED_PROXY_HOSTS
+    )
 
 # Encryption Key for Sessions at Rest
 ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY")
@@ -3571,7 +3581,10 @@ async def run_browser_task_with_source_fallback(
             )
         try:
             attempt_actions = list(actions)
-            use_tor = is_onion_url(candidate) or (index == len(candidates) - 1 and TOR_PUBLIC_FALLBACK_ENABLED and tor_route_available())
+            # Public-source fallback must remain transparent. Tor is reserved for
+            # explicitly authorized .onion navigation; it must never be injected
+            # into an ordinary Google, DuckDuckGo, Bing, Brave, or Startpage task.
+            use_tor = is_onion_url(candidate)
             if use_tor:
                 if not tor_route_allowed(candidate, user_id):
                     raise PermissionError("tor_route_unavailable_or_not_authorized")
@@ -3640,6 +3653,20 @@ async def run_browser_task_with_retry(url: str, actions: List[str], user_id: int
     update_operation(operation_id, "failed", max(1, attempts))
     asyncio.create_task(review_recent_activity_with_ai(user_id, operation_id))
     raise last_error or RuntimeError("browser task failed")
+
+
+def browser_failure_message(exc: BaseException, requested_url: str = "") -> str:
+    """Return a useful, safe explanation without exposing provider internals."""
+    text = str(exc or "").lower()
+    if "explicit proxy routing is disabled" in text or "tor_route_unavailable" in text:
+        return "Transparent browsing is required for this provider, so GreyAI blocked the proxy/Tor route instead of bypassing its controls."
+    if "429" in text or "too many requests" in text or "rate limit" in text:
+        return "The provider is temporarily rate-limiting this request. GreyAI did not bypass the limit; please try again later or use another approved source."
+    if "418" in text or "automated" in text or "challenge" in text or "captcha" in text:
+        return "The provider returned an automated-traffic challenge. GreyAI stopped safely instead of attempting to bypass it."
+    if "proxy" in text or "tor" in text:
+        return "The configured browsing route was unavailable. GreyAI stopped safely without attempting an evasive fallback."
+    return "The approved web source could not complete the check. No unsafe action was executed."
 
 
 def priority_for_user(user_id: int) -> int:
@@ -4359,7 +4386,7 @@ async def run_browser_task(url: str, actions: List[str], user_id: int, status_ms
     }
 
     if ("proxy:tor" in actions or "proxy:on" in actions) and not proxy_routing_allowed_for_url(url):
-        raise PermissionError("explicit proxy routing is disabled for Google and Reddit")
+        raise PermissionError("explicit proxy routing is disabled for search providers and transparency-sensitive hosts")
     if "proxy:tor" in actions:
         if not TOR_PROXY_SERVER:
             raise RuntimeError("Tor proxy is not configured")
@@ -7442,11 +7469,11 @@ async def _process_natural_language(
             await status_msg.edit_text(
                 f"❌ The request exceeded the {COMMAND_TIMEOUT}-second timeout."
             )
-        except Exception:
+        except Exception as exc:
             runtime_metrics["failures_total"] += 1
             logger.exception("Natural-language check failed operation_id=%s", operation_id)
             log_audit(user_id, "natural_language", plan["url"], "ERROR")
-            await status_msg.edit_text("❌ The web check failed. No unsafe action was executed.")
+            await status_msg.edit_text(f"❌ {browser_failure_message(exc, plan['url'])}")
         return
 
     watcher_id = uuid.uuid4().hex[:6]
