@@ -31,7 +31,7 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 - **📬 Durable User Notifications:** Ban, unban, and appeal decisions enqueue bounded, secret-free Telegram notifications in an idempotent retryable SQLite outbox delivered by a background worker.
 - **📰 Current-Fact Verification:** Questions such as “Have Cristiano Ronaldo officially announced his retirement?” are locally classified as verification tasks, converted into an allowlisted Google News search, and answered with extracted text and an optional screenshot instead of a false “I cannot access the internet” response.
 - **📣 Role-Targeted Messaging:** Administrators can preview and confirm messages to users, developers, or administrators through `/massrole`, with server-side role resolution, banned-user exclusion, audit records, and revalidation at delivery time.
-- **🟢 Maintenance Status:** Administrators can publish scheduled, degraded, or hard-maintenance updates with reasons. Users can read the current status and timestamped history through Telegram and the public dashboard status endpoints.
+- **🟢 Maintenance Status:** Administrators can publish scheduled, degraded, or hard-maintenance updates with reasons. A scheduled maintenance entry accepts a future local time and IANA timezone; the persistent worker activates hard maintenance automatically at that time, pauses browser work, and enqueues one idempotent notification per user. Users can read the current status and timestamped history through Telegram and the public dashboard status endpoints.
 - **⚖️ Priority Queueing:** Browser work uses a bounded priority queue. Administrators, Max, developers, and Pro users receive progressively higher priority; free users remain accepted fairly with an estimated wait time, while full queues fail safely.
 - **🚨 Crash Failsafe:** Unhandled runtime failures capture a sanitized SQLite snapshot, transition the service to hard maintenance, pause browser work, enqueue a public incident notice, and send administrators a diagnostic incident and snapshot reference without exposing secrets.
 - **🧰 Confirmation-Gated Administration:** Announcements, private messages, mass ban/unban, and mass appeal decisions use preview-first jobs with bounded target counts, short-lived single-use confirmation tokens, audit records, and per-item success/failure counts.
@@ -152,6 +152,14 @@ Ban, unban, and appeal decisions send the affected user a bounded notification t
 ### Maintenance, queueing, and incident recovery
 
 Administrators publish status updates with `/maintenance <mode> | <public message> | <reason>`, where mode is `operational`, `scheduled`, `degraded`, or `hard_maintenance`. Users can use `/status` and `/maintenance_log` to view the current state and timestamped history. The public dashboard exposes `GET /api/status` and `GET /api/status/events`; authenticated administrators can inspect queue depth and the latest sanitized crash snapshot at `/api/admin/runtime`.
+
+Administrators can schedule an automatic maintenance start with the fourth pipe-delimited field:
+
+```text
+/maintenance scheduled | Database migration begins soon | Planned database migration | 2026-08-22 14:30 Europe/London
+```
+
+The time must be in the future and use `YYYY-MM-DD HH:MM IANA/Timezone`. Before activation, `/maintenance_status` reports the planned start. At the configured time, GreyAI changes the state to `hard_maintenance`, pauses browser tasks, and sends durable user notifications. To cancel a scheduled window before it starts, use `/maintenance operational | Service restored | Scheduled window cancelled`.
 
 Browser tasks are admitted to a bounded priority queue. The response includes an estimated wait when work is queued. Chat replies, status reads, and maintenance commands bypass the browser queue. If an unhandled application failure reaches the global error boundary, GreyAI records a sanitized snapshot, enters hard maintenance, pauses browser work, sends a safe incident notice through the notification outbox, and alerts administrators with the incident and snapshot identifiers. Recovery should be performed by an administrator after reviewing the logs and can be published with `/maintenance operational | Service restored | Incident resolved`.
 
