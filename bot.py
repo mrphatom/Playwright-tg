@@ -6509,7 +6509,7 @@ async def _resolve_direct_download_source(url: str, user_id: int) -> str:
     headers = {"User-Agent": "GreyAI/1.0 authorized-file-retrieval", "Accept": "text/html,application/xhtml+xml"}
     seen_urls = set()
     try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers, auto_decompress=False) as session:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers, auto_decompress=True) as session:
             for depth in range(3):
                 if current_url in seen_urls:
                     raise DownloadRejected("discovery_loop")
@@ -6552,6 +6552,20 @@ async def _resolve_direct_download_source(url: str, user_id: int) -> str:
                             direct_candidates.append((score, candidate))
                         elif score and depth < 2:
                             page_candidates.append((score, candidate))
+                    for quote, encoded_metadata in re.findall(r'data-track-info\s*=\s*(["\'])(.*?)\1', html, flags=re.IGNORECASE | re.DOTALL):
+                        try:
+                            metadata = json.loads(html_unescape(encoded_metadata))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        metadata_url = str(metadata.get("fileUrl") or "").replace("\\\\/", "/").strip()
+                        if not metadata_url:
+                            continue
+                        candidate = urljoin(str(response.url), html_unescape(metadata_url))
+                        if not route_url_allowed(candidate, user_id):
+                            continue
+                        suffix = Path(urlparse(candidate).path).suffix.lower()
+                        if suffix in DOWNLOAD_ALLOWED_EXTENSIONS and suffix not in DOWNLOAD_BLOCKED_EXTENSIONS:
+                            direct_candidates.append((12, candidate))
                     if direct_candidates:
                         direct_candidates.sort(key=lambda item: (-item[0], item[1]))
                         return direct_candidates[0][1]

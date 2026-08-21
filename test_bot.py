@@ -5,6 +5,7 @@ import json
 import asyncio
 import tempfile
 import zipfile
+import gzip
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
@@ -3737,3 +3738,75 @@ def test_download_delivery_explains_missing_direct_artifact(monkeypatch):
         "❌ Download stopped safely: the approved source did not expose a direct permitted artifact. "
         "No file was delivered."
     )
+
+
+def test_resolve_direct_download_source_accepts_embedded_track_metadata_url(monkeypatch):
+    import bot
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/track":
+                metadata = (
+                    '{&quot;fileUrl&quot;:&quot;http:\\/\\/127.0.0.1:'
+                    + str(server.server_port)
+                    + '\\/files\\/free-song.mp3&quot;,&quot;fileName&quot;:&quot;free-song.mp3&quot;}'
+                )
+                body = f'<html><body><div data-track-info="{metadata}">Free song</div></body></html>'.encode()
+            else:
+                body = b"not relevant"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        resolved = asyncio.run(bot._resolve_direct_download_source(
+            f"http://127.0.0.1:{server.server_port}/track",
+            42,
+        ))
+        assert resolved.endswith("/files/free-song.mp3")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_resolve_direct_download_source_decompresses_gzip_html(monkeypatch):
+    import bot
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'<html><body><a href="/files/free-song.mp3">Download song</a></body></html>'
+            compressed = gzip.compress(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=UTF-8")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(compressed)))
+            self.end_headers()
+            self.wfile.write(compressed)
+
+        def log_message(self, format, *args):
+            return
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        resolved = asyncio.run(bot._resolve_direct_download_source(
+            f"http://127.0.0.1:{server.server_port}/track",
+            42,
+        ))
+        assert resolved.endswith("/files/free-song.mp3")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
