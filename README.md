@@ -329,6 +329,7 @@ Campaigns are previewed first and never post until the administrator confirms th
 /confirmad <campaign_id> <token>
 /adlist
 /cancelad <campaign_id>
+/resumead <campaign_id>
 ```
 
 For example:
@@ -338,6 +339,8 @@ For example:
 ```
 
 The `ai:` form uses the existing Gemini failover pool to draft concise plain-text copy. Administrators can also provide exact copy instead. Repetition is bounded, the minimum interval is one hour by default, per-chat cooldowns prevent repeated posts from different campaigns, and delivery receipts plus failures are persisted in SQLite. Interrupted sends are reclaimed safely, retried a bounded number of times, and surfaced as failed rather than retried forever. Campaigns resume after a container restart and can be cancelled with `/cancelad`.
+
+As a safety circuit breaker, a campaign is automatically paused after the configured number of distinct targets lose membership or posting permission. The default `AD_CAMPAIGN_PERMISSION_LOSS_PAUSE_THRESHOLD=2` prevents a broad campaign from repeatedly hitting inaccessible chats. Each affected target receives a durable administrator alert, and the pause is recorded with a reason and timestamp. After reviewing Telegram membership and send rights, the administrator can restore access and run `/resumead <campaign_id>`; GreyAI resets only the permission-loss dead letters for the interrupted occurrence and retries that occurrence. Set the threshold to `0` to disable automatic pausing.
 
 Natural language is supported in the administrator’s private GreyAI chat, for example: `Create an ad campaign for chat ID -1001234567890, write an honest ad about GreyAI, and send it 3 times every 2 hours.` GreyAI returns a preview and requires `/confirmad` before any external message is posted. Ordinary users and shared-chat invocations cannot create campaigns.
 
@@ -360,7 +363,7 @@ Log in once and reuse the state safely.
 
 Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and replace the starter `ALLOWED_DOMAINS` list with the domains you are prepared to permit. Public mode rejects private and loopback IP targets and refuses to operate with an empty domain allowlist. Search-provider fallbacks remain allowlist-controlled; the Fly deployment runs Tor privately on loopback for public fallback, and `.onion` hosts remain unavailable to Green/free and Pro users.
 
-Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, compare Pro and Max benefits with `/upgrade` and select either plan using Telegram buttons, or use `/upgrade pro` and `/upgrade max` for direct invoices. They can also purchase access using Telegram Stars, submit `/report` and `/appeal` tickets, request developer access with `/devrequest`, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, chat, and developer-management capabilities. Ordinary conversation is routed directly to the chat path; browser-like wording, named-site requests, schedules, watchers, and management actions remain on the task path. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, `/resolveappeal`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/adcreate`, `/confirmad`, `/adlist`, and `/cancelad` for the advertising campaign workflow.
+Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, compare Pro and Max benefits with `/upgrade` and select either plan using Telegram buttons, or use `/upgrade pro` and `/upgrade max` for direct invoices. They can also purchase access using Telegram Stars, submit `/report` and `/appeal` tickets, request developer access with `/devrequest`, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, chat, and developer-management capabilities. Ordinary conversation is routed directly to the chat path; browser-like wording, named-site requests, schedules, watchers, and management actions remain on the task path. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, `/resolveappeal`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/adcreate`, `/confirmad`, `/adlist`, `/cancelad`, and `/resumead` for the advertising campaign workflow.
 
 The current plans are **Pro at 750 Stars for 30 days with 1,000 monthly execution units** and **Max at 1,000 Stars for 30 days with 5,000 monthly execution units**. Telegram payment validation checks the selected plan, amount, currency, invoice owner, and idempotent payment record before granting the matching entitlement.
 

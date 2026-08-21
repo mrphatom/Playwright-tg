@@ -2755,3 +2755,67 @@ def test_ad_dispatch_permission_loss_dead_letters_and_alerts(monkeypatch):
     assert captured["dead"][0] == row["delivery_id"]
     assert captured["alert"] == ("ad_perm", -1001234567890, "GreyAI is no longer a member")
     assert captured["status"][2] == "failed"
+
+
+def test_ad_dispatch_stops_after_circuit_breaker_pause(monkeypatch):
+    import bot
+    sent = []
+    rows = [
+        {"delivery_id": "ad_pause:1:-1001", "target_chat_id": -1001},
+        {"delivery_id": "ad_pause:1:-1002", "target_chat_id": -1002},
+    ]
+    monkeypatch.setattr(bot, "reclaim_stale_ad_deliveries", lambda: 0)
+    monkeypatch.setattr(bot, "ensure_ad_delivery_rows", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "list_pending_ad_deliveries", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(bot, "get_ad_chat_last_sent_at", lambda target: None)
+    monkeypatch.setattr(bot, "mark_ad_delivery_sending", lambda delivery_id: True)
+    monkeypatch.setattr(bot, "mark_ad_delivery_dead_letter", lambda *args, **kwargs: True)
+    monkeypatch.setattr(bot, "enqueue_ad_permission_loss_alert", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "maybe_pause_ad_campaign_for_permission_loss", lambda campaign_id: True)
+    monkeypatch.setattr(bot, "get_ad_campaign", lambda campaign_id: {"campaign_id": campaign_id, "status": "paused"})
+    monkeypatch.setattr(bot, "update_ad_campaign_next_run", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("paused campaign must not be rescheduled")))
+
+    class FakeBot:
+        async def get_me(self):
+            return SimpleNamespace(id=999)
+
+        async def get_chat_member(self, chat_id, user_id):
+            return SimpleNamespace(status="left", can_send_messages=False)
+
+        async def get_chat(self, chat_id):
+            return SimpleNamespace(type="supergroup")
+
+        async def send_message(self, **kwargs):
+            sent.append(kwargs)
+            return SimpleNamespace(message_id=42)
+
+    result = asyncio.run(bot.dispatch_ad_campaign_occurrence({
+        "campaign_id": "ad_pause",
+        "body": "copy",
+        "target_chats_json": json.dumps([-1001, -1002]),
+        "repeat_count": 2,
+        "next_occurrence": 1,
+        "interval_seconds": 3600,
+    }, FakeBot()))
+    assert result == {"processed": 1, "succeeded": 0, "failed": 1}
+    assert sent == []
+
+
+def test_ad_pause_command_is_registered_and_helped():
+    import bot
+    captured = {}
+
+    class FakeBot:
+        async def set_my_short_description(self, value):
+            captured["short"] = value
+
+        async def set_my_description(self, value):
+            captured["description"] = value
+
+        async def set_my_commands(self, commands):
+            captured["commands"] = commands
+
+    asyncio.run(bot.configure_bot_profile(FakeBot()))
+    descriptions = {command.command: command.description for command in captured["commands"]}
+    assert "resumead" in descriptions
+    assert "permission review" in descriptions["resumead"]
