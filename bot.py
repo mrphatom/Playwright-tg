@@ -23,7 +23,7 @@ from urllib.parse import urlparse, quote_plus, parse_qs
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, InlineQueryHandler, ChosenInlineResultHandler, BusinessConnectionHandler, CallbackQueryHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, InlineQueryHandler, ChosenInlineResultHandler, BusinessConnectionHandler, ChatMemberHandler, CallbackQueryHandler, filters
 from telegram.error import TelegramError, Forbidden
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Browser, Playwright, BrowserContext
@@ -6482,6 +6482,43 @@ async def chosen_inline_result_handler(update: Update, context: ContextTypes.DEF
         log_audit(chosen.from_user.id, "inline_result", None, "CHOSEN")
 
 
+async def group_membership_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Acknowledge a new group membership and explain the privacy-preserving opt-in."""
+    membership = getattr(update, "my_chat_member", None)
+    if not membership:
+        return
+    chat = getattr(membership, "chat", None)
+    if not chat or getattr(chat, "type", None) not in {"group", "supergroup"}:
+        return
+    old_member = getattr(membership, "old_chat_member", None)
+    new_member = getattr(membership, "new_chat_member", None)
+    old_status = str(getattr(old_member, "status", "") or "")
+    new_status = str(getattr(new_member, "status", "") or "")
+    actor = getattr(membership, "from_user", None)
+    actor_id = getattr(actor, "id", None)
+    was_present = old_status in {"member", "administrator", "creator"}
+    is_present = new_status in {"member", "administrator", "creator"}
+    if is_present and not was_present:
+        # Joining never silently opts a group into reading messages. Existing
+        # enablement is reset so a re-added bot must be explicitly reviewed.
+        set_chat_setting(chat.id, chat.type, False, actor_id)
+        username = str(getattr(context.bot, "username", None) or "GreyBrowserBot").lstrip("@")
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=(
+                    "👋 GreyAI has joined this group. For privacy, I do not read or answer ordinary group messages "
+                    "until a group administrator explicitly enables me with /enablegreyai. After that, mention @"
+                    f"{username}, reply to a GreyAI message, or use /ask."
+                ),
+            )
+        except TelegramError:
+            logger.info("group_join_onboarding_message_failed", exc_info=True)
+    elif not is_present and was_present:
+        # Keep the durable scope disabled when Telegram removes the bot.
+        set_chat_setting(chat.id, chat.type, False, actor_id)
+
+
 async def _is_group_admin_or_greyai_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if not user:
@@ -6937,6 +6974,7 @@ def main():
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("enablegreyai", enable_group_command))
     app.add_handler(CommandHandler("disablegreyai", disable_group_command))
+    app.add_handler(ChatMemberHandler(group_membership_update_handler, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("allowchannel", allow_channel_command))
     app.add_handler(CommandHandler("disallowchannel", disallow_channel_command))
     app.add_handler(CommandHandler("allowdomain", allow_domain_command))
