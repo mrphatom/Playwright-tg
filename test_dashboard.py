@@ -20,6 +20,7 @@ def dashboard_db(tmp_path, monkeypatch):
 def test_dashboard_registers_developer_and_integration_routes(dashboard_db):
     paths = {resource.canonical for resource in dashboard.create_dashboard_app().router.resources()}
     assert "/api/v1/check" in paths
+    assert "/api/v1/docs" in paths
     assert "/api/v1/keys" in paths
     assert "/api/v1/keys/{key_id}" in paths
     assert "/api/v1/developer/stats" in paths
@@ -63,3 +64,11 @@ def test_dashboard_client_has_bounded_bootstrap_and_recovery_states():
     assert "Promise.allSettled" in dashboard.HTML
     assert "Dashboard data could not be loaded" in dashboard.HTML
     assert "setInterval(()=>refresh().catch(()=>{}),3000)" in dashboard.HTML
+
+
+def test_public_developer_api_contract_is_machine_readable(dashboard_db):
+    response = dashboard.developer_api_docs()
+    assert response["base_url"].endswith("playwright-tg-mrphatom.fly.dev")
+    assert response["enabled_scopes"] == ["check"]
+    assert response["endpoints"][0]["method"] == "POST"
+    assert response["endpoints"][0]["path"] == "/api/v1/check"

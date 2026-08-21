@@ -34,6 +34,7 @@ from telegram import LabeledPrice
 from telegram.ext import PreCheckoutQueryHandler
 
 from dashboard import serve_dashboard
+from api_contract import developer_api_contract, format_developer_api_example
 
 from control_plane import (
     init_platform_db,
@@ -151,6 +152,7 @@ MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", "12000000"))
 MAX_MEDIA_CONTEXT_CHARS = int(os.getenv("MAX_MEDIA_CONTEXT_CHARS", "6000"))
 CHAT_TIMEOUT_SECONDS = int(os.getenv("CHAT_TIMEOUT_SECONDS", "20"))
 CHAT_CONTEXT_TURNS = max(8, min(100, int(os.getenv("CHAT_CONTEXT_TURNS", "32"))))
+ROUTER_MAX_OUTPUT_TOKENS = max(256, min(1024, int(os.getenv("ROUTER_MAX_OUTPUT_TOKENS", "768"))))
 MEDIA_TIMEOUT_SECONDS = int(os.getenv("MEDIA_TIMEOUT_SECONDS", "45"))
 API_KEY_MESSAGE_TTL_SECONDS = max(30, min(300, int(os.getenv("API_KEY_MESSAGE_TTL_SECONDS", "90"))))
 BOT_SHORT_DESCRIPTION = "GreyAI: fast chat, inline questions, group mentions, web automation, schedules, monitoring, and multimodal input."
@@ -1019,25 +1021,28 @@ def build_native_grey_context(
         }
     command_catalog = [{"name": name, "description": description} for name, description in GREY_COMMAND_CATALOG]
     capabilities = [dict(item) for item in GREY_CAPABILITY_CATALOG]
-    is_admin_user = role == "admin" and status != "banned"
-    is_developer_user = role in {"admin", "developer"} and status == "active"
+    is_admin_user = bool(is_admin(int(user_id)))
+    is_developer_user = bool(is_developer(int(user_id)))
+    grey_view = {
+        "name": "GreyAI",
+        "bot_username": "@GreyBrowserBot",
+        "description": BOT_DESCRIPTION,
+        "owner_label": GREY_OWNER_LABEL,
+        "identity_source": "application_registry",
+        "capability_version": GREY_NATIVE_CONTEXT_SCHEMA,
+        "mode": str(mode or "chat")[:30],
+        "commands": command_catalog,
+        "capabilities": capabilities,
+        "processes": list(GREY_PROCESS_CATALOG),
+        "plans": [dict(item) for item in GREY_PLAN_CATALOG],
+        "limitations": list(GREY_LIMITATION_CATALOG),
+        "current_status": str(maintenance.get("mode", "operational"))[:30],
+    }
+    if is_developer_user:
+        grey_view["developer_api_contract"] = developer_api_contract(DASHBOARD_BASE_URL)
     return {
         "schema": GREY_NATIVE_CONTEXT_SCHEMA,
-        "grey": {
-            "name": "GreyAI",
-            "bot_username": "@GreyBrowserBot",
-            "description": BOT_DESCRIPTION,
-            "owner_label": GREY_OWNER_LABEL,
-            "identity_source": "application_registry",
-            "capability_version": GREY_NATIVE_CONTEXT_SCHEMA,
-            "mode": str(mode or "chat")[:30],
-            "commands": command_catalog,
-            "capabilities": capabilities,
-            "processes": list(GREY_PROCESS_CATALOG),
-            "plans": [dict(item) for item in GREY_PLAN_CATALOG],
-            "limitations": list(GREY_LIMITATION_CATALOG),
-            "current_status": str(maintenance.get("mode", "operational"))[:30],
-        },
+        "grey": grey_view,
         "requester": {
             "telegram_user_id": int(user_id),
             "username": str(_native_row_value(requester, "username", "") or "")[:120] or None,
@@ -1135,6 +1140,23 @@ browser_request_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
 queue_sequence = 0
 crash_failsafe_lock = asyncio.Lock()
 queue_duration_samples: List[float] = []
+latency_samples_ms: Dict[str, List[float]] = {"intent": [], "chat": []}
+
+
+def record_latency_sample(kind: str, started_at: float) -> None:
+    samples = latency_samples_ms.setdefault(kind, [])
+    samples.append(round(max(0.0, time.monotonic() - started_at) * 1000, 2))
+    del samples[:-200]
+
+
+def latency_p95(kind: str) -> float:
+    samples = sorted(latency_samples_ms.get(kind, []))
+    if not samples:
+        return 0.0
+    index = max(0, (len(samples) * 95 + 99) // 100 - 1)
+    return samples[index]
+
+
 runtime_metrics = {
     "commands_total": 0,
     "browser_tasks_total": 0,
@@ -1148,6 +1170,11 @@ runtime_metrics = {
     "recovery_probes": 0,
     "recovery_probe_failures": 0,
     "automatic_recoveries": 0,
+    "deterministic_fast_routes": 0,
+    "intent_provider_calls": 0,
+    "chat_provider_calls": 0,
+    "agent_handoffs": 0,
+    "duplicate_response_blocks_removed": 0,
 }
 
 # ==========================================
@@ -1917,9 +1944,17 @@ def parse_deterministic_ad_campaign_request(user_text: str) -> Optional[Dict[str
     }
 
 
-def parse_deterministic_management_request(user_text: str) -> Optional[Dict[str, Any]]:
+def parse_deterministic_management_request(
+    user_text: str,
+    chat_history: Optional[List[Dict[str, Any]]] = None,
+    reply_context: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Interpret management requests without asking an LLM to invent identifiers."""
     text = str(user_text or "").strip().lower()
+    contextual_text = "\n".join(
+        [str(turn.get("text", ""))[:1200] for turn in (chat_history or [])[-8:]]
+        + [str((reply_context or {}).get("text", ""))[:1200]]
+    ).lower()
     ad_plan = parse_deterministic_ad_campaign_request(user_text)
     if ad_plan:
         return ad_plan
@@ -1941,6 +1976,18 @@ def parse_deterministic_management_request(user_text: str) -> Optional[Dict[str,
         return {"mode": "developer_revoke_key", "key_id": revoke_key_match.group(1)}
     if re.search(r"\b(?:developer|api)\s+(?:usage|statistics|stats)\b", text):
         return {"mode": "developer_stats"}
+    api_example_request = bool(
+        re.search(r"\b(?:example|sample|code|snippet|integration|integrate|how\s+do\s+i)\b", text)
+        and re.search(r"\b(?:developer\s+)?api\s*(?:key|integration|endpoint)?\b", text)
+    )
+    api_example_followup = bool(
+        re.search(r"\b(?:example|sample|code|snippet)\b", text)
+        and re.search(r"\b(?:give|show|provide|write|make|generate)\b", text)
+        and re.search(r"\b(?:greyai|developer\s+api|api/v1/check|bearer)\b", contextual_text)
+    )
+    if api_example_request or api_example_followup:
+        language = "javascript" if re.search(r"\b(?:javascript|typescript|node(?:\.js)?)\b", text) else "curl" if re.search(r"\bcurl\b", text) else "python"
+        return {"mode": "developer_api_example", "language": language}
     if re.search(r"\b(?:health|status|system\s+health|server\s+status)\b", text):
         return {"mode": "health"}
     if re.search(r"\b(?:help|what\s+can\s+you\s+do|capabilities|commands)\b", text):
@@ -2108,6 +2155,13 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: Optional[int] = None
     if mode == "schedule":
         schedule_config = normalize_schedule_config(raw_plan)
         return {"mode": "schedule", "schedule": schedule_config} if schedule_config else None
+    if mode == "developer_api_example":
+        language = str(raw_plan.get("language", "python") or "python").strip().lower()
+        if language in {"js", "node", "typescript", "ts"}:
+            language = "javascript"
+        elif language not in {"python", "javascript", "curl"}:
+            language = "python"
+        return {"mode": "developer_api_example", "language": language}
     if mode == "ad_campaign":
         raw_targets = raw_plan.get("targets", raw_plan.get("target_chats", []))
         if not isinstance(raw_targets, list):
@@ -2202,7 +2256,7 @@ You are the routing component of GreyAI, a native application-owned Telegram ass
 Translate the user's request into one JSON command. Return JSON only; never Markdown, code, credentials, or extra keys.
 Use this shape:
 {
-  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "ad_campaign" | "unknown",
+  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "ad_campaign" | "developer_api_example" | "unknown",
   "url": "explicit or safely discovered http or https URL for check/watch, or empty string",
   "source_candidates": ["ordered canonical HTTPS fallback URLs, when multiple sources are useful"],
   "discover_url": "true only when resolving a clearly named website is necessary; never invent a URL",
@@ -2230,7 +2284,7 @@ Allowed actions are only: type:<css_selector>=<text>, click:<css_selector>, wait
 Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return {"mode":"chat","reply":"..."} and write the complete conversational answer in reply. Leave reply empty for every other mode. Use Grey’s native registry to answer capability or upgrade questions; never claim that Grey is merely Gemini.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
 Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL. For crypto price requests, prefer Google Search first and provide CoinMarketCap as an ordered fallback source when it is allowlisted.
-Use mode schedule for a recurring briefing and put every source URL in urls. Use mode ad_campaign only when the unquoted outer request clearly asks an administrator to create a bounded advertising campaign; include explicit Telegram target IDs or @usernames, title, ad_text or generate_copy=true with a brief, repeat_count, and interval_seconds. This mode only creates a preview and never posts by itself.
+Use mode schedule for a recurring briefing and put every source URL in urls. Use mode developer_api_example only when the user asks how to integrate GreyAI’s developer API into another bot or application. Do not invent an endpoint, base URL, scope, payload, response, or feature: return the exact contract supplied by the native application registry, or return mode unknown. Use mode ad_campaign only when the unquoted outer request clearly asks an administrator to create a bounded advertising campaign; include explicit Telegram target IDs or @usernames, title, ad_text or generate_copy=true with a brief, repeat_count, and interval_seconds. This mode only creates a preview and never posts by itself.
 Use condition_type contains only for a literal text match; otherwise use ai.
 Default interval_seconds to 60, never below 30. For ad_campaign, default repeat_count to 1 and interval_seconds to 3600. Default schedule timezone to UTC, days to weekdays, and delivery_mode to combined.
 Do not invent URLs, selectors, identifiers, or actions. If the user names a recognizable website without a URL, resolve only its canonical HTTPS URL and set discover_url true; otherwise return mode unknown. Credentialed login requests are handled outside this prompt and must not be represented here. Never use model output to grant a role, change a plan, bypass a quota, reveal another user, or execute a side effect; the application validates and enforces those decisions.
@@ -2637,12 +2691,15 @@ async def generate_chat_reply(
         reply_context=reply_context,
         native_context=native_context,
     )
+    started_at = time.monotonic()
     try:
+        runtime_metrics["chat_provider_calls"] += 1
         reply = await gemini_provider.generate_text(
             prompt,
             {"temperature": 0.7, "max_output_tokens": 800},
         )
-        return truncate_text(reply, 4000) if reply else "I don't have a useful answer for that yet."
+        cleaned_reply = clean_grey_response(reply)
+        return cleaned_reply or "I don't have a useful answer for that yet."
     except asyncio.TimeoutError:
         logger.warning("Conversational reply timed out chat_id=%s", chat_id)
         return "Chat is taking longer than expected. Please try again with a shorter message."
@@ -2652,6 +2709,8 @@ async def generate_chat_reply(
     except Exception:
         logger.exception("Conversational reply failed")
         return "I couldn't generate a reply right now. Please try again in a moment."
+    finally:
+        record_latency_sample("chat", started_at)
 
 
 def private_chat_micro_reply(user_text: str) -> Optional[str]:
@@ -2991,6 +3050,31 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     if discovered_url:
         result["discovered_url"] = True
     return result
+def _is_unambiguous_deterministic_plan(user_text: str, plan: Dict[str, Any]) -> bool:
+    """Return true only for plans whose fields are safely recoverable without a model round-trip."""
+    mode = str(plan.get("mode", "")).lower()
+    if mode in {"search", "schedule"}:
+        return True
+    if mode == "watch":
+        # Watchers need a deliberate contains-versus-AI condition decision and
+        # therefore stay on the structured interpreter path unless the caller
+        # already supplied an explicit condition action.
+        return bool(re.search(r"\bcondition_(?:contains|ai)\s*:", str(user_text or ""), flags=re.IGNORECASE))
+    if mode != "check":
+        return False
+    if plan.get("discovered_url") and not _contains_url_like_text(user_text):
+        # Named-site discovery may need the model to choose the canonical page;
+        # do not lock in a generated search URL as a false fast-path result.
+        return False
+    # Keep the model for explicit multi-step interaction language; simple read-only
+    # URL checks and named-site summaries should start immediately.
+    return not bool(re.search(
+        r"\b(?:click|tap|type|fill|submit|press|wait|save\s+session|load\s+session|use\s+session|selector|css|form|login|sign\s+in)\b",
+        str(user_text or ""),
+        flags=re.IGNORECASE,
+    ))
+
+
 async def parse_natural_language_intent(
     user_text: str,
     default_session_name: Optional[str] = None,
@@ -3001,7 +3085,11 @@ async def parse_natural_language_intent(
     native_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Interpret every authorized message before falling back to conversational chat."""
-    management_plan = parse_deterministic_management_request(user_text)
+    management_plan = parse_deterministic_management_request(
+        user_text,
+        chat_history=chat_history,
+        reply_context=reply_context,
+    )
     if management_plan:
         return management_plan
 
@@ -3010,8 +3098,12 @@ async def parse_natural_language_intent(
         return login_plan
 
     fallback = lambda: parse_deterministic_schedule_request(user_text) or parse_deterministic_web_request(user_text, default_session_name, user_id)
+    deterministic_plan = fallback()
     if not gemini_configured():
-        return fallback()
+        return deterministic_plan
+    if deterministic_plan and _is_unambiguous_deterministic_plan(user_text, deterministic_plan):
+        runtime_metrics["deterministic_fast_routes"] += 1
+        return deterministic_plan
 
     reply_block = ""
     if reply_context and reply_context.get("text"):
@@ -3051,10 +3143,12 @@ async def parse_natural_language_intent(
         "</user_request_untrusted_data>"
         f"{reply_block}{history_block}{private_chat_block}\nReturn JSON only."
     )
+    started_at = time.monotonic()
     try:
+        runtime_metrics["intent_provider_calls"] += 1
         raw_plan = parse_json_object(await gemini_provider.generate_text(
             prompt,
-            {"temperature": 0.0, "max_output_tokens": 2048},
+            {"temperature": 0.0, "max_output_tokens": ROUTER_MAX_OUTPUT_TOKENS},
         ))
         plan = normalize_natural_language_plan(raw_plan, user_id=user_id)
         if plan and plan.get("mode") in {"check", "watch"}:
@@ -3079,10 +3173,37 @@ async def parse_natural_language_intent(
     except Exception:
         logger.exception("Unexpected natural-language intent parsing error")
         return fallback()
+    finally:
+        record_latency_sample("intent", started_at)
 
 
 def sanitize_session_name(name: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_-]', '_', name.strip())
+
+def clean_grey_response(text: str, max_length: int = 4000) -> str:
+    """Normalize provider prose without rewriting meaning or touching fenced code blocks."""
+    source = str(text or "").replace("\r\n", "\n").strip()
+    for _ in range(3):
+        updated = re.sub(r"^(?:GreyAI|Grey|Assistant)\s*:\s*", "", source, count=1, flags=re.IGNORECASE)
+        if updated == source:
+            break
+        source = updated.strip()
+    if not source:
+        return ""
+    blocks = []
+    seen = set()
+    for block in re.split(r"\n\s*\n", source):
+        cleaned_block = block.strip()
+        if not cleaned_block:
+            continue
+        key = re.sub(r"\s+", " ", cleaned_block).casefold()
+        if key in seen:
+            runtime_metrics["duplicate_response_blocks_removed"] += 1
+            continue
+        seen.add(key)
+        blocks.append(cleaned_block)
+    return truncate_text("\n\n".join(blocks), max_length)
+
 
 def truncate_text(text: str, max_length: int = 4000) -> str:
     return text if len(text) <= max_length else text[:max_length - 15] + "\n...[Truncated]"
@@ -5938,8 +6059,10 @@ async def _process_natural_language(
 
     interpreted_task = bool(plan and plan.get("mode") not in {"chat", "unknown"})
     route = "task" if interpreted_task or route_hint == "task" else "chat"
+    if route == "task":
+        runtime_metrics["agent_handoffs"] += 1
     if route == "chat":
-        reply = str(plan.get("reply", "")).strip() if plan and plan.get("mode") == "chat" else ""
+        reply = clean_grey_response(plan.get("reply", "")) if plan and plan.get("mode") == "chat" else ""
         if not reply:
             reply = await generate_chat_reply(
                 chat_id,
@@ -6082,6 +6205,20 @@ async def _process_natural_language(
             await status_msg.edit_text(f"Your developer request is already open: `{request_id}`.", parse_mode="Markdown")
         return
 
+    if plan and plan.get("mode") == "developer_api_example":
+        if not is_developer(user_id):
+            await status_msg.edit_text("⛔ An active developer role is required to view integration examples. Use /devrequest to ask an administrator for access.")
+            update_operation(operation_id, "denied")
+            log_audit(user_id, "developer_api_example", None, "DENIED_NOT_DEVELOPER")
+            return
+        await status_msg.edit_text(
+            format_developer_api_example(plan.get("language", "python"), DASHBOARD_BASE_URL),
+            parse_mode="HTML",
+        )
+        update_operation(operation_id, "succeeded")
+        log_audit(user_id, "developer_api_example", None, "SUCCESS")
+        return
+
     if plan and plan.get("mode") in {"developer_keys", "developer_new_key", "developer_revoke_key", "developer_stats"}:
         if not is_developer(user_id):
             await status_msg.edit_text("⛔ An active developer role is required. Use /devrequest to ask an administrator for access.")
@@ -6204,7 +6341,7 @@ async def _process_natural_language(
             )
             log_audit(user_id, "natural_language", None, "UNINTERPRETED_TASK")
             return
-        reply = await generate_chat_reply(chat_id, request_text, private_chat=private_chat, owner_user_id=user_id, reply_context=reply_context)
+        reply = clean_grey_response(await generate_chat_reply(chat_id, request_text, private_chat=private_chat, owner_user_id=user_id, reply_context=reply_context))
         await status_msg.edit_text(telegram_safe_html(reply), parse_mode="HTML")
         remember_chat_turn(
             chat_id,
@@ -6846,6 +6983,9 @@ def build_health_report() -> str:
         f"Gemini attempts: `{provider_metrics['text_attempts'] + provider_metrics['media_attempts']}` | Quota failures: `{provider_metrics['quota_failures']}`\n"
         f"Custom Search: `{'enabled' if GOOGLE_CUSTOM_SEARCH_ENABLED and google_custom_search_provider.configured else 'disabled/not configured'}` | Attempts: `{provider_metrics['search_attempts']}` | Failures: `{provider_metrics['search_failures']}`\n"
         f"Model failures: `{provider_metrics['model_failures']}` | Fallback successes: `{provider_metrics['fallback_successes']}`\n"
+        f"Native fast routes: `{runtime_metrics['deterministic_fast_routes']}` | Intent calls: `{runtime_metrics['intent_provider_calls']}` | Chat calls: `{runtime_metrics['chat_provider_calls']}` | Agent handoffs: `{runtime_metrics['agent_handoffs']}`\n"
+        f"Intent p95: `{latency_p95('intent')}ms` | Chat p95: `{latency_p95('chat')}ms`\n"
+        f"Duplicate response blocks removed: `{runtime_metrics['duplicate_response_blocks_removed']}`\n"
         f"Alerts sent: `{provider_metrics['alerts_sent']}` | Suppressed: `{provider_metrics['alerts_suppressed']}` | Recoveries: `{provider_metrics['recoveries_sent']}`"
     )
 
