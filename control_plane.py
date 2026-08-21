@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import secrets
+import re
 from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional
@@ -84,6 +85,34 @@ def init_platform_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
             CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+
+            CREATE TABLE IF NOT EXISTS conversation_turns (
+                turn_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+                text TEXT NOT NULL,
+                source_message_id INTEGER,
+                reply_to_message_id INTEGER,
+                business_connection_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversation_turns_scope_time ON conversation_turns(owner_user_id, chat_id, created_at DESC, turn_id DESC);
+
+            CREATE TABLE IF NOT EXISTS contact_logs (
+                contact_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                interaction_type TEXT NOT NULL,
+                message_text TEXT NOT NULL DEFAULT '',
+                message_id INTEGER,
+                reply_to_message_id INTEGER,
+                business_connection_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_contact_logs_scope_time ON contact_logs(owner_user_id, chat_id, created_at DESC, contact_id DESC);
 
             CREATE TABLE IF NOT EXISTS developer_access_requests (
                 request_id TEXT PRIMARY KEY,
@@ -1317,3 +1346,119 @@ def mark_payment_success(order_id: str, plan: str, expires_at: Optional[str] = N
         connection.execute("UPDATE users SET plan = ?, quota_limit = ?, updated_at = ? WHERE telegram_user_id = ?", (plan, quota_limit, now, row["user_id"]))
         connection.commit()
         return True
+
+
+_CONTACT_SECRET_PATTERNS = (
+    re.compile(r"(?i)(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*[^\s,;]+"),
+    re.compile(r"\b(?:AIza|sk-|xoxb-|ghp_)[A-Za-z0-9_./-]{12,}\b"),
+)
+
+
+def _safe_contact_text(value: Any, limit: int = 4000) -> str:
+    text = str(value or "")[:limit]
+    for pattern in _CONTACT_SECRET_PATTERNS:
+        text = pattern.sub(lambda match: f"{match.group(1)}=[redacted]" if match.lastindex else "[redacted]", text)
+    return text
+
+
+def record_conversation_turn(
+    owner_user_id: int,
+    chat_id: int,
+    role: str,
+    text: str,
+    source_message_id: Optional[int] = None,
+    reply_to_message_id: Optional[int] = None,
+    business_connection_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> int:
+    clean_role = str(role or "").strip().lower()
+    if clean_role not in {"user", "assistant", "system"}:
+        raise ValueError("invalid conversation role")
+    with _connect() as connection:
+        cursor = connection.execute(
+            """INSERT INTO conversation_turns
+               (owner_user_id, chat_id, role, text, source_message_id, reply_to_message_id,
+                business_connection_id, metadata_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(owner_user_id),
+                int(chat_id),
+                clean_role,
+                _safe_contact_text(text, 6000),
+                int(source_message_id) if source_message_id is not None else None,
+                int(reply_to_message_id) if reply_to_message_id is not None else None,
+                str(business_connection_id or "")[:200] or None,
+                json.dumps(metadata or {}, separators=(",", ":"), default=str)[:2000],
+                utc_now(),
+            ),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+
+
+def list_conversation_turns(owner_user_id: int, chat_id: int, limit: int = 24) -> List[sqlite3.Row]:
+    bounded_limit = max(1, min(int(limit), 200))
+    with _connect() as connection:
+        rows = connection.execute(
+            """SELECT turn_id, owner_user_id, chat_id, role, text, source_message_id,
+                      reply_to_message_id, business_connection_id, metadata_json, created_at
+               FROM conversation_turns
+               WHERE owner_user_id = ? AND chat_id = ?
+               ORDER BY turn_id DESC LIMIT ?""",
+            (int(owner_user_id), int(chat_id), bounded_limit),
+        ).fetchall()
+    return list(reversed(rows))
+
+
+def record_contact_log(
+    owner_user_id: int,
+    chat_id: int,
+    interaction_type: str,
+    message_text: str = "",
+    message_id: Optional[int] = None,
+    reply_to_message_id: Optional[int] = None,
+    business_connection_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    contact_id = "contact_" + secrets.token_urlsafe(9)
+    with _connect() as connection:
+        connection.execute(
+            """INSERT INTO contact_logs
+               (contact_id, owner_user_id, chat_id, interaction_type, message_text,
+                message_id, reply_to_message_id, business_connection_id, metadata_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                contact_id,
+                int(owner_user_id),
+                int(chat_id),
+                str(interaction_type or "message")[:80],
+                _safe_contact_text(message_text, 4000),
+                int(message_id) if message_id is not None else None,
+                int(reply_to_message_id) if reply_to_message_id is not None else None,
+                str(business_connection_id or "")[:200] or None,
+                json.dumps(metadata or {}, separators=(",", ":"), default=str)[:2000],
+                utc_now(),
+            ),
+        )
+        connection.commit()
+    return contact_id
+
+
+def list_contact_logs(owner_user_id: int, chat_id: Optional[int] = None, limit: int = 50) -> List[sqlite3.Row]:
+    bounded_limit = max(1, min(int(limit), 200))
+    with _connect() as connection:
+        if chat_id is None:
+            return connection.execute(
+                """SELECT contact_id, owner_user_id, chat_id, interaction_type, message_text,
+                          message_id, reply_to_message_id, business_connection_id, metadata_json, created_at
+                   FROM contact_logs WHERE owner_user_id = ?
+                   ORDER BY created_at DESC, contact_id DESC LIMIT ?""",
+                (int(owner_user_id), bounded_limit),
+            ).fetchall()
+        return connection.execute(
+            """SELECT contact_id, owner_user_id, chat_id, interaction_type, message_text,
+                      message_id, reply_to_message_id, business_connection_id, metadata_json, created_at
+               FROM contact_logs WHERE owner_user_id = ? AND chat_id = ?
+               ORDER BY created_at DESC, contact_id DESC LIMIT ?""",
+            (int(owner_user_id), int(chat_id), bounded_limit),
+        ).fetchall()

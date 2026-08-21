@@ -17,6 +17,8 @@ Playwright-tg is an asynchronous, AI-powered Telegram bot for stealth web automa
 - **🗣️ Grey Private Chat:** In private chats Grey responds warmly to greetings, thanks, short emotional messages, teasing, playful insults, and casual profanity. It can use light witty banter without changing group tone or weakening task, authorization, privacy, or safety boundaries.
 - **💼 Telegram Secretary Mode:** Telegram’s current user-facing label for connected-account automation. An owner can connect GreyAI as a Secretary Bot so Grey can participate directly in selected private chats. The original user message remains visible and Grey’s answer is sent as a separate message in the same conversation, subject to explicit read/reply permissions and the owner allowlist.
 - **🔁 Chat-Agent Continuity:** Follow-up messages resolve the current chat’s durable watcher state before ordinary chat. Questions such as “What about the watch session we had on Reddit?” return the watcher ID, URL, interval, condition, and running or restored state instead of resetting the conversation or claiming that GreyAI has no access to its prior task.
+- **🧠 Durable Conversation Memory:** Conversation turns and contact interactions are stored in SQLite by authorized owner and chat, so Gemini key failover, process restarts, and long gaps do not erase context. The prompt loads a bounded recent window from the durable log, while the underlying history remains available for future retrieval.
+- **↩️ Telegram Reply Context:** When a user replies to an earlier GreyAI or contact message, Grey reads the replied-to text, author, and message ID automatically in normal, group, channel, and Secretary Mode flows.
 - **🎙️ Multimodal Telegram Input:** Send voice notes for transcription or photos/screenshots for visual identification, OCR, and image-aware answers. Captions and interpreted media can enter either chat mode or the authorized browser-agent path.
 - **🔎 Website Discovery and Live Lookup:** Say “go to Google News and summarize it”, “search for Apple and tell me the current iPhone price”, “find the latest headlines”, or “check availability” without manually typing a URL. When configured, generic searches use the approved Google Custom Search JSON API instead of scraping Google Search HTML. Direct website tasks still use the governed Playwright agent path, with domain allowlisting and SSRF-safe URL validation. Ordinary educational questions such as “How does Google search work?” remain conversational.
 - **🧠 AI-Powered Extraction:** Query webpages using conversational prompts instead of fragile CSS selectors.
@@ -98,6 +100,8 @@ What can you do?
 A voice note is transcribed and then routed as either a normal chat message or an agent task. A photo or screenshot is analyzed for visible text, labels, prices, objects, and UI intent before the same routing decision. Media is authorized before download, size-limited, processed with the dedicated multimodal model, bounded as untrusted context, and deleted from temporary storage after processing. Agent task receipts are added to the bounded chat history so later conversational replies know that an application-owned task was accepted and can distinguish confirmed state from information requiring a fresh browser check.
 
 In a private chat, Grey uses a warmer persona than it uses in groups or inline mode. Very short social messages such as greetings, thanks, “cry”, or playful profanity can receive an immediate local response, keeping the conversation responsive during provider latency or quota pressure. Longer or ambiguous messages still use the private-chat Gemini prompt. Grey may be witty, but it does not use slurs, threats, coercion, or encouragement of self-harm or violence, and private-chat personality instructions never suppress a recognized browser-agent task.
+
+Conversation memory is keyed to the authorized Telegram owner and chat rather than to a Gemini API key. Each Gemini fallback therefore receives the same durable conversation context. Contact logs retain bounded message metadata, reply relationships, and timestamps; credential-like strings are redacted before persistence. The active prompt window is controlled by `CHAT_CONTEXT_TURNS` and remains bounded to protect latency and provider context limits.
 
 ### Telegram Secretary Mode (Telegram Business Bot)
 
@@ -211,6 +215,7 @@ They can block a host or family of subdomains immediately:
    GEMINI_MODEL=gemini-3.6-flash
    MULTIMODAL_MODEL=gemini-3.5-flash-lite
    CHAT_TIMEOUT_SECONDS=20
+   CHAT_CONTEXT_TURNS=32
    MEDIA_TIMEOUT_SECONDS=45
    MEDIA_MAX_BYTES=12000000
    MAX_MEDIA_CONTEXT_CHARS=6000
