@@ -96,6 +96,7 @@ def test_role_audience_excludes_banned_users_and_is_role_scoped(platform_db):
 def test_maintenance_history_snapshot_and_queue_lifecycle_are_durable(platform_db):
     state = cp.set_maintenance_state("scheduled", "Planned update", "database migration", 9001, incident_id="inc_test")
     assert state["mode"] == "scheduled"
+    assert state["started_at"] is None
     assert cp.list_maintenance_events(5)[0]["reason"] == "database migration"
     snapshot_id = cp.save_runtime_snapshot("crash", {"api_key": "must not be logged", "queue": {"queued": 2}}, "inc_test")
     assert snapshot_id.startswith("snp_")

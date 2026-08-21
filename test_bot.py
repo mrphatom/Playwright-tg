@@ -1605,3 +1605,106 @@ def test_natural_language_chat_reply_uses_telegram_html(monkeypatch):
     assert "<b>Sell this</b>" in rendered
     assert "<code>cash</code>" in rendered
     assert "&amp;" in rendered
+
+
+def test_telegram_safe_html_renders_fenced_code_as_language_code_block():
+    import bot
+
+    rendered = bot.telegram_safe_html("Save this as index.html:\n```html\n<div class=\"game\">Hello</div>\n```")
+
+    assert "```" not in rendered
+    assert '<pre><code class="language-html">' in rendered
+    assert "&lt;div class=\"game\"&gt;Hello&lt;/div&gt;" in rendered
+
+
+def test_maintenance_schedule_parser_requires_future_time_and_preserves_timezone():
+    import bot
+
+    parsed = bot.parse_maintenance_schedule_time(
+        "2026-08-22 14:30 Europe/London",
+        now=datetime(2026, 8, 22, 12, 0, tzinfo=ZoneInfo("UTC")),
+    )
+
+    assert parsed["timezone"] == "Europe/London"
+    assert parsed["scheduled_for"].startswith("2026-08-22T14:30:00+01:00")
+
+    assert bot.parse_maintenance_schedule_time(
+        "2026-08-22 11:00 UTC",
+        now=datetime(2026, 8, 22, 12, 0, tzinfo=ZoneInfo("UTC")),
+    ) is None
+
+
+def test_due_scheduled_maintenance_activates_once_and_notifies_users(monkeypatch):
+    import bot
+
+    scheduled_for = "2026-08-22T12:00:00+00:00"
+    state = {
+        "mode": "scheduled",
+        "message": "Planned update",
+        "reason": "Database migration",
+        "metadata": {"scheduled_for": scheduled_for, "actor_user_id": 6411860985},
+    }
+    calls = []
+    notifications = []
+
+    monkeypatch.setattr(bot, "get_maintenance_state", lambda: state)
+    monkeypatch.setattr(bot, "set_maintenance_state", lambda *args, **kwargs: calls.append((args, kwargs)) or {**state, "mode": "hard_maintenance"})
+    monkeypatch.setattr(bot, "list_users_by_status", lambda *args: [{"telegram_user_id": 10}, {"telegram_user_id": 20}])
+    monkeypatch.setattr(bot, "enqueue_safe_user_notification", lambda *args: notifications.append(args))
+
+    activated = asyncio.run(bot.activate_scheduled_maintenance_if_due(
+        SimpleNamespace(),
+        now=datetime(2026, 8, 22, 12, 0, 1, tzinfo=ZoneInfo("UTC")),
+    ))
+
+    assert activated is True
+    assert calls[0][0][0] == "hard_maintenance"
+    assert len(notifications) == 2
+
+    state["mode"] = "hard_maintenance"
+    assert asyncio.run(bot.activate_scheduled_maintenance_if_due(SimpleNamespace(), now=datetime(2026, 8, 22, 12, 1, tzinfo=ZoneInfo("UTC")))) is False
+
+
+def test_telegram_safe_html_renders_truncated_fenced_code_without_backticks():
+    import bot
+
+    rendered = bot.telegram_safe_html("```javascript\nconst coin = { x: Math.random() * 380 };", max_length=200)
+
+    assert "```" not in rendered
+    assert '<pre><code class="language-javascript">' in rendered
+    assert "const coin" in rendered
+
+
+def test_maintenance_command_persists_scheduled_time(monkeypatch):
+    import bot
+
+    captured = []
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=6411860985),
+        message=message,
+    )
+    context = SimpleNamespace(args=[
+        "scheduled", "|", "Maintenance", "|", "Planned", "|", "2026-08-22", "14:30", "Europe/London"
+    ])
+
+    monkeypatch.setattr(bot, "MAINTENANCE_FEATURE_ENABLED", True)
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: True)
+    monkeypatch.setattr(bot, "set_maintenance_state", lambda *args, **kwargs: captured.append((args, kwargs)) or {
+        "mode": "scheduled", "message": "Maintenance", "reason": "Planned", "metadata": kwargs["metadata"]
+    })
+    monkeypatch.setattr(bot, "record_admin_action", lambda *args, **kwargs: None)
+
+    asyncio.run(bot.maintenance_command(update, context))
+
+    assert captured[0][0][0] == "scheduled"
+    assert captured[0][1]["metadata"]["timezone"] == "Europe/London"
+    assert captured[0][1]["metadata"]["scheduled_for"].startswith("2026-08-22T14:30:00+01:00")

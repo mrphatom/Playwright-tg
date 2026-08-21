@@ -772,7 +772,7 @@ def set_maintenance_state(mode: str, message: str = "", reason: str = "", actor_
         raise ValueError("invalid maintenance mode")
     now = utc_now()
     clean_incident = str(incident_id or "")[:100] or None
-    started_at = now if clean_mode != "operational" else None
+    started_at = now if clean_mode in {"degraded", "hard_maintenance"} else None
     safe_metadata = json.dumps(metadata or {}, separators=(",", ":"))[:4000]
     event_id = "mnt_" + secrets.token_urlsafe(8)
     with _connect() as connection:

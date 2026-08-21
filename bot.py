@@ -149,6 +149,7 @@ MAX_BULK_TARGETS = max(1, min(500, int(os.getenv("MAX_BULK_TARGETS", "200"))))
 NOTIFICATION_POLL_SECONDS = max(2, min(60, int(os.getenv("NOTIFICATION_POLL_SECONDS", "5"))))
 ROLE_MESSAGING_ENABLED = os.getenv("ROLE_MESSAGING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 MAINTENANCE_FEATURE_ENABLED = os.getenv("MAINTENANCE_FEATURE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+MAINTENANCE_SCHEDULER_POLL_SECONDS = max(5, min(60, int(os.getenv("MAINTENANCE_SCHEDULER_POLL_SECONDS", "15"))))
 CRASH_FAILSAFE_ENABLED = os.getenv("CRASH_FAILSAFE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 QUEUE_ENABLED = os.getenv("QUEUE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 QUEUE_MAX_DEPTH = max(1, min(1000, int(os.getenv("QUEUE_MAX_DEPTH", "100"))))
@@ -164,6 +165,7 @@ ALLOWED_CHANNEL_IDS = {
 }
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 notification_worker_task = None
+maintenance_scheduler_task = None
 provider_metrics = {
     "text_attempts": 0,
     "media_attempts": 0,
@@ -2120,12 +2122,12 @@ def telegram_safe_html(text: str, max_length: int = 4000) -> str:
         return stash(f"<code>{html_escape(match.group(1), quote=False)}</code>")
 
     def stash_fenced_code(match):
-        language = match.group(1).strip()
+        language = re.sub(r"[^A-Za-z0-9_+#.-]", "", match.group(1).strip())[:32]
         body = html_escape(match.group(2).strip("\n"), quote=False)
-        label = f"{language}\n" if language else ""
-        return stash(f"<pre>{html_escape(label, quote=False)}{body}</pre>")
+        language_attr = f' class="language-{html_escape(language, quote=True)}"' if language else ""
+        return stash(f"<pre><code{language_attr}>{body}</code></pre>")
 
-    source = re.sub(r"```([^\n`]*)\n(.*?)```", stash_fenced_code, source, flags=re.DOTALL)
+    source = re.sub(r"```([^\n`]*)\n(.*?)(?:```|$)", stash_fenced_code, source, flags=re.DOTALL)
     source = re.sub(r"`([^`\n]+)`", stash_code, source)
 
     def stash_link(match):
@@ -2491,7 +2493,7 @@ async def restore_schedules_from_db(context_bot):
 
 
 async def post_init(application: Application):
-    global notification_worker_task
+    global notification_worker_task, maintenance_scheduler_task
     provider_alerts.attach_bot(application.bot)
     try:
         await start_browser_pool(application)
@@ -2502,15 +2504,20 @@ async def post_init(application: Application):
     if NOTIFICATION_WORKER_ENABLED:
         notification_worker_task = asyncio.create_task(notification_worker(application.bot))
         application.bot_data["notification_worker_task"] = notification_worker_task
+    if MAINTENANCE_FEATURE_ENABLED:
+        maintenance_scheduler_task = asyncio.create_task(maintenance_scheduler_worker(application.bot))
+        application.bot_data["maintenance_scheduler_task"] = maintenance_scheduler_task
     await configure_bot_profile(application.bot)
 
 
 async def stop_browser_pool(application: Application):
-    global notification_worker_task
+    global notification_worker_task, maintenance_scheduler_task
     provider_alerts.shutdown()
     await stop_queue_dispatcher()
     if notification_worker_task and not notification_worker_task.done():
         notification_worker_task.cancel()
+    if maintenance_scheduler_task and not maintenance_scheduler_task.done():
+        maintenance_scheduler_task.cancel()
     for task in application.bot_data.get("ephemeral_message_tasks", set()):
         task.cancel()
     dashboard_task = application.bot_data.get("dashboard_task")
@@ -3079,7 +3086,10 @@ def _maintenance_message(state: Optional[Dict[str, Any]] = None) -> str:
     label = mode.replace("_", " ").title()
     message = current.get("message") or "GreyAI is operating with reduced availability."
     updated = current.get("updated_at") or "unknown"
-    return f"⚠️ GreyAI status: {label}\n{message}\nLast updated: {updated}\nUse /maintenance_log to view recent status events."
+    scheduled_line = ""
+    if mode == "scheduled":
+        scheduled_line = f"\nScheduled start: {(current.get('metadata') or {}).get('display_time') or (current.get('metadata') or {}).get('scheduled_for') or 'configured time'}"
+    return f"⚠️ GreyAI status: {label}\n{message}{scheduled_line}\nLast updated: {updated}\nUse /maintenance_log to view recent status events."
 
 
 async def enter_hard_maintenance(bot, error: Any, operation_id: Optional[str] = None) -> Dict[str, Any]:
@@ -3116,8 +3126,91 @@ async def enter_hard_maintenance(bot, error: Any, operation_id: Optional[str] = 
         return state
 
 
+def parse_maintenance_schedule_time(value: str, now: Optional[datetime] = None) -> Optional[Dict[str, str]]:
+    """Parse a future `YYYY-MM-DD HH:MM IANA/Timezone` maintenance start."""
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})\s+([A-Za-z]+/[A-Za-z0-9_+.-]+)", str(value or "").strip())
+    if not match:
+        return None
+    date_text, time_text, timezone_name = match.groups()
+    try:
+        timezone = ZoneInfo(timezone_name)
+        scheduled = datetime.strptime(f"{date_text} {time_text}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone)
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    current = now or datetime.now(ZoneInfo("UTC"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=ZoneInfo("UTC"))
+    if scheduled <= current.astimezone(timezone):
+        return None
+    return {
+        "scheduled_for": scheduled.isoformat(),
+        "timezone": timezone_name,
+        "display_time": scheduled.strftime("%Y-%m-%d %H:%M %Z"),
+    }
+
+
 def maintenance_blocks_browser_work() -> bool:
     return MAINTENANCE_FEATURE_ENABLED and get_maintenance_state().get("mode") == "hard_maintenance"
+
+
+async def activate_scheduled_maintenance_if_due(bot, now: Optional[datetime] = None) -> bool:
+    """Atomically transition one due scheduled state into hard maintenance."""
+    if not MAINTENANCE_FEATURE_ENABLED:
+        return False
+    state = get_maintenance_state()
+    if state.get("mode") != "scheduled":
+        return False
+    metadata = state.get("metadata") or {}
+    raw_scheduled_for = metadata.get("scheduled_for")
+    try:
+        scheduled_for = datetime.fromisoformat(str(raw_scheduled_for))
+    except (TypeError, ValueError):
+        logger.error("scheduled_maintenance_has_invalid_time")
+        return False
+    current = now or datetime.now(ZoneInfo("UTC"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=ZoneInfo("UTC"))
+    if scheduled_for > current.astimezone(scheduled_for.tzinfo or ZoneInfo("UTC")):
+        return False
+    actor_user_id = metadata.get("actor_user_id")
+    activation_metadata = {
+        "source": "scheduled_maintenance_worker",
+        "scheduled_for": str(raw_scheduled_for)[:80],
+        "activated_at": current.isoformat(),
+    }
+    state = set_maintenance_state(
+        "hard_maintenance",
+        state.get("message") or "GreyAI has entered scheduled maintenance.",
+        state.get("reason") or "Scheduled maintenance window started.",
+        actor_user_id=int(actor_user_id) if str(actor_user_id or "").isdigit() else None,
+        metadata=activation_metadata,
+    )
+    public_body = f"GreyAI has entered scheduled maintenance. Browser tasks are paused.\nReason: {state.get('reason') or 'Scheduled maintenance window started.'}"
+    for row in list_users_by_status(None, 500):
+        user_id = int(row["telegram_user_id"])
+        enqueue_safe_user_notification(
+            user_id,
+            "maintenance",
+            "GreyAI scheduled maintenance",
+            public_body,
+            f"scheduled-maintenance:{raw_scheduled_for}:user:{user_id}",
+        )
+    logger.warning("scheduled_maintenance_activated scheduled_for=%s", raw_scheduled_for)
+    return True
+
+
+async def maintenance_scheduler_worker(bot) -> None:
+    logger.info("maintenance_scheduler_started")
+    try:
+        while True:
+            try:
+                await activate_scheduled_maintenance_if_due(bot)
+            except Exception:
+                logger.exception("scheduled_maintenance_worker_iteration_failed")
+            await asyncio.sleep(MAINTENANCE_SCHEDULER_POLL_SECONDS)
+    except asyncio.CancelledError:
+        logger.info("maintenance_scheduler_stopped")
+        raise
 
 
 @admin_only
@@ -3126,13 +3219,21 @@ async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return await update.message.reply_text("Maintenance controls are disabled by configuration.")
     raw = " ".join(context.args).strip()
     if "|" not in raw:
-        return await update.message.reply_text("Usage: /maintenance <operational|scheduled|degraded|hard_maintenance> | <message> | <reason>")
-    parts = [part.strip() for part in raw.split("|", 2)]
+        return await update.message.reply_text("Usage: /maintenance <operational|scheduled|degraded|hard_maintenance> | <message> | <reason> [| <YYYY-MM-DD HH:MM IANA/Timezone>]")
+    parts = [part.strip() for part in raw.split("|", 3)]
     mode = parts[0].lower()
-    if mode not in {"operational", "scheduled", "degraded", "hard_maintenance"} or not parts[1]:
+    if mode not in {"operational", "scheduled", "degraded", "hard_maintenance"} or len(parts) < 2 or not parts[1]:
         return await update.message.reply_text("Invalid maintenance mode or empty public message.")
-    reason = parts[2] if len(parts) > 2 else "Administrator status update"
-    state = set_maintenance_state(mode, parts[1][:1000], reason[:1000], update.effective_user.id, metadata={"source": "telegram_command"})
+    reason = parts[2] if len(parts) > 2 and parts[2] else "Administrator status update"
+    metadata = {"source": "telegram_command", "actor_user_id": update.effective_user.id}
+    if mode == "scheduled":
+        if len(parts) < 4:
+            return await update.message.reply_text("Scheduled maintenance requires a start time: YYYY-MM-DD HH:MM IANA/Timezone, for example 2026-08-22 14:30 Europe/London.")
+        schedule = parse_maintenance_schedule_time(parts[3])
+        if not schedule:
+            return await update.message.reply_text("Invalid scheduled time. Use a future YYYY-MM-DD HH:MM IANA/Timezone value, for example 2026-08-22 14:30 Europe/London.")
+        metadata.update(schedule)
+    state = set_maintenance_state(mode, parts[1][:1000], reason[:1000], update.effective_user.id, metadata=metadata)
     record_admin_action(update.effective_user.id, "maintenance_update", None, reason[:500], {"mode": mode})
     await update.message.reply_text(_maintenance_message(state))
 
