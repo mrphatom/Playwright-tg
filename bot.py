@@ -344,6 +344,7 @@ async def configure_bot_profile(bot) -> None:
         BotCommand("deletesession", "Delete an encrypted browser session"),
         BotCommand("dashboard", "Open the secure operations dashboard"),
         BotCommand("upgrade", "View Pro and Max Telegram Stars plans"),
+        BotCommand("stars", "View the bot Telegram Stars balance and revenue"),
         BotCommand("referral", "Create your referral link"),
         BotCommand("report", "Open a support or safety report"),
         BotCommand("appeal", "Open an account review appeal"),
@@ -3832,6 +3833,60 @@ async def crypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"External crypto checkout: {CRYPTO_CHECKOUT_URL}\nOnly complete payment on the configured HTTPS provider page. Do not send a wallet seed phrase or private key.")
 
 
+def _star_amount_value(value: Any) -> int:
+    try:
+        return int(getattr(value, "amount", value) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _star_partner_label(partner: Any) -> str:
+    if partner is None:
+        return "unknown"
+    name = type(partner).__name__
+    if name.startswith("TransactionPartner"):
+        name = name.removeprefix("TransactionPartner")
+    return re.sub(r"[^A-Za-z0-9 _-]", "", name or "unknown") or "unknown"
+
+
+def format_stars_report(balance: Any, transactions: List[Any], inspected_limit: int = 100) -> str:
+    balance_stars = _star_amount_value(balance)
+    received = 0
+    outgoing = 0
+    for transaction in transactions:
+        amount = _star_amount_value(transaction)
+        if amount >= 0:
+            received += amount
+        else:
+            outgoing += abs(amount)
+
+    net = received - outgoing
+    lines = [
+        "⭐ Telegram Stars revenue",
+        f"Current bot balance: {balance_stars:,} Stars",
+        f"Received in inspected history: {received:,} Stars",
+        f"Outgoing/refunds in inspected history: {outgoing:,} Stars",
+        f"Net in inspected history: {net:,} Stars",
+        f"Transactions inspected: {len(transactions)} (maximum requested: {max(1, min(int(inspected_limit), 100))})",
+    ]
+    if not transactions:
+        lines.append("No Telegram Stars transactions were returned.")
+        return "\n".join(lines)
+
+    lines.append("\nRecent transaction sample:")
+    for transaction in list(transactions)[-8:]:
+        amount = _star_amount_value(transaction)
+        direction = "received" if amount >= 0 else "outgoing"
+        date_value = getattr(transaction, "date", None)
+        if hasattr(date_value, "strftime"):
+            date_text = date_value.strftime("%Y-%m-%d %H:%M UTC")
+        else:
+            date_text = "date unavailable"
+        partner = _star_partner_label(getattr(transaction, "source", None) or getattr(transaction, "receiver", None))
+        lines.append(f"• {date_text} — {abs(amount):,} Stars {direction} ({partner})")
+    return "\n".join(lines)
+
+
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
@@ -4205,6 +4260,27 @@ async def disallow_channel_command(update: Update, context: ContextTypes.DEFAULT
         return await update.message.reply_text("Channel ID must be numeric.")
     set_chat_setting(channel_id, "channel", False, update.effective_user.id)
     await update.message.reply_text(f"✅ Channel {channel_id} is no longer allowlisted for GreyAI.")
+
+
+@admin_only
+async def stars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        balance, transaction_page = await asyncio.gather(
+            context.bot.get_my_star_balance(),
+            context.bot.get_star_transactions(limit=100),
+        )
+        transactions = list(getattr(transaction_page, "transactions", ()) or ())
+        report = format_stars_report(balance, transactions, inspected_limit=100)
+        log_audit(update.effective_user.id, "/stars", None, f"VIEWED_STARS_BALANCE_TRANSACTIONS_{len(transactions)}")
+        await update.message.reply_text(report)
+    except TelegramError as exc:
+        logger.warning("telegram_stars_report_failed error_type=%s", type(exc).__name__)
+        log_audit(update.effective_user.id, "/stars", None, "TELEGRAM_API_ERROR")
+        await update.message.reply_text("⚠️ Telegram Stars data is temporarily unavailable. Please try /stars again shortly.")
+    except Exception as exc:
+        logger.exception("telegram_stars_report_unexpected_failure error_type=%s", type(exc).__name__)
+        log_audit(update.effective_user.id, "/stars", None, "UNEXPECTED_ERROR")
+        await update.message.reply_text("⚠️ The Stars report could not be loaded. The failure was logged without exposing payment details.")
 
 
 @admin_only
@@ -5772,6 +5848,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/maintenance &lt;mode&gt; | &lt;public message&gt; | &lt;reason&gt; — publish status/update and maintenance reason\n"
         "/status, /maintenance_log — view current status and timestamped status history\n"
         "/analytics — top users, top referrers, suspicious queue, and most risky accounts\n"
+        "/stars or /starsbalance — view the bot’s current Telegram Stars balance and recent revenue summary\n"
         "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n"
         "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n"
         "/allowdomain &lt;domain|*.domain&gt;, /disallowdomain &lt;pattern&gt;, /resetdomain &lt;pattern&gt;, /domains\n\n"
@@ -5885,6 +5962,8 @@ def main():
     app.add_handler(CommandHandler("confirmbulk", confirm_bulk_command))
     app.add_handler(CommandHandler("banned", banned_users_command))
     app.add_handler(CommandHandler("analytics", analytics_command))
+    app.add_handler(CommandHandler("stars", stars_command))
+    app.add_handler(CommandHandler("starsbalance", stars_command))
     app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("upgrade", upgrade_command))
     app.add_handler(CallbackQueryHandler(upgrade_plan_callback, pattern=r"^upgrade:(pro|max)$"))
