@@ -305,3 +305,41 @@ def test_non_admin_still_cannot_create_developer_key_without_approval(platform_d
     assert cp.is_developer(42) is False
     with pytest.raises(PermissionError):
         cp.create_api_key(42, "blocked", ["check"])
+
+
+def test_automatic_recovery_requires_stability_window_and_preserves_source(platform_db):
+    incident_id = "inc_auto_test"
+    state = cp.set_maintenance_state(
+        "hard_maintenance",
+        "Temporary outage",
+        "An unexpected runtime failure triggered the automatic safety stop.",
+        incident_id=incident_id,
+        metadata={"source": "automatic_failsafe", "consecutive_healthy_checks": 0},
+    )
+    assert state["mode"] == "hard_maintenance"
+    assert cp.recover_automatic_maintenance(incident_id, 3) is None
+    assert cp.update_maintenance_recovery_progress(incident_id, 2, cp.utc_now(), "healthy") is True
+    assert cp.recover_automatic_maintenance(incident_id, 3) is None
+    assert cp.update_maintenance_recovery_progress(incident_id, 3, cp.utc_now(), "healthy") is True
+    recovered = cp.recover_automatic_maintenance(incident_id, 3)
+    assert recovered["mode"] == "operational"
+    assert recovered["metadata"]["recovery_state"] == "recovered"
+    assert cp.recover_automatic_maintenance(incident_id, 3) is None
+
+
+def test_automatic_recovery_does_not_clear_manual_or_scheduled_maintenance(platform_db):
+    manual = cp.set_maintenance_state(
+        "hard_maintenance", "Manual hold", "Administrator maintenance", 9001,
+        incident_id="inc_manual", metadata={"source": "telegram_command", "consecutive_healthy_checks": 5},
+    )
+    assert cp.update_maintenance_recovery_progress("inc_manual", 6, cp.utc_now(), "healthy") is False
+    assert cp.recover_automatic_maintenance("inc_manual", 3) is None
+    assert cp.get_maintenance_state()["mode"] == manual["mode"]
+
+    scheduled = cp.set_maintenance_state(
+        "hard_maintenance", "Scheduled hold", "Scheduled maintenance", 9001,
+        incident_id="inc_scheduled", metadata={"source": "scheduled_maintenance_worker", "consecutive_healthy_checks": 5},
+    )
+    assert cp.update_maintenance_recovery_progress("inc_scheduled", 6, cp.utc_now(), "healthy") is False
+    assert cp.recover_automatic_maintenance("inc_scheduled", 3) is None
+    assert cp.get_maintenance_state()["mode"] == scheduled["mode"]
