@@ -1592,7 +1592,7 @@ def test_current_fact_question_routes_to_web_verification():
     assert plan["mode"] == "check"
     assert plan["url"].startswith("https://news.google.com/search?q=")
     assert plan["discovered_url"] is True
-    assert any(action.startswith("ai_extract:") for action in plan["actions"])
+    assert any(action.startswith(("navigate:", "ai_extract:")) for action in plan["actions"])
 
 
 def test_model_unknown_falls_back_to_deterministic_current_fact_check(monkeypatch):
@@ -3134,3 +3134,302 @@ def test_telegram_bot_starter_python_entrypoint_compiles(tmp_path, monkeypatch):
     with zipfile.ZipFile(archive_path) as archive:
         archive.extractall(extract_dir)
     py_compile.compile(str(extract_dir / "compile-check" / "bot.py"), doraise=True)
+
+
+def test_navigation_action_plan_accepts_inspect_search_click_and_extract(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+
+    plan = bot.normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://example.com/catalog",
+        "request": "Find the Bitcoin price and timestamp",
+        "actions": [
+            "inspect",
+            "search:Bitcoin",
+            "click:Bitcoin",
+            "ai_extract:Return the current Bitcoin price, currency, timestamp, and source URL",
+        ],
+    })
+
+    assert plan["actions"] == [
+        "inspect",
+        "search:Bitcoin",
+        "click:Bitcoin",
+        "ai_extract:Return the current Bitcoin price, currency, timestamp, and source URL",
+    ]
+
+
+def test_navigation_plan_rejects_consequential_click_targets():
+    import bot
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+        assert bot.normalize_natural_language_plan({
+            "mode": "check",
+            "url": "https://example.com/catalog",
+            "request": "Buy the item",
+            "actions": ["click:Buy now"],
+        }) is None
+    finally:
+        monkeypatch.undo()
+
+
+def test_intelligent_navigation_searches_clicks_and_extracts(monkeypatch):
+    import bot
+
+    class FakeElement:
+        def __init__(self, page, tag, label="", placeholder="", name="", element_id="", input_type="", href=""):
+            self.page = page
+            self.tag = tag
+            self.label = label
+            self.placeholder = placeholder
+            self.name = name
+            self.element_id = element_id
+            self.input_type = input_type
+            self.href = href
+
+        async def evaluate(self, _script):
+            return self.tag
+
+        async def get_attribute(self, name):
+            return {
+                "aria-label": self.label,
+                "title": "",
+                "placeholder": self.placeholder,
+                "name": self.name,
+                "id": self.element_id,
+                "type": self.input_type,
+                "href": self.href,
+                "role": "",
+            }.get(name, "")
+
+        async def inner_text(self):
+            return self.label
+
+        async def is_visible(self):
+            return True
+
+        async def fill(self, value):
+            self.page.search_value = value
+
+        async def press(self, key):
+            assert key == "Enter"
+            self.page.url = "https://example.com/search?q=bitcoin"
+            self.page.state = "results"
+
+        async def click(self, timeout=None):
+            self.page.clicked_label = self.label
+            self.page.url = "https://example.com/asset/bitcoin"
+            self.page.state = "detail"
+
+    class FakeLocator:
+        def __init__(self, elements):
+            self.elements = elements
+
+        async def all(self):
+            return self.elements
+
+    class FakePage:
+        def __init__(self):
+            self.url = "https://example.com/search"
+            self.state = "search"
+            self.search_value = None
+            self.clicked_label = None
+
+        async def evaluate(self, script):
+            if "innerText" in script:
+                if self.state == "detail":
+                    return "Bitcoin current price: $100,000 USD. Updated moments ago."
+                if self.state == "results":
+                    return "Search results for bitcoin"
+                return "Search Bitcoin on Example Markets"
+            return ""
+
+        async def title(self):
+            return "Example Markets"
+
+        def locator(self, selector):
+            if "input" in selector or "textbox" in selector or "textarea" in selector:
+                return FakeLocator([FakeElement(self, "input", placeholder="Search assets", name="search", input_type="search")])
+            if "a," in selector or "button" in selector or "role='link'" in selector:
+                if self.state == "results":
+                    return FakeLocator([FakeElement(self, "a", label="Bitcoin", href="/asset/bitcoin")])
+                return FakeLocator([])
+            return FakeLocator([])
+
+        async def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+        async def wait_for_timeout(self, _milliseconds):
+            return None
+
+    class FakeProvider:
+        def __init__(self):
+            self.responses = [
+                '{"action":"search","query":"Bitcoin"}',
+                '{"action":"click","target":"Bitcoin"}',
+                '{"action":"extract"}',
+                "Bitcoin is $100,000 USD, updated moments ago.",
+            ]
+
+        async def generate_text(self, _prompt, _config):
+            return self.responses.pop(0)
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+    monkeypatch.setattr(bot, "gemini_provider", FakeProvider())
+    page = FakePage()
+
+    result = asyncio.run(bot.execute_pipeline(
+        page,
+        None,
+        ["navigate:Find the current Bitcoin price"],
+        42,
+    ))
+
+    assert page.search_value == "Bitcoin"
+    assert page.clicked_label == "Bitcoin"
+    assert result["navigation_steps"][-1]["action"] == "extract"
+    assert "$100,000" in "\n".join(result["extracted"])
+
+
+def test_current_lookup_uses_intelligent_navigation_plan(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    monkeypatch.setattr(bot, "INTELLIGENT_NAVIGATION_ENABLED", True)
+
+    plan = bot.parse_deterministic_web_request("What is the current Bitcoin price?")
+
+    assert plan["mode"] == "check"
+    assert plan["actions"] == ["navigate:What is the current Bitcoin price"]
+    assert plan.get("screenshot_requested") is False
+
+
+def test_navigation_planner_fails_closed_on_destructive_model_target(monkeypatch):
+    import bot
+
+    class UnsafeProvider:
+        async def generate_text(self, _prompt, _config):
+            return '{"action":"click","target":"Buy now"}'
+
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+    monkeypatch.setattr(bot, "gemini_provider", UnsafeProvider())
+
+    decision = asyncio.run(bot._choose_navigation_action(
+        "Find the price",
+        {"url": "https://example.com", "title": "Example", "text": "", "controls": []},
+        None,
+    ))
+
+    assert decision == {"action": "extract"}
+    assert bot._navigation_click_is_safe("Buy now") is False
+    assert bot._navigation_click_is_safe("Bitcoin") is True
+
+
+def test_intelligent_navigation_runs_in_real_chromium_on_local_fixture(monkeypatch):
+    import bot
+    from playwright.async_api import async_playwright
+
+    class FixtureProvider:
+        def __init__(self):
+            self.responses = [
+                '{"action":"search","query":"Bitcoin"}',
+                '{"action":"click","target":"Bitcoin"}',
+                '{"action":"extract"}',
+                "Bitcoin is $100,000 USD.",
+            ]
+
+        async def generate_text(self, _prompt, _config):
+            return self.responses.pop(0)
+
+    async def run_case():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True, executable_path="/usr/bin/chromium", args=["--no-sandbox"])
+            page = await browser.new_page()
+            await page.set_content("""
+                <form onsubmit=\"return false\"><input aria-label=\"Search assets\" type=\"search\"></form>
+                <main id=\"results\">Search the market</main>
+                <script>
+                document.querySelector('input').addEventListener('keydown', event => {
+                    if (event.key === 'Enter') document.querySelector('#results').innerHTML = '<a href=\"#bitcoin\">Bitcoin</a>';
+                });
+                document.querySelector('#results').addEventListener('click', event => {
+                    if (event.target.matches('a')) document.querySelector('#results').textContent = 'Bitcoin current price: $100,000 USD';
+                });
+                </script>
+            """)
+            result = await bot._execute_intelligent_navigation(page, "Find the Bitcoin price", 42, None)
+            await browser.close()
+            return result
+
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+    monkeypatch.setattr(bot, "gemini_provider", FixtureProvider())
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+    result = asyncio.run(run_case())
+
+    assert result["navigation_steps"][0:2] == [
+        {"step": 1, "action": "search", "url": "about:blank"},
+        {"step": 2, "action": "click", "url": "about:blank"},
+    ]
+    assert result["navigation_steps"][2]["step"] == 3
+    assert result["navigation_steps"][2]["action"] == "extract"
+    assert result["navigation_steps"][2]["url"].startswith("about:blank")
+    assert "$100,000" in "\n".join(result["extracted"])
+
+
+def test_successful_text_extraction_does_not_create_screenshot(monkeypatch, tmp_path):
+    import bot
+
+    class FakeMouse:
+        async def wheel(self, **_kwargs):
+            return None
+
+    class FakePage:
+        url = "https://example.com/detail"
+        mouse = FakeMouse()
+
+        async def add_init_script(self, *_args):
+            return None
+
+        async def goto(self, *_args, **_kwargs):
+            return None
+
+        async def wait_for_timeout(self, *_args):
+            return None
+
+        async def title(self):
+            return "Example detail"
+
+        async def screenshot(self, path, full_page=True):
+            raise AssertionError("successful extraction should not capture a screenshot")
+
+        async def close(self):
+            return None
+
+    class FakeContext:
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **_kwargs):
+            return FakeContext()
+
+    class FakePool:
+        browser = FakeBrowser()
+
+    async def fake_pipeline(*_args, **_kwargs):
+        return {"extracted": ["Bitcoin is $100,000"], "condition_met": False, "action_errors": []}
+
+    monkeypatch.setattr(bot, "pool", FakePool())
+    monkeypatch.setattr(bot, "execute_pipeline", fake_pipeline)
+    monkeypatch.setattr(bot, "build_native_grey_context", lambda *args, **kwargs: {})
+    monkeypatch.chdir(tmp_path)
+
+    result = asyncio.run(bot.run_browser_task("https://example.com", ["ai_extract:price"], 42))
+
+    assert result["extracted"] == ["Bitcoin is $100,000"]
+    assert result["screenshot"] is None
