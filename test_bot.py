@@ -3652,3 +3652,88 @@ def test_google_and_reddit_proxy_routing_is_disabled_for_transparent_browsing():
     assert bot.proxy_routing_allowed_for_url("https://www.google.com/search?q=bitcoin") is False
     assert bot.proxy_routing_allowed_for_url("https://www.reddit.com/r/forhire") is False
     assert bot.proxy_routing_allowed_for_url("https://archive.org/details/example") is True
+
+
+def test_resolve_direct_download_source_accepts_single_quoted_search_result_links(monkeypatch):
+    import bot
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/results":
+                body = b"<html><body><a class='result' href='/detail?item=believer&amp;source=search'>Imagine Dragons song</a></body></html>"
+            elif self.path == "/detail?item=believer&source=search":
+                body = b"<html><body><a class='download' href='/files/believer.mp3'>Download MP3</a></body></html>"
+            else:
+                body = b"not relevant"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        resolved = asyncio.run(bot._resolve_direct_download_source(
+            f"http://127.0.0.1:{server.server_port}/results",
+            42,
+        ))
+        assert resolved.endswith("/files/believer.mp3")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_download_delivery_explains_missing_direct_artifact(monkeypatch):
+    import bot
+
+    class FakeStatus:
+        def __init__(self):
+            self.messages = []
+
+        async def edit_text(self, text, **_kwargs):
+            self.messages.append(text)
+
+    class FakeBot:
+        async def send_document(self, **_kwargs):
+            raise AssertionError("no document should be sent when discovery fails")
+
+    class FakeContext:
+        bot = FakeBot()
+
+    status = FakeStatus()
+    monkeypatch.setattr(bot, "download_policy_for_user", lambda _user_id: {"allowed": True, "tier": "pro", "max_bytes": 1000, "daily_limit": 2})
+    monkeypatch.setattr(bot, "count_download_jobs_since", lambda *_args: 0)
+    monkeypatch.setattr(bot, "get_last_download_job_at", lambda *_args: None)
+    monkeypatch.setattr(bot, "consume_quota", lambda *_args: (True, 1, 100))
+    monkeypatch.setattr(bot, "create_download_job", lambda *_args: None)
+    monkeypatch.setattr(bot, "finish_download_job", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bot, "update_operation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+
+    async def reject_source(*_args, **_kwargs):
+        raise bot.DownloadRejected("no_direct_artifact_found")
+
+    monkeypatch.setattr(bot, "_resolve_direct_download_source", reject_source)
+    bot.active_download_jobs.clear()
+
+    asyncio.run(bot._deliver_download_artifact(
+        FakeContext(),
+        status,
+        {"mode": "download", "url": "https://downloads.example/results", "source_candidates": []},
+        42,
+        42,
+        "op_download_missing_artifact",
+    ))
+
+    assert status.messages[-1] == (
+        "❌ Download stopped safely: the approved source did not expose a direct permitted artifact. "
+        "No file was delivered."
+    )

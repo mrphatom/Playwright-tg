@@ -21,7 +21,7 @@ import urllib.error
 import aiohttp
 from pathlib import Path
 from types import SimpleNamespace
-from html import escape as html_escape
+from html import escape as html_escape, unescape as html_unescape
 from datetime import datetime, timedelta, timezone, time as datetime_time
 from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse, quote_plus, parse_qs, urljoin
@@ -6532,8 +6532,8 @@ async def _resolve_direct_download_source(url: str, user_id: int) -> str:
                     html = body.decode("utf-8", errors="replace")
                     direct_candidates: List[tuple[int, str]] = []
                     page_candidates: List[tuple[int, str]] = []
-                    for href, label in re.findall(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL):
-                        candidate = urljoin(str(response.url), href.strip())
+                    for quote, href, label in re.findall(r'<a\b[^>]*?\bhref\s*=\s*(["\'])(.*?)\1[^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL):
+                        candidate = urljoin(str(response.url), html_unescape(href).strip())
                         if not route_url_allowed(candidate, user_id):
                             continue
                         parsed = urlparse(candidate)
@@ -6771,6 +6771,14 @@ async def _deliver_download_artifact(
             "download_timeout": "the source took too long to respond",
             "source_not_allowlisted": "the source is no longer allowlisted",
             "final_source_not_allowlisted": "a redirect left the approved source policy",
+            "no_direct_artifact_found": "the approved source did not expose a direct permitted artifact",
+            "discovery_hop_limit": "the approved source required more navigation than Grey allows",
+            "discovery_loop": "the approved source returned a repeated navigation loop",
+            "redirect_limit": "the approved source exceeded Grey’s redirect limit",
+            "download_discovery_timeout": "the approved source took too long to reveal an artifact",
+            "download_discovery_network_error": "the approved source could not be reached reliably",
+            "empty_artifact": "the source returned an empty file",
+            "blocked_content_type": "the source returned a blocked content type",
         }
         await status_msg.edit_text(f"❌ Download stopped safely: {safe_reasons.get(error_code, 'the source or artifact failed Grey’s safety checks')}. No file was delivered.")
     except Exception:
