@@ -1352,6 +1352,22 @@ def test_broad_live_web_requests_route_to_agent_without_urls(monkeypatch):
         assert plan["url"].startswith("https://www.google.com/search?q="), request
 
 
+def test_general_natural_language_agent_tasks_route_to_agent():
+    import bot
+
+    task_requests = [
+        "Check google and summarize",
+        "Fill out the form on example.com",
+        "Watch the product page every 5 minutes for price changes",
+        "Let me know when the price changes on the product page",
+        "Schedule a morning briefing with the latest tech news",
+        "Take a screenshot of the Google News homepage",
+        "Open Amazon and find the cheapest iPhone",
+    ]
+    for request in task_requests:
+        assert bot.classify_message_route(request) == "task", request
+
+
 def test_ordinary_web_education_stays_chat():
     import bot
 

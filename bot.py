@@ -1739,12 +1739,14 @@ def resolve_contextual_watcher_followup(chat_id: int, user_text: str) -> Optiona
 
 
 def is_live_web_lookup_request(user_text: str) -> bool:
-    """Detect live-information and browser-work intent even when no URL is supplied."""
+    """Detect operational web/browser intent even when the user did not provide a URL."""
     text = str(user_text or "").strip().lower()
     if not text:
         return False
     if re.search(r"\b(?:how\s+does|what\s+is|explain)\b.*\b(?:google|search|browser|web)\b.*\b(?:work|mean|concept|algorithm)\b", text):
         return False
+
+    has_url = _contains_url_like_text(text)
     search_action = bool(re.search(
         r"\b(?:search(?:\s+for)?|look\s+up|find|research|check\s+online|browse\s+for|look\s+for)\b",
         text,
@@ -1754,24 +1756,40 @@ def is_live_web_lookup_request(user_text: str) -> bool:
         text,
     ))
     web_target = bool(re.search(
-        r"\b(?:on|from|via|through|using)\s+(?:the\s+)?(?:google(?:\s+news)?|web|internet|online|website|site)\b|\b(?:google(?:\s+news)?|reddit|amazon|ebay|wikipedia|youtube|github|linkedin)\b",
+        r"\b(?:on|from|via|through|using)\s+(?:the\s+)?(?:google(?:\s+news)?|web|internet|online|website|site|page|form|homepage)\b"
+        r"|\b(?:google(?:\s+news)?|reddit|amazon|ebay|wikipedia|youtube|github|linkedin)\b"
+        r"|\b(?:website|webpage|homepage|web\s+page|product\s+page|form)\b",
         text,
     ))
     browser_action = bool(re.search(
-        r"\b(?:click|tap|type|fill|submit|log\s*in|sign\s*in|screenshot|take\s+a\s+screen|extract|scrape|summari[sz]e|read|open|visit|navigate|monitor|watch|alert|notify|tell\s+me\s+when)\b",
+        r"\b(?:check|click|tap|type|fill|submit|log\s*in|sign\s*in|screenshot|screen\s*shot|take\s+a\s+screen|extract|scrape|summari[sz]e|read|open|visit|navigate|browse|monitor|watch|alert|notify|tell\s+me\s+when|let\s+me\s+know\s+when)\b",
+        text,
+    ))
+    recurring = bool(re.search(
+        r"\b(?:schedule|scheduled|briefing|watch|monitor|every\s+(?:\d+\s+)?(?:second|seconds|minute|minutes|hour|hours|day|days|weekday|weekdays|week|weeks)|daily|weekly|each\s+(?:morning|evening)|let\s+me\s+know\s+when)\b",
         text,
     ))
     question = bool(re.search(r"\?|\b(?:what|who|when|where|which|how\s+much|how\s+many|is|are|did|does|has|have)\b", text))
-    strong_lookup = search_action and (live_data or web_target or browser_action)
-    live_data_target = bool(re.search(r"\b(?:price|pricing|cost|stock|availability|available|news|headlines|latest|current|today|recent|announced|results?|weather|score)\b", text))
+    operational_target = has_url or web_target or live_data
+    explicit_browser_task = browser_action and operational_target
+    search_task = search_action and operational_target
+    recurring_web_task = recurring and (operational_target or bool(re.search(r"\b(?:briefing|news|headlines|summary|summarize|report)\b", text)))
+    current_question = live_data and question and bool(re.search(
+        r"\b(?:price|pricing|cost|stock|availability|available|in\s+stock|news|headlines|weather|score|results?)\b",
+        text,
+    ))
     direct_lookup = bool(re.search(r"\b(?:tell\s+me|give\s+me|show\s+me|get\s+me|what(?:'s|\s+is))\b", text))
-    current_question = live_data and question and bool(re.search(r"\b(?:price|pricing|cost|stock|availability|available|in\s+stock|news|headlines|weather|score|results?)\b", text))
-    return strong_lookup or current_question or (live_data_target and direct_lookup and bool(re.search(r"\b(?:price|pricing|cost|stock|availability|available|in\s+stock|news|headlines|weather|score|results?)\b", text)))
+    current_lookup_term = bool(re.search(
+        r"\b(?:latest|current|currently|today|tonight|right\s+now|recent|news|headlines|price|pricing|cost|stock|availability|available|in\s+stock|release|schedule|listing|deal|sale|weather|score|results?)\b",
+        text,
+    ))
+    direct_current_lookup = direct_lookup and current_lookup_term
+    return explicit_browser_task or search_task or recurring_web_task or current_question or direct_current_lookup
 
 
 
 def classify_message_route(user_text: str) -> str:
-    """Select chat only for conversation; route every supported live/browser request to the agent."""
+    """Select chat only for conversation; route supported operational requests to the agent."""
     text = str(user_text or "").strip()
     if not text:
         return "chat"
@@ -1787,13 +1805,6 @@ def classify_message_route(user_text: str) -> str:
         return "task"
     if re.search(r"\b(?:go|navigate|take|open|visit|browse)\s+(?:to\s+)?(?:the\s+)?[a-z0-9][a-z0-9 .-]{1,80}", lowered):
         return "task"
-    if re.search(r"\b(?:summarize|extract|scrape|check)\b", lowered) and (
-        _contains_url_like_text(signal_text)
-        or re.search(r"\b(?:website|webpage|page|site|news|headlines|article)\b", lowered)
-    ):
-        return "task"
-    if re.search(r"\b(?:monitor|watch|alert|notify|tell me when|let me know when|every\s+(?:day|weekday|week)|daily|weekly)\b", lowered):
-        return "task"
     return "chat"
 
 
@@ -1805,18 +1816,19 @@ def build_media_context(interpretation: str, media_kind: str) -> str:
 
 
 def is_web_automation_request(user_text: str) -> bool:
-    """Detect explicit URL browser work and recurring web requests."""
-    text = str(user_text or "").lower()
-    web_markers = (
-        "check", "browse", "open", "visit", "scrape", "extract", "summarize",
-        "monitor", "watch", "alert", "notify", "tell me when", "schedule",
-        "login", "log in", "sign in", "search", "look up", "find",
-    )
-    if not any(marker in text for marker in web_markers):
+    """Detect explicit browser work while leaving ordinary conversation in chat mode."""
+    text = str(user_text or "").strip().lower()
+    if not text:
         return False
-    if _contains_url_like_text(text):
-        return True
-    return is_live_web_lookup_request(text)
+    web_markers = re.search(
+        r"\b(?:check|browse|open|visit|navigate|click|tap|type|fill|submit|scrape|extract|summari[sz]e|"
+        r"screenshot|screen\s*shot|monitor|watch|alert|notify|tell\s+me\s+when|schedule|"
+        r"login|log\s+in|sign\s+in|search|look\s+up|find|research)\b",
+        text,
+    )
+    if not web_markers:
+        return False
+    return _contains_url_like_text(text) or is_live_web_lookup_request(text)
 
 
 def build_chat_prompt(
