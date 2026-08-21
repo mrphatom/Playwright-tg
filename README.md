@@ -215,6 +215,8 @@ They can block a host or family of subdomains immediately:
    GEMINI_MODEL=gemini-3.6-flash
    MULTIMODAL_MODEL=gemini-3.5-flash-lite
    CHAT_TIMEOUT_SECONDS=20
+   # Show a persistent “still thinking” message only when work exceeds this delay.
+   PROGRESS_FEEDBACK_DELAY_SECONDS=1.2
    CHAT_CONTEXT_TURNS=32
    MEDIA_TIMEOUT_SECONDS=45
    MEDIA_MAX_BYTES=12000000

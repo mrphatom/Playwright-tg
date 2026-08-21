@@ -1554,6 +1554,68 @@ def test_unified_chat_reply_avoids_second_model_round_trip(monkeypatch):
     assert "next useful thing" in message.sent[0][0]
 
 
+def test_slow_unified_interpreter_shows_thinking_feedback_and_reuses_message(monkeypatch):
+    import bot
+
+    class FakeOutgoing:
+        message_id = 904
+
+        def __init__(self):
+            self.edits = []
+
+        async def edit_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+            return self
+
+    class FakeMessage:
+        text = "Give me a thoughtful answer"
+        caption = None
+        chat_id = 7793
+        message_id = 905
+        business_connection_id = None
+
+        def __init__(self):
+            self.sent = []
+            self.outgoing = None
+
+        async def reply_text(self, text, **kwargs):
+            self.outgoing = FakeOutgoing()
+            self.sent.append((text, kwargs, self.outgoing))
+            return self.outgoing
+
+    source = FakeMessage()
+    update = SimpleNamespace(
+        message=source,
+        business_message=None,
+        channel_post=None,
+        effective_message=source,
+        effective_chat=SimpleNamespace(id=source.chat_id, type="private"),
+        effective_user=SimpleNamespace(id=42),
+    )
+
+    async def slow_interpreter(*args, **kwargs):
+        await asyncio.sleep(0.01)
+        return {"mode": "chat", "reply": "I’m still with you, and here is the answer."}
+
+    async def fail_second_chat_call(*args, **kwargs):
+        raise AssertionError("the progress path must still use the unified chat reply")
+
+    monkeypatch.setattr(bot, "PROGRESS_FEEDBACK_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(bot, "parse_natural_language_intent", slow_interpreter)
+    monkeypatch.setattr(bot, "classify_message_route", lambda request: "chat")
+    monkeypatch.setattr(bot, "load_chat_history", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bot, "generate_chat_reply", fail_second_chat_call)
+    monkeypatch.setattr(bot, "record_contact_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+
+    asyncio.run(bot._process_natural_language(update, SimpleNamespace()))
+
+    assert len(source.sent) == 1
+    assert len(source.outgoing.edits) == 1
+    assert "still with you" in source.outgoing.edits[0][0]
+
+
 def test_private_chat_prompt_is_distinct_from_group_prompt():
     import bot
 
