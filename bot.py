@@ -174,6 +174,16 @@ GOOGLE_CUSTOM_SEARCH_API_KEY = os.getenv("GOOGLE_CUSTOM_SEARCH_API_KEY", "").str
 GOOGLE_CUSTOM_SEARCH_CX = os.getenv("GOOGLE_CUSTOM_SEARCH_CX", "").strip()
 GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS = max(3, min(20, int(os.getenv("GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS", "8"))))
 GOOGLE_CUSTOM_SEARCH_RESULTS = max(1, min(10, int(os.getenv("GOOGLE_CUSTOM_SEARCH_RESULTS", "5"))))
+DUCKDUCKGO_ENABLED = os.getenv("DUCKDUCKGO_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+BING_SEARCH_ENABLED = os.getenv("BING_SEARCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+BRAVE_SEARCH_ENABLED = os.getenv("BRAVE_SEARCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+STARTPAGE_SEARCH_ENABLED = os.getenv("STARTPAGE_SEARCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+TOR_PUBLIC_FALLBACK_ENABLED = os.getenv("TOR_PUBLIC_FALLBACK_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+TOR_ONION_ACCESS_ENABLED = os.getenv("TOR_ONION_ACCESS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+TOR_PROXY_SERVER = os.getenv("TOR_PROXY_SERVER", "").strip()
+TOR_PROXY_USERNAME = os.getenv("TOR_PROXY_USERNAME", "").strip()
+TOR_PROXY_PASSWORD = os.getenv("TOR_PROXY_PASSWORD", "").strip()
+TOR_ONION_ALLOWLIST = [pattern.strip().lower() for pattern in os.getenv("TOR_ONION_ALLOWLIST", "").split(",") if pattern.strip()]
 INLINE_TIMEOUT_SECONDS = max(3, min(20, int(os.getenv("INLINE_TIMEOUT_SECONDS", "8"))))
 ALLOWED_CHANNEL_IDS = {
     int(value.strip()) for value in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if value.strip().lstrip("-").isdigit()
@@ -1539,7 +1549,7 @@ def _normalize_pipeline_actions(raw_actions: Any, mode: str) -> Optional[List[st
             if not name:
                 return None
             action = action.split(":", 1)[0] + ":" + name
-        elif action == "proxy:on":
+        elif action in {"proxy:on", "proxy:tor"}:
             pass
         else:
             return None
@@ -1624,6 +1634,56 @@ CRYPTO_ASSET_TERMS = (
 CRYPTO_PRICE_TERMS = ("price", "worth", "value", "trading", "market cap", "marketcap", "quote")
 
 
+def is_onion_url(url: str) -> bool:
+    hostname = (urlparse(str(url or "")).hostname or "").rstrip(".").lower()
+    return hostname == "onion" or hostname.endswith(".onion")
+
+
+def onion_host_allowed(url: str) -> bool:
+    if not is_onion_url(url) or not TOR_ONION_ALLOWLIST:
+        return False
+    hostname = (urlparse(url).hostname or "").rstrip(".").lower()
+    return any(domain_pattern_matches(hostname, pattern) for pattern in TOR_ONION_ALLOWLIST)
+
+
+def user_can_use_onion(user_id: int) -> bool:
+    user = get_user(user_id)
+    if not user or user["status"] != "active":
+        return False
+    # Green/free users are intentionally excluded; paid and governed roles require
+    # the feature flag and an explicit onion host allowlist as a second boundary.
+    return bool(TOR_ONION_ACCESS_ENABLED and (user["plan"] in {"pro", "max"} or user["role"] in {"developer", "admin"}))
+
+
+def tor_route_available() -> bool:
+    return bool(TOR_PROXY_SERVER and (TOR_PUBLIC_FALLBACK_ENABLED or TOR_ONION_ACCESS_ENABLED))
+
+
+def tor_route_allowed(url: str, user_id: int) -> bool:
+    if not tor_route_available():
+        return False
+    if is_onion_url(url):
+        return user_can_use_onion(user_id) and onion_host_allowed(url)
+    return TOR_PUBLIC_FALLBACK_ENABLED
+
+
+def public_search_source_candidates(user_text: str) -> List[str]:
+    query = re.sub(r"\s+", " ", str(user_text or "").strip())[:240]
+    if not query:
+        return []
+    encoded = quote_plus(query)
+    candidates: List[str] = []
+    if DUCKDUCKGO_ENABLED:
+        candidates.append(f"https://duckduckgo.com/?q={encoded}")
+    if BING_SEARCH_ENABLED:
+        candidates.append(f"https://www.bing.com/search?q={encoded}")
+    if BRAVE_SEARCH_ENABLED:
+        candidates.append(f"https://search.brave.com/search?q={encoded}")
+    if STARTPAGE_SEARCH_ENABLED:
+        candidates.append(f"https://www.startpage.com/sp/search?query={encoded}")
+    return candidates
+
+
 def is_crypto_price_request(user_text: str) -> bool:
     text = str(user_text or "").lower()
     return bool(any(term in text for term in CRYPTO_ASSET_TERMS) and any(term in text for term in CRYPTO_PRICE_TERMS))
@@ -1638,24 +1698,43 @@ def crypto_source_candidates(user_text: str) -> List[str]:
     return [
         "https://www.google.com/search?q=" + quote_plus(query),
         "https://coinmarketcap.com/search/?q=" + quote_plus(query),
+        *public_search_source_candidates(clean),
     ]
 
 
-def source_candidates_for_request(user_text: str, primary_url: str = "") -> List[str]:
+def route_url_allowed(url: str, user_id: Optional[int] = None) -> bool:
+    if not is_valid_url(url):
+        return False
+    if is_onion_url(url):
+        return bool(onion_host_allowed(url) and (user_id is None or tor_route_allowed(url, user_id)))
+    return is_domain_allowed(url)
+
+
+def source_candidates_for_request(user_text: str, primary_url: str = "", user_id: Optional[int] = None) -> List[str]:
     """Build an ordered source list without bypassing the existing domain policy."""
     candidates: List[str] = []
-    for candidate in [primary_url, *crypto_source_candidates(user_text)]:
+    if is_crypto_price_request(user_text):
+        crypto_sources = crypto_source_candidates(user_text)
+        primary_is_google = bool(primary_url and (urlparse(primary_url).hostname or "").lower().removeprefix("www.") in {"google.com"})
+        ordered = [primary_url, *crypto_sources] if primary_is_google else [*crypto_sources, primary_url]
+    elif primary_url:
+        ordered = [primary_url]
+    elif is_live_web_lookup_request(user_text):
+        ordered = public_search_source_candidates(user_text)
+    else:
+        ordered = []
+    for candidate in ordered:
         clean = str(candidate or "").strip().rstrip(".,;!?)")
         if not clean or not clean.lower().startswith(("http://", "https://")):
             continue
-        if not is_valid_url(clean) or not is_domain_allowed(clean):
+        if not route_url_allowed(clean, user_id):
             continue
         if clean not in candidates:
             candidates.append(clean)
     return candidates
 
 
-def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
+def normalize_natural_language_plan(raw_plan: Any, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Validate and convert an AI-produced intent into allowlisted pipeline actions."""
     if not isinstance(raw_plan, dict):
         return None
@@ -1679,7 +1758,7 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
     if mode == "search":
         query = re.sub(r"\s+", " ", str(raw_plan.get("query", raw_plan.get("request", ""))).strip())[:500]
         return {"mode": "search", "query": query, "discovered_url": True} if GOOGLE_CUSTOM_SEARCH_ENABLED and query else None
-    if mode not in {"check", "watch"} or not is_valid_url(url) or not is_domain_allowed(url):
+    if mode not in {"check", "watch"} or not route_url_allowed(url, user_id):
         return None
 
     request = str(raw_plan.get("request", "")).strip()[:500]
@@ -1725,12 +1804,13 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
     if bool(raw_plan.get("screenshot", False)) or re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", request, flags=re.IGNORECASE):
         plan["screenshot_requested"] = True
     request_for_sources = str(raw_plan.get("request", ""))
-    safe_sources = source_candidates_for_request(request_for_sources, url)
+    safe_sources = source_candidates_for_request(request_for_sources, url, user_id)
+
     raw_sources = raw_plan.get("source_candidates")
     if isinstance(raw_sources, list):
         for candidate in raw_sources[:5]:
             if isinstance(candidate, str):
-                safe_sources.extend(source_candidates_for_request(request_for_sources, candidate))
+                safe_sources.extend(source_candidates_for_request(request_for_sources, candidate, user_id))
     if len(safe_sources) > 1:
         plan["source_candidates"] = list(dict.fromkeys(safe_sources))[:5]
     if discovered_url:
@@ -2396,7 +2476,7 @@ def discover_named_web_reference(user_text: str) -> Optional[str]:
     return None
 
 
-def parse_deterministic_web_request(user_text: str, default_session_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def parse_deterministic_web_request(user_text: str, default_session_name: Optional[str] = None, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Recover common check/watch requests when structured interpretation is unavailable."""
     text = str(user_text or "").strip()
     lowered = text.lower()
@@ -2421,7 +2501,7 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     reference_text = url_match.group(0) if url_match else (reference_match.group(0) if reference_match else "")
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
-    if not is_valid_url(url) or not is_domain_allowed(url):
+    if not route_url_allowed(url, user_id):
         return None
 
     interval_match = re.search(r"\bevery\s+(?:(\d+)\s*)?(seconds?|secs?|minutes?|mins?|hours?)\b", lowered)
@@ -2461,7 +2541,7 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
             "condition_type": "ai",
             "interval_seconds": interval_seconds,
         }
-        source_urls = source_candidates_for_request(text, url)
+        source_urls = source_candidates_for_request(text, url, user_id)
         if len(source_urls) > 1:
             result["source_candidates"] = source_urls
         if discovered_url:
@@ -2500,19 +2580,19 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
         "request": request,
         "screenshot_requested": bool(re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", lowered)),
     }
-    source_urls = source_candidates_for_request(text, url)
+    source_urls = source_candidates_for_request(text, url, user_id)
     if len(source_urls) > 1:
         result["source_candidates"] = source_urls
     if discovered_url:
         result["discovered_url"] = True
     return result
 async def parse_natural_language_intent(
-
     user_text: str,
     default_session_name: Optional[str] = None,
     reply_context: Optional[Dict[str, Any]] = None,
     chat_history: Optional[List[Dict[str, str]]] = None,
     private_chat: bool = False,
+    user_id: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Interpret every authorized message before falling back to conversational chat."""
     management_plan = parse_deterministic_management_request(user_text)
@@ -2523,7 +2603,7 @@ async def parse_natural_language_intent(
     if re.search(r"\b(?:login|log\s+in|sign\s+in)\b", str(user_text or ""), flags=re.IGNORECASE):
         return login_plan
 
-    fallback = lambda: parse_deterministic_schedule_request(user_text) or parse_deterministic_web_request(user_text, default_session_name)
+    fallback = lambda: parse_deterministic_schedule_request(user_text) or parse_deterministic_web_request(user_text, default_session_name, user_id)
     if not gemini_configured():
         return fallback()
 
@@ -2561,9 +2641,9 @@ async def parse_natural_language_intent(
             prompt,
             {"temperature": 0.0, "max_output_tokens": 2048},
         ))
-        plan = normalize_natural_language_plan(raw_plan)
+        plan = normalize_natural_language_plan(raw_plan, user_id=user_id)
         if plan and plan.get("mode") in {"check", "watch"}:
-            ordered_sources = source_candidates_for_request(user_text, plan.get("url", ""))
+            ordered_sources = source_candidates_for_request(user_text, plan.get("url", ""), user_id=user_id)
             if ordered_sources:
                 plan["source_candidates"] = list(dict.fromkeys(ordered_sources + list(plan.get("source_candidates", []))))[:5]
             if not plan.get("discovered_url") and plan["url"].rstrip("/") not in user_text and plan["url"] not in user_text:
@@ -2753,7 +2833,7 @@ async def run_browser_task_with_source_fallback(
     candidates = list(dict.fromkeys(
         str(url).strip()
         for url in source_urls
-        if str(url).strip() and is_valid_url(str(url).strip()) and is_domain_allowed(str(url).strip())
+        if str(url).strip() and route_url_allowed(str(url).strip(), user_id)
     ))
     if not candidates:
         raise ValueError("no safe source candidates")
@@ -2765,7 +2845,14 @@ async def run_browser_task_with_source_fallback(
                 f"🔁 The first source did not provide a usable result. Trying fallback source {index + 1}/{len(candidates)}..."
             )
         try:
-            result = await run_browser_task_with_retry(candidate, actions, user_id, operation_id, status_msg, attempts)
+            attempt_actions = list(actions)
+            use_tor = is_onion_url(candidate) or (index == len(candidates) - 1 and TOR_PUBLIC_FALLBACK_ENABLED and tor_route_available())
+            if use_tor:
+                if not tor_route_allowed(candidate, user_id):
+                    raise PermissionError("tor_route_unavailable_or_not_authorized")
+                if "proxy:tor" not in attempt_actions:
+                    attempt_actions.append("proxy:tor")
+            result = await run_browser_task_with_retry(candidate, attempt_actions, user_id, operation_id, status_msg, attempts)
             result["source_url"] = candidate
             last_result = result
             if extraction_result_is_usable(result) or index == len(candidates) - 1:
@@ -3207,7 +3294,11 @@ async def run_browser_task(url: str, actions: List[str], user_id: int, status_ms
         "viewport": {'width': 1280, 'height': 800}
     }
 
-    if "proxy:on" in actions and PROXY_SERVER:
+    if "proxy:tor" in actions:
+        if not TOR_PROXY_SERVER:
+            raise RuntimeError("Tor proxy is not configured")
+        context_opts["proxy"] = {"server": TOR_PROXY_SERVER, "username": TOR_PROXY_USERNAME, "password": TOR_PROXY_PASSWORD}
+    elif "proxy:on" in actions and PROXY_SERVER:
         context_opts["proxy"] = {"server": PROXY_SERVER, "username": PROXY_USERNAME, "password": PROXY_PASSWORD}
 
     for action in actions:
@@ -4695,6 +4786,7 @@ async def _process_natural_language(
             None if shared_context else active_session_by_chat.get(chat_id),
             chat_history=chat_history,
             private_chat=private_chat,
+            user_id=user_id,
             **parser_kwargs,
         )
     except TextProviderUnavailable:
@@ -4760,6 +4852,25 @@ async def _process_natural_language(
         getattr(status_msg, "message_id", None),
     )
     update_operation(operation_id, "running", 0)
+
+    onion_match = re.search(r"https?://[^\s,]+\.onion(?:/[^\s,]*)?", request_text, flags=re.IGNORECASE)
+    onion_target = str((plan or {}).get("url") or (onion_match.group(0) if onion_match else "")).rstrip(".,;!?)")
+    if onion_target and is_onion_url(onion_target):
+        if not TOR_ONION_ACCESS_ENABLED or not user_can_use_onion(user_id):
+            await status_msg.edit_text("⛔ Dark-web `.onion` access is not available on the Green/free tier. An eligible paid or governed account must also use an explicitly allowlisted onion host.")
+            log_audit(user_id, "natural_language", onion_target, "DENIED_ONION_TIER")
+            update_operation(operation_id, "denied")
+            return
+        if not onion_host_allowed(onion_target):
+            await status_msg.edit_text("⛔ This `.onion` host is not allowlisted. An administrator must explicitly allow the host before GreyAI can route to it.")
+            log_audit(user_id, "natural_language", onion_target, "DENIED_ONION_ALLOWLIST")
+            update_operation(operation_id, "denied")
+            return
+        if not TOR_PROXY_SERVER:
+            await status_msg.edit_text("⚠️ Tor routing is not configured on this deployment, so GreyAI cannot safely open this `.onion` address yet.")
+            log_audit(user_id, "natural_language", onion_target, "DENIED_TOR_NOT_CONFIGURED")
+            update_operation(operation_id, "denied")
+            return
 
     if shared_context:
         allowed_modes = {"check"} if public_context else {"check", "watch"}

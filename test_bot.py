@@ -163,6 +163,21 @@ def test_encrypted_session_storage():
     decrypted = load_encrypted_session(user_id, session_name)
     assert decrypted == dummy_cookies
 
+def test_public_search_sources_include_duckduckgo_and_other_fallbacks(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "DUCKDUCKGO_ENABLED", True)
+    monkeypatch.setattr(bot, "BING_SEARCH_ENABLED", True)
+    monkeypatch.setattr(bot, "BRAVE_SEARCH_ENABLED", True)
+    monkeypatch.setattr(bot, "STARTPAGE_SEARCH_ENABLED", True)
+
+    sources = bot.public_search_source_candidates("latest technology news")
+
+    assert sources[0].startswith("https://duckduckgo.com/")
+    assert any("bing.com/search" in source for source in sources)
+    assert any("search.brave.com" in source for source in sources)
+    assert any("startpage.com" in source for source in sources)
+
+
 def test_crypto_source_candidates_are_ordered_and_allowlisted(monkeypatch):
     import bot
     monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
@@ -171,6 +186,27 @@ def test_crypto_source_candidates_are_ordered_and_allowlisted(monkeypatch):
 
     assert candidates[0] == "https://www.google.com/search?q=bitcoin"
     assert any("coinmarketcap.com/search" in candidate for candidate in candidates)
+
+
+def test_green_tier_cannot_use_onion_but_paid_governed_accounts_can(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "TOR_ONION_ACCESS_ENABLED", True)
+    monkeypatch.setattr(bot, "TOR_PROXY_SERVER", "socks5://127.0.0.1:9050")
+    monkeypatch.setattr(bot, "TOR_ONION_ALLOWLIST", ["exampleonion.onion"])
+    users = {
+        1: {"status": "active", "plan": "free", "role": "user"},
+        2: {"status": "active", "plan": "pro", "role": "user"},
+        3: {"status": "active", "plan": "free", "role": "developer"},
+    }
+    monkeypatch.setattr(bot, "get_user", lambda user_id: users[user_id])
+
+    onion_url = "http://exampleonion.onion/catalog"
+    assert bot.user_can_use_onion(1) is False
+    assert bot.user_can_use_onion(2) is True
+    assert bot.user_can_use_onion(3) is True
+    assert bot.route_url_allowed(onion_url, user_id=1) is False
+    assert bot.route_url_allowed(onion_url, user_id=2) is True
+    assert bot.tor_route_allowed(onion_url, 2) is True
 
 
 def test_path_specific_plan_preserves_path_and_does_not_force_screenshot(monkeypatch):
@@ -750,6 +786,19 @@ def test_sensitive_natural_language_actions_are_redacted():
     assert mask_sensitive_action("ai_extract:read my private account") == "ai_extract:***REDACTED***"
     assert mask_sensitive_action("condition_ai:alert me about my order") == "condition_ai:***REDACTED***"
     assert mask_sensitive_action("condition_contains:secret phrase") == "condition_contains:***REDACTED***"
+
+
+def test_tor_public_fallback_is_optional_and_last_route(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    monkeypatch.setattr(bot, "TOR_PUBLIC_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(bot, "TOR_PROXY_SERVER", "socks5://127.0.0.1:9050")
+
+    sources = bot.source_candidates_for_request("Search the latest technology news")
+
+    assert sources
+    assert all(not bot.is_onion_url(source) for source in sources)
+    assert bot.tor_route_allowed("https://example.com", 42) is True
 
 
 def test_source_fallback_tries_next_provider_after_empty_extraction(monkeypatch):
