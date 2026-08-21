@@ -1542,7 +1542,11 @@ def normalize_natural_language_plan(raw_plan: Any) -> Optional[Dict[str, Any]]:
     mode = str(raw_plan.get("mode", "")).strip().lower()
     mode = {"monitor": "watch", "poll": "watch", "track": "watch"}.get(mode, mode)
     if mode == "chat":
-        return {"mode": "chat"}
+        reply = str(raw_plan.get("reply", raw_plan.get("response", "")) or "").strip()[:4000]
+        plan = {"mode": "chat"}
+        if reply:
+            plan["reply"] = reply
+        return plan
     if mode == "schedule":
         schedule_config = normalize_schedule_config(raw_plan)
         return {"mode": "schedule", "schedule": schedule_config} if schedule_config else None
@@ -1620,10 +1624,11 @@ Use this shape:
   "urls": ["explicit http or https URLs for a schedule"],
   "delivery_mode": "combined" | "separate",
   "summary_prompt": "summary instructions for a schedule",
+  "reply": "the conversational answer when mode is chat; empty for every other mode",
   "reply_summary": "short confirmation"
 }
 Allowed actions are only: type:<css_selector>=<text>, click:<css_selector>, wait:<seconds from 0 to 30>, extract:<css_selector>, ai_extract:<prompt>, save_session:<name>, load_session:<name>, proxy:on, condition_contains:<text>, and condition_ai:<prompt>.
-Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return only {"mode":"chat"} for ordinary conversation.
+Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return {"mode":"chat","reply":"..."} and write the complete conversational answer in reply. Leave reply empty for every other mode.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
 Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL.
 Use mode schedule for a recurring briefing and put every source URL in urls.
@@ -2362,6 +2367,8 @@ async def parse_natural_language_intent(
     user_text: str,
     default_session_name: Optional[str] = None,
     reply_context: Optional[Dict[str, Any]] = None,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+    private_chat: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Interpret every authorized message before falling back to conversational chat."""
     management_plan = parse_deterministic_management_request(user_text)
@@ -2383,12 +2390,27 @@ async def parse_natural_language_intent(
             f"{str(reply_context['text'])[:4000]}\n"
             "</replied_to_message_untrusted_data>\n"
         )
+    history_block = ""
+    if chat_history:
+        transcript = "\n".join(
+            f"{turn.get('role', 'user').capitalize()}: {str(turn.get('text', ''))[:1200]}"
+            for turn in chat_history[-CHAT_CONTEXT_TURNS:]
+        )
+        history_block = (
+            "\n<conversation_context_untrusted_data>\n"
+            f"{transcript[:8000]}\n"
+            "</conversation_context_untrusted_data>\n"
+        )
+    private_chat_block = (
+        "\nFor private chat, keep a warm, expressive, natural GreyAI persona when mode is chat.\n"
+        if private_chat else ""
+    )
     prompt = (
         f"{NATURAL_LANGUAGE_SYSTEM_PROMPT}\n\n"
         "<user_request_untrusted_data>\n"
         f"{str(user_text)[:2000]}\n"
         "</user_request_untrusted_data>"
-        f"{reply_block}\nReturn JSON only."
+        f"{reply_block}{history_block}{private_chat_block}\nReturn JSON only."
     )
     try:
         raw_plan = parse_json_object(await gemini_provider.generate_text(
@@ -4358,11 +4380,17 @@ async def _process_natural_language(
             return
 
     route_hint = classify_message_route(request_text)
+    chat_history: List[Dict[str, str]] = []
+    if route_hint == "chat":
+        durable_history = load_chat_history(user_id, chat_id, CHAT_CONTEXT_TURNS)
+        chat_history = durable_history or chat_histories.get(chat_id, [])
     try:
         parser_kwargs = {"reply_context": reply_context} if reply_context else {}
         plan = await parse_natural_language_intent(
             request_text,
             None if shared_context else active_session_by_chat.get(chat_id),
+            chat_history=chat_history,
+            private_chat=private_chat,
             **parser_kwargs,
         )
     except TextProviderUnavailable:
@@ -4373,7 +4401,15 @@ async def _process_natural_language(
     interpreted_task = bool(plan and plan.get("mode") not in {"chat", "unknown"})
     route = "task" if interpreted_task or route_hint == "task" else "chat"
     if route == "chat":
-        reply = await generate_chat_reply(chat_id, request_text, private_chat=private_chat, owner_user_id=user_id, reply_context=reply_context)
+        reply = str(plan.get("reply", "")).strip() if plan and plan.get("mode") == "chat" else ""
+        if not reply:
+            reply = await generate_chat_reply(
+                chat_id,
+                request_text,
+                private_chat=private_chat,
+                owner_user_id=user_id,
+                reply_context=reply_context,
+            )
         sent_reply = await source_message.reply_text(telegram_safe_html(reply), parse_mode="HTML")
         remember_chat_turn(
             chat_id,
