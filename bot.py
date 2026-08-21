@@ -14,6 +14,7 @@ import urllib.request
 import urllib.error
 import aiohttp
 from pathlib import Path
+from types import SimpleNamespace
 from html import escape as html_escape
 from datetime import datetime, timedelta, time as datetime_time
 from typing import List, Dict, Optional, Any
@@ -104,6 +105,7 @@ from control_plane import (
     get_queue_stats,
     record_conversation_turn,
     list_conversation_turns,
+    get_conversation_turn_by_telegram_message_id,
     record_contact_log as persist_contact_log,
     list_contact_logs as load_contact_logs,
 )
@@ -1839,20 +1841,66 @@ def build_chat_prompt(
     return f"{system_prompt}\n\nConversation so far:\n{transcript or '(none)'}{reply_block}\n\nUser: {str(user_text)[:4000]}\nAssistant:"
 
 
-def extract_reply_context(message) -> Optional[Dict[str, Any]]:
-    """Extract text and identity from Telegram's replied-to message without requiring a copy/paste."""
-    replied = getattr(message, "reply_to_message", None)
-    if not replied:
+def extract_reply_context(
+    message,
+    update: Optional[Update] = None,
+    owner_user_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Extract Telegram reply context across normal and Secretary Mode update shapes."""
+    candidates = []
+    if update is not None:
+        # Telegram's lower-level business update shape carries the original reply beside the message.
+        candidates.extend([
+            getattr(update, "reply_to_message", None),
+            getattr(update, "business_reply_to_message", None),
+        ])
+    candidates.append(getattr(message, "reply_to_message", None))
+
+    replied = next((candidate for candidate in candidates if candidate is not None), None)
+    source_kind = "reply"
+    if replied is None:
+        quote = getattr(message, "quote", None)
+        quote_text = str(getattr(quote, "text", None) or "").strip() if quote else ""
+        if quote_text:
+            replied = quote
+            source_kind = "quote"
+    if replied is None:
+        # Some Telegram wrappers expose only a partial external reply object.
+        external_reply = getattr(message, "external_reply", None)
+        external_text = str(
+            getattr(external_reply, "text", None)
+            or getattr(external_reply, "caption", None)
+            or ""
+        ).strip() if external_reply else ""
+        if external_text:
+            replied = external_reply
+            source_kind = "external_reply"
+    if replied is None:
         return None
-    text = str(getattr(replied, "text", None) or getattr(replied, "caption", None) or "").strip()
+
+    message_id = getattr(replied, "message_id", None) or getattr(message, "reply_to_message_id", None)
+    text = str(
+        getattr(replied, "text", None)
+        or getattr(replied, "caption", None)
+        or getattr(replied, "quote", None)
+        or ""
+    ).strip()
+    author = getattr(replied, "from_user", None)
+    if not text and owner_user_id is not None and chat_id is not None and message_id is not None:
+        stored = get_conversation_turn_by_telegram_message_id(owner_user_id, chat_id, message_id)
+        if stored:
+            text = str(stored["text"] or "").strip()
+            source_kind = "durable_conversation_log"
+            author = SimpleNamespace(full_name="GreyAI", username="GreyBrowserBot", is_bot=True)
     if not text:
         return None
-    author = getattr(replied, "from_user", None)
     return {
-        "message_id": getattr(replied, "message_id", None),
+        "message_id": message_id,
         "text": text[:4000],
         "author": getattr(author, "full_name", None) or getattr(author, "username", None) or "Telegram user",
         "is_bot": bool(getattr(author, "is_bot", False)),
+        "source": source_kind,
     }
 
 
@@ -1897,6 +1945,7 @@ def remember_chat_turn(
     source_message_id: Optional[int] = None,
     reply_to_message_id: Optional[int] = None,
     business_connection_id: Optional[str] = None,
+    assistant_message_id: Optional[int] = None,
 ):
     owner_id = int(owner_user_id if owner_user_id is not None else chat_id)
     history = chat_histories.setdefault(chat_id, [])
@@ -1906,8 +1955,28 @@ def remember_chat_turn(
     ])
     chat_histories[chat_id] = history[-8:]
     metadata = {"source": "telegram", "owner_user_id": owner_id}
-    record_conversation_turn(owner_id, chat_id, "user", user_text, source_message_id, reply_to_message_id, business_connection_id, metadata)
-    record_conversation_turn(owner_id, chat_id, "assistant", reply_text, source_message_id, reply_to_message_id, business_connection_id, metadata)
+    record_conversation_turn(
+        owner_id,
+        chat_id,
+        "user",
+        user_text,
+        source_message_id=source_message_id,
+        telegram_message_id=source_message_id,
+        reply_to_message_id=reply_to_message_id,
+        business_connection_id=business_connection_id,
+        metadata=metadata,
+    )
+    record_conversation_turn(
+        owner_id,
+        chat_id,
+        "assistant",
+        reply_text,
+        source_message_id=source_message_id,
+        telegram_message_id=assistant_message_id,
+        reply_to_message_id=reply_to_message_id,
+        business_connection_id=business_connection_id,
+        metadata=metadata,
+    )
 
 
 async def generate_chat_reply(
@@ -4216,7 +4285,7 @@ async def _process_natural_language(
     if user_id is None:
         logger.warning("natural_language_missing_user_identity chat_id=%s", chat_id)
         return
-    reply_context = extract_reply_context(source_message)
+    reply_context = extract_reply_context(source_message, update=update, owner_user_id=user_id, chat_id=chat_id)
     reply_to_message_id = reply_context.get("message_id") if reply_context else None
     business_connection_id = getattr(source_message, "business_connection_id", None)
     interaction_type = "business_message" if business_connection_id else ("channel_post" if getattr(update, "channel_post", None) else "message")
@@ -4233,8 +4302,17 @@ async def _process_natural_language(
 
     contextual_reply = resolve_contextual_watcher_followup(chat_id, request_text)
     if contextual_reply:
-        remember_chat_turn(chat_id, request_text, contextual_reply, user_id, getattr(source_message, "message_id", None), reply_to_message_id, business_connection_id)
-        await source_message.reply_text(telegram_safe_html(contextual_reply), parse_mode="HTML")
+        sent_reply = await source_message.reply_text(telegram_safe_html(contextual_reply), parse_mode="HTML")
+        remember_chat_turn(
+            chat_id,
+            request_text,
+            contextual_reply,
+            user_id,
+            getattr(source_message, "message_id", None),
+            reply_to_message_id,
+            business_connection_id,
+            getattr(sent_reply, "message_id", None),
+        )
         log_audit(user_id, "agent_context_followup", None, "WATCHER_CONTEXT_RESOLVED")
         return
 
@@ -4242,8 +4320,17 @@ async def _process_natural_language(
     route = classify_message_route(request_text)
     if route == "chat":
         reply = await generate_chat_reply(chat_id, request_text, private_chat=private_chat, owner_user_id=user_id, reply_context=reply_context)
-        remember_chat_turn(chat_id, request_text, reply, user_id, getattr(source_message, "message_id", None), reply_to_message_id, business_connection_id)
-        await source_message.reply_text(telegram_safe_html(reply), parse_mode="HTML")
+        sent_reply = await source_message.reply_text(telegram_safe_html(reply), parse_mode="HTML")
+        remember_chat_turn(
+            chat_id,
+            request_text,
+            reply,
+            user_id,
+            getattr(source_message, "message_id", None),
+            reply_to_message_id,
+            business_connection_id,
+            getattr(sent_reply, "message_id", None),
+        )
         log_audit(user_id, "chat", None, "SUCCESS")
         return
 
@@ -4259,6 +4346,7 @@ async def _process_natural_language(
         getattr(source_message, "message_id", None),
         reply_to_message_id,
         business_connection_id,
+        getattr(status_msg, "message_id", None),
     )
     update_operation(operation_id, "running", 0)
 
@@ -4452,8 +4540,17 @@ async def _process_natural_language(
             log_audit(user_id, "natural_language", None, "UNINTERPRETED_TASK")
             return
         reply = await generate_chat_reply(chat_id, request_text, private_chat=private_chat, owner_user_id=user_id, reply_context=reply_context)
-        remember_chat_turn(chat_id, request_text, reply, user_id, getattr(source_message, "message_id", None), reply_to_message_id, business_connection_id)
         await status_msg.edit_text(telegram_safe_html(reply), parse_mode="HTML")
+        remember_chat_turn(
+            chat_id,
+            request_text,
+            reply,
+            user_id,
+            getattr(source_message, "message_id", None),
+            reply_to_message_id,
+            business_connection_id,
+            getattr(status_msg, "message_id", None),
+        )
         log_audit(user_id, "chat", None, "SUCCESS")
         update_operation(operation_id, "succeeded")
         return

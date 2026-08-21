@@ -1862,3 +1862,62 @@ def test_contact_log_redacts_credentials_and_keeps_reply_metadata():
     assert "super-secret-value" not in row["message_text"]
     assert "[redacted]" in row["message_text"]
     assert row["reply_to_message_id"] == 87
+
+
+def test_business_reply_context_reads_update_level_reply_and_quote_fallback():
+    import bot
+
+    replied = SimpleNamespace(
+        message_id=91,
+        text="Classic mutual friend chaos—gotta love high stakes.",
+        caption=None,
+        from_user=SimpleNamespace(id=6411860985, is_bot=True, username="GreyBrowserBot"),
+    )
+    business_message = SimpleNamespace(
+        message_id=92,
+        text="..",
+        caption=None,
+        reply_to_message=None,
+        quote=None,
+    )
+    update = SimpleNamespace(business_message=business_message, reply_to_message=replied)
+
+    context = bot.extract_reply_context(business_message, update=update)
+
+    assert context["message_id"] == 91
+    assert "Classic mutual friend chaos" in context["text"]
+
+    quoted_message = SimpleNamespace(
+        message_id=93,
+        text="..",
+        caption=None,
+        reply_to_message=None,
+        quote=SimpleNamespace(text="Quoted Grey message text"),
+    )
+    quote_context = bot.extract_reply_context(quoted_message)
+
+    assert quote_context["text"] == "Quoted Grey message text"
+
+
+def test_reply_context_recovers_outbound_grey_message_from_durable_log():
+    import bot
+
+    bot.remember_chat_turn(
+        7005,
+        "Earlier question",
+        "The durable answer Grey sent.",
+        owner_user_id=6411860985,
+        source_message_id=94,
+        assistant_message_id=95,
+    )
+    incoming = SimpleNamespace(
+        message_id=96,
+        text="..",
+        caption=None,
+        reply_to_message=SimpleNamespace(message_id=95, text=None, caption=None, from_user=None),
+    )
+
+    context = bot.extract_reply_context(incoming, owner_user_id=6411860985, chat_id=7005)
+
+    assert context["source"] == "durable_conversation_log"
+    assert context["text"] == "The durable answer Grey sent."
