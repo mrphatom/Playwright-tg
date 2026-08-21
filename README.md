@@ -71,7 +71,7 @@ When a new key is created, GreyAI sends a separate, clearly labeled message cont
 | `/sessions` | List encrypted browser-session metadata | `/sessions` |
 | `/deletesession` | Delete one saved browser session | `/deletesession <name>` |
 | `/dashboard` | Request a secure one-time operations-dashboard link | `/dashboard` |
-| `/upgrade` | View or purchase Pro or Max with Telegram Stars | `/upgrade max` |
+| `/upgrade` | Compare Pro and Max benefits and choose a plan with Telegram buttons | `/upgrade max` for a direct invoice |
 | `/referral` | Create or display your invite link | `/referral` |
 | `/report` | Submit a support or safety report | `/report The browser task failed` |
 | `/appeal` | Open an account review appeal | `/appeal Please review my limitation` |
@@ -334,7 +334,7 @@ Log in once and reuse the state safely.
 
 Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and replace the starter `ALLOWED_DOMAINS` list with the domains you are prepared to permit. Public mode rejects private and loopback IP targets and refuses to operate with an empty domain allowlist. Search-provider fallbacks remain allowlist-controlled; the Fly deployment runs Tor privately on loopback for public fallback, and `.onion` hosts remain unavailable to Green/free and Pro users.
 
-Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, purchase Pro or Max access with `/upgrade pro` or `/upgrade max` using Telegram Stars, submit `/report` and `/appeal` tickets, request developer access with `/devrequest`, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, chat, and developer-management capabilities. Ordinary conversation is routed directly to the chat path; browser-like wording, named-site requests, schedules, watchers, and management actions remain on the task path. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, `/resolveappeal`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, and `/revokedeveloper`.
+Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, compare Pro and Max benefits with `/upgrade` and select either plan using Telegram buttons, or use `/upgrade pro` and `/upgrade max` for direct invoices. They can also purchase access using Telegram Stars, submit `/report` and `/appeal` tickets, request developer access with `/devrequest`, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, chat, and developer-management capabilities. Ordinary conversation is routed directly to the chat path; browser-like wording, named-site requests, schedules, watchers, and management actions remain on the task path. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, `/resolveappeal`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, and `/revokedeveloper`.
 
 The current plans are **Pro at 750 Stars for 30 days with 1,000 monthly execution units** and **Max at 1,000 Stars for 30 days with 5,000 monthly execution units**. Telegram payment validation checks the selected plan, amount, currency, invoice owner, and idempotent payment record before granting the matching entitlement.
 

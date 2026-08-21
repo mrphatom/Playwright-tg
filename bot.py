@@ -22,8 +22,8 @@ from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse, quote_plus, parse_qs
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, InlineQueryHandler, ChosenInlineResultHandler, BusinessConnectionHandler, filters
+from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, InlineQueryHandler, ChosenInlineResultHandler, BusinessConnectionHandler, CallbackQueryHandler, filters
 from telegram.error import TelegramError
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Browser, Playwright, BrowserContext
@@ -150,6 +150,22 @@ PRO_PLAN_STARS = int(os.getenv("PRO_PLAN_STARS", "750"))
 MAX_PLAN_STARS = int(os.getenv("MAX_PLAN_STARS", "1000"))
 PRO_PLAN_QUOTA = int(os.getenv("PRO_PLAN_QUOTA", "1000"))
 MAX_PLAN_QUOTA = int(os.getenv("MAX_PLAN_QUOTA", "5000"))
+PLAN_BENEFITS = {
+    "pro": (
+        "1,000 monthly execution units",
+        "Priority access over the Green/free queue",
+        "Natural-language chat, browser tasks, watchers, and schedules",
+        "30-day Telegram Stars entitlement",
+        "Pro does not include .onion browsing",
+    ),
+    "max": (
+        "5,000 monthly execution units",
+        "Highest queue priority for faster task dispatch",
+        "Natural-language chat, browser tasks, watchers, and schedules",
+        "Eligible for explicitly allowlisted .onion browsing",
+        "30-day Telegram Stars entitlement",
+    ),
+}
 PROVIDER_ALERTS_ENABLED = os.getenv("PROVIDER_ALERTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 PROVIDER_ALERT_COOLDOWN_SECONDS = max(60, min(86400, int(os.getenv("PROVIDER_ALERT_COOLDOWN_SECONDS", "900"))))
 NOTIFICATION_WORKER_ENABLED = os.getenv("NOTIFICATION_WORKER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -3650,13 +3666,34 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔐 One-time dashboard link (expires soon):\n{base}/login?token={token}")
 
 
-@restricted
-async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    requested_plan = (context.args[0].lower() if context.args else "pro")
-    if requested_plan not in {"pro", "max"}:
-        return await update.message.reply_text("Usage: /upgrade [pro|max]")
-    plan = requested_plan
+def upgrade_plan_menu_text() -> str:
+    lines = [
+        "<b>GreyAI plans</b>",
+        "Choose a plan below. Every paid entitlement lasts 30 days and is paid with Telegram Stars.",
+        "",
+        f"<b>Pro — {PRO_PLAN_STARS} Stars / 30 days</b>",
+    ]
+    lines.extend(f"• {html_escape(benefit)}" for benefit in PLAN_BENEFITS["pro"])
+    lines.extend([
+        "",
+        f"<b>Max — {MAX_PLAN_STARS} Stars / 30 days</b>",
+    ])
+    lines.extend(f"• {html_escape(benefit)}" for benefit in PLAN_BENEFITS["max"])
+    lines.extend([
+        "",
+        "Paid access grants usage entitlements, not guaranteed results from third-party websites. All tasks remain subject to GreyAI safety, allowlist, and service policies.",
+    ])
+    return "\n".join(lines)
+
+
+def upgrade_plan_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Choose Pro — {PRO_PLAN_STARS} Stars", callback_data="upgrade:pro")],
+        [InlineKeyboardButton(f"Choose Max — {MAX_PLAN_STARS} Stars", callback_data="upgrade:max")],
+    ])
+
+
+async def _send_upgrade_invoice(target, user_id: int, plan: str, audit_action: str = "/upgrade"):
     amount = PRO_PLAN_STARS if plan == "pro" else MAX_PLAN_STARS
     quota = PRO_PLAN_QUOTA if plan == "pro" else MAX_PLAN_QUOTA
     payload = plan + ":" + secrets.token_urlsafe(16)
@@ -3672,17 +3709,54 @@ async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order = get_payment_order_by_external_id("telegram_stars", payload)
         order_id = order["order_id"] if order else order_id
     title = "GreyAI Pro" if plan == "pro" else "GreyAI Max"
-    description = ("Higher execution limits and priority access for 30 days." if plan == "pro" else "Maximum execution limits and priority access for 30 days.")
-    await update.message.reply_invoice(
+    description = " ".join(PLAN_BENEFITS[plan][:3]) + "."
+    await target.reply_invoice(
         title=title,
-        description=description,
+        description=description[:255],
         payload=payload,
         provider_token="",
         currency="XTR",
         prices=[LabeledPrice(f"{title} — 30 days", amount)],
         start_parameter=f"greyai-{plan}",
     )
-    log_audit(user_id, "/upgrade", None, f"INVOICE_{order_id}")
+    log_audit(user_id, audit_action, None, f"INVOICE_{order_id}_{plan.upper()}")
+
+
+@restricted
+async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    requested_plan = context.args[0].lower() if context.args else ""
+    if not requested_plan:
+        return await update.message.reply_text(
+            upgrade_plan_menu_text(),
+            parse_mode="HTML",
+            reply_markup=upgrade_plan_keyboard(),
+        )
+    if requested_plan not in {"pro", "max"}:
+        return await update.message.reply_text(
+            "Please choose one of the plans below, or use /upgrade pro or /upgrade max.",
+            reply_markup=upgrade_plan_keyboard(),
+        )
+    await _send_upgrade_invoice(update.message, user_id, requested_plan)
+
+
+async def upgrade_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    user = query.from_user
+    user_id = user.id
+    ensure_user(user_id, getattr(user, "username", None), getattr(user, "full_name", None))
+    if not is_allowed_user(user_id):
+        await query.answer("Your account is not currently eligible to upgrade.", show_alert=True)
+        log_audit(user_id, "upgrade_callback", None, "DENIED_UNAUTHORIZED_OR_ACCOUNT_STATE")
+        return
+    plan = str(query.data or "").split(":", 1)[-1].lower()
+    if plan not in {"pro", "max"} or not query.message:
+        await query.answer("That plan selection is no longer valid. Use /upgrade again.", show_alert=True)
+        return
+    await query.answer(f"Preparing your {plan.title()} invoice…")
+    await _send_upgrade_invoice(query.message, user_id, plan, audit_action="upgrade_button")
 
 
 async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3738,7 +3812,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
 
 @restricted
 async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Plans: Pro costs {PRO_PLAN_STARS} Telegram Stars and includes up to {PRO_PLAN_QUOTA} monthly execution units. Max costs {MAX_PLAN_STARS} Telegram Stars and includes up to {MAX_PLAN_QUOTA} monthly execution units. Each entitlement lasts 30 days. Paid access grants software usage entitlements, not guaranteed results from third-party websites. Use /paysupport for payment support.")
+    await update.message.reply_text(upgrade_plan_menu_text(), parse_mode="HTML", reply_markup=upgrade_plan_keyboard())
 
 
 @restricted
@@ -5677,7 +5751,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — Start GreyAI and get your referral link\n"
         "/dashboard — Open the secure operations dashboard\n"
         "/health — View service health\n"
-        "/upgrade [pro|max] — View or purchase a plan with Telegram Stars\n"
+        "/upgrade — Compare Pro and Max benefits, then choose a plan with buttons\n"
         "/referral — Create your invite link\n"
         "/report &lt;text&gt; — Send a support or safety report\n"
         "/appeal &lt;text&gt; — Request account review\n\n"
@@ -5813,6 +5887,7 @@ def main():
     app.add_handler(CommandHandler("analytics", analytics_command))
     app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("upgrade", upgrade_command))
+    app.add_handler(CallbackQueryHandler(upgrade_plan_callback, pattern=r"^upgrade:(pro|max)$"))
     app.add_handler(CommandHandler("crypto", crypto_command))
     app.add_handler(CommandHandler("terms", terms_command))
     app.add_handler(CommandHandler("support", support_command))
