@@ -1708,3 +1708,67 @@ def test_maintenance_command_persists_scheduled_time(monkeypatch):
     assert captured[0][0][0] == "scheduled"
     assert captured[0][1]["metadata"]["timezone"] == "Europe/London"
     assert captured[0][1]["metadata"]["scheduled_for"].startswith("2026-08-22T14:30:00+01:00")
+def test_custom_search_provider_parses_and_bounds_results(monkeypatch):
+    import bot
+
+    provider = bot.GoogleCustomSearchProvider("api-key", "engine-id", timeout_seconds=3)
+
+    async def fake_request(query):
+        assert query == "latest product news"
+        return {
+            "items": [
+                {"title": "Example result", "link": "https://example.com/article", "snippet": "A useful result."},
+                {"title": "Not a URL", "link": "javascript:alert(1)", "snippet": "Ignored."},
+                {"title": "Missing link", "snippet": "Ignored."},
+            ]
+        }
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    results = asyncio.run(provider.search("  latest   product news  "))
+
+    assert results == [{
+        "title": "Example result",
+        "link": "https://example.com/article",
+        "snippet": "A useful result.",
+    }]
+
+
+def test_custom_search_provider_classifies_quota_errors(monkeypatch):
+    import bot
+
+    provider = bot.GoogleCustomSearchProvider("api-key", "engine-id")
+
+    async def fake_request(query):
+        raise bot.SearchProviderUnavailable("quota")
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    with pytest.raises(bot.SearchProviderUnavailable, match="quota"):
+        asyncio.run(provider.search("quota test"))
+
+
+def test_enabled_custom_search_routes_generic_and_factual_requests(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "GOOGLE_CUSTOM_SEARCH_ENABLED", True)
+    assert bot.parse_deterministic_web_request("Search for the latest laptop prices") == {
+        "mode": "search",
+        "query": "Search for the latest laptop prices",
+        "discovered_url": True,
+    }
+    factual = bot.parse_deterministic_web_request("Have Cristiano Ronaldo officially announced his retirement?")
+    assert factual["mode"] == "search"
+    assert factual["query"].startswith("Have Cristiano Ronaldo")
+
+
+def test_enabled_custom_search_normalizes_google_model_url(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "GOOGLE_CUSTOM_SEARCH_ENABLED", True)
+    plan = bot.normalize_natural_language_plan({
+        "mode": "check",
+        "url": "https://www.google.com/search?q=latest+headlines",
+        "discover_url": True,
+        "request": "latest headlines",
+    })
+
+    assert plan == {"mode": "search", "query": "latest headlines", "discovered_url": True}
