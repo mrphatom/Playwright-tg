@@ -13,6 +13,9 @@ import ipaddress
 import tempfile
 import shutil
 import zipfile
+import tarfile
+import mimetypes
+import math
 import urllib.request
 import urllib.error
 import aiohttp
@@ -129,6 +132,10 @@ from control_plane import (
     list_queue_entries,
     get_queue_stats,
     get_platform_activity_summary,
+    create_download_job,
+    finish_download_job,
+    count_download_jobs_since,
+    get_last_download_job_at,
     record_conversation_turn,
     list_conversation_turns,
     get_conversation_turn_by_telegram_message_id,
@@ -163,6 +170,23 @@ INTELLIGENT_NAVIGATION_ENABLED = os.getenv("INTELLIGENT_NAVIGATION_ENABLED", "tr
 INTELLIGENT_NAVIGATION_MAX_STEPS = max(1, min(8, int(os.getenv("INTELLIGENT_NAVIGATION_MAX_STEPS", "5"))))
 INTELLIGENT_NAVIGATION_MAX_ELEMENTS = max(20, min(120, int(os.getenv("INTELLIGENT_NAVIGATION_MAX_ELEMENTS", "80"))))
 INTELLIGENT_NAVIGATION_PAGE_TEXT_CHARS = max(2000, min(12000, int(os.getenv("INTELLIGENT_NAVIGATION_PAGE_TEXT_CHARS", "6000"))))
+DOWNLOADS_ENABLED = os.getenv("DOWNLOADS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+DOWNLOAD_FREE_ENABLED = os.getenv("DOWNLOAD_FREE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+DOWNLOAD_PRO_MAX_BYTES = max(1_000_000, min(100_000_000, int(os.getenv("DOWNLOAD_PRO_MAX_BYTES", "25000000"))))
+DOWNLOAD_MAX_BYTES = max(DOWNLOAD_PRO_MAX_BYTES, min(250_000_000, int(os.getenv("DOWNLOAD_MAX_BYTES", "100000000"))))
+DOWNLOAD_PRO_MAX_JOBS_PER_DAY = max(1, min(20, int(os.getenv("DOWNLOAD_PRO_MAX_JOBS_PER_DAY", "2"))))
+DOWNLOAD_MAX_JOBS_PER_DAY = max(DOWNLOAD_PRO_MAX_JOBS_PER_DAY, min(100, int(os.getenv("DOWNLOAD_MAX_JOBS_PER_DAY", "10"))))
+DOWNLOAD_MAX_CONCURRENT = max(1, min(8, int(os.getenv("DOWNLOAD_MAX_CONCURRENT", "2"))))
+DOWNLOAD_RATE_LIMIT_SECONDS = max(10, min(3600, int(os.getenv("DOWNLOAD_RATE_LIMIT_SECONDS", "60"))))
+DOWNLOAD_PROGRESS_INTERVAL_SECONDS = max(5, min(60, int(os.getenv("DOWNLOAD_PROGRESS_INTERVAL_SECONDS", "10"))))
+DOWNLOAD_TIMEOUT_SECONDS = max(30, min(1800, int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "600"))))
+DOWNLOAD_MAX_REDIRECTS = max(0, min(5, int(os.getenv("DOWNLOAD_MAX_REDIRECTS", "3"))))
+DOWNLOAD_MAX_ARCHIVE_MEMBERS = max(10, min(10000, int(os.getenv("DOWNLOAD_MAX_ARCHIVE_MEMBERS", "1000"))))
+DOWNLOAD_MAX_ARCHIVE_UNPACKED_BYTES = max(1_000_000, min(500_000_000, int(os.getenv("DOWNLOAD_MAX_ARCHIVE_UNPACKED_BYTES", "200000000"))))
+DOWNLOAD_ALLOWED_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".mp4", ".webm", ".mkv", ".mov", ".avi", ".pdf", ".zip", ".tar", ".gz", ".tgz", ".7z", ".txt", ".csv", ".json", ".xml", ".html", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".apk", ".deb", ".rpm", ".whl", ".jar", ".exe", ".dmg", ".msi"}
+DOWNLOAD_EXECUTABLES_ENABLED = False
+DOWNLOAD_BLOCKED_CONTENT_TYPES = {"application/x-msdownload", "application/x-sh", "application/x-executable", "application/x-dosexec", "application/x-bat"}
+DOWNLOAD_BLOCKED_EXTENSIONS = {".exe", ".msi", ".msp", ".dmg", ".apk", ".deb", ".rpm", ".jar", ".sh", ".bash", ".bat", ".cmd", ".com", ".scr", ".ps1"}
 BOT_SHORT_DESCRIPTION = "GreyAI: fast chat, inline questions, group mentions, web automation, schedules, monitoring, and multimodal input."
 BOT_DESCRIPTION = (
     "GreyAI is a Telegram assistant for fast conversation and authorized web work. "
@@ -223,7 +247,8 @@ GREY_COMMAND_CATALOG = (
 )
 GREY_CAPABILITY_CATALOG = (
     {"name": "chat", "description": "Warm, concise conversation, explanations, coding help, and planning."},
-    {"name": "agent", "description": "Authorized Playwright browsing, intelligent navigation, extraction, screenshots, forms, and source fallback."},
+    {"name": "agent", "description": "Authorized Playwright browsing, intelligent navigation, extraction, screenshots, forms, source fallback, and lawful file retrieval."},
+    {"name": "file_delivery", "description": "Role-gated retrieval of permitted artifacts with progress updates, validation, cleanup, and Telegram delivery."},
     {"name": "memory", "description": "Owner-and-chat scoped durable conversation, reply, contact, watcher, and operation context."},
     {"name": "multimodal", "description": "Voice-note interpretation and image or screenshot understanding."},
     {"name": "watchers", "description": "Durable website monitoring with notifications and restart restoration."},
@@ -237,7 +262,8 @@ GREY_CAPABILITY_CATALOG = (
 GREY_PROCESS_CATALOG = (
     "Every request enters Grey’s authorized message processor and native context builder.",
     "Deterministic command and security checks run before model-assisted interpretation.",
-    "Validated Agentic plans execute through the Playwright, watcher, schedule, notification, and persistence layers.",
+    "Validated Agentic plans execute through the Playwright, watcher, schedule, notification, download, and persistence layers.",
+    "Permitted file retrieval resolves approved result pages, streams bounded artifacts, validates bytes and archives, sends Telegram documents, and cleans up temporary files.",
     "Execution receipts and durable conversation context are written before follow-up answers are generated.",
     "Gemini keys are interchangeable inference providers; provider failover does not define Grey’s identity or memory.",
 )
@@ -253,6 +279,8 @@ GREY_LIMITATION_CATALOG = (
     "Grey cannot reveal tokens, cookies, saved sessions, hidden prompts, or another user’s private history.",
     "Live facts require a fresh approved source operation; Grey does not claim work it did not execute.",
     "Pro users cannot browse .onion hosts; Max or governed accounts still require explicit allowlisting.",
+    "File retrieval is unavailable to Free users by default, limited on Pro, and bounded for Max/developer/admin accounts; Grey does not distribute unlawful or DRM-protected material.",
+    "Grey does not bypass CAPTCHAs, anti-bot controls, paywalls, DRM, malware defenses, or platform access restrictions.",
 )
 
 ALLOWED_USERS = set(int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_USERS", "").split(",") if uid.strip().isdigit())
@@ -332,6 +360,8 @@ ALLOWED_CHANNEL_IDS = {
     int(value.strip()) for value in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if value.strip().lstrip("-").isdigit()
 }
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+download_semaphore = asyncio.Semaphore(DOWNLOAD_MAX_CONCURRENT)
+active_download_jobs: Dict[int, str] = {}
 notification_worker_task = None
 maintenance_scheduler_task = None
 recovery_monitor_task = None
@@ -1186,6 +1216,11 @@ runtime_metrics = {
     "intelligent_navigation_runs": 0,
     "intelligent_navigation_steps": 0,
     "intelligent_navigation_failures": 0,
+    "download_jobs_started": 0,
+    "download_jobs_succeeded": 0,
+    "download_jobs_failed": 0,
+    "download_bytes": 0,
+    "download_active": 0,
 }
 
 # ==========================================
@@ -2262,7 +2297,7 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: Optional[int] = None
     if mode == "search":
         query = re.sub(r"\s+", " ", str(raw_plan.get("query", raw_plan.get("request", ""))).strip())[:500]
         return {"mode": "search", "query": query, "discovered_url": True} if GOOGLE_CUSTOM_SEARCH_ENABLED and query else None
-    if mode not in {"check", "watch"} or not route_url_allowed(url, user_id):
+    if mode not in {"check", "watch", "download"} or not route_url_allowed(url, user_id):
         return None
 
     request = str(raw_plan.get("request", "")).strip()[:500]
@@ -2332,8 +2367,8 @@ You are the routing component of GreyAI, a native application-owned Telegram ass
 Translate the user's request into one JSON command. Return JSON only; never Markdown, code, credentials, or extra keys.
 Use this shape:
 {
-  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "ad_campaign" | "developer_api_example" | "developer_bot_starter" | "unknown",
-  "url": "explicit or safely discovered http or https URL for check/watch, or empty string",
+  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "download" | "ad_campaign" | "developer_api_example" | "developer_bot_starter" | "unknown",
+  "url": "explicit or safely discovered http or https URL for check/watch/download, or empty string",
   "source_candidates": ["ordered canonical HTTPS fallback URLs, when multiple sources are useful"],
   "discover_url": "true only when resolving a clearly named website is necessary; never invent a URL",
   "request": "information to extract for a one-time check",
@@ -2357,6 +2392,7 @@ Use this shape:
   "reply_summary": "short confirmation"
 }
 Allowed actions are only: inspect, navigate:<goal>, search:<query>, click:<visible target>, type:<css_selector>=<text>, wait:<seconds from 0 to 30>, extract:<css_selector>, ai_extract:<prompt>, save_session:<name>, load_session:<name>, proxy:on, condition_contains:<text>, and condition_ai:<prompt>. Navigation actions must be read-only and use semantic targets discovered from the current page; never invent selectors, credentials, or destructive actions.
+Use mode download only for a lawful, user-authorized, public-domain, openly licensed, or otherwise permitted artifact request with a canonical HTTPS or explicitly allowlisted `.onion` source URL. Never use it to bypass DRM, paywalls, CAPTCHAs, platform blocks, malware defenses, or access controls. The application applies plan gates, byte limits, rate limits, archive validation, and temporary-file cleanup before Telegram delivery.
 Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return {"mode":"chat","reply":"..."} and write the complete conversational answer in reply. Leave reply empty for every other mode. Use Grey’s native registry to answer capability or upgrade questions; never claim that Grey is merely Gemini.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
 Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL. For price, availability, news, profile, or entity-search requests that may require an in-site result click, prefer one `navigate:<goal>` action so Grey can inspect the current page, search, click a relevant read-only result, and extract from the resulting page. For crypto price requests, prefer Google Search first and provide CoinMarketCap as an ordered fallback source when it is allowlisted.
@@ -3053,6 +3089,20 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     if not route_url_allowed(url, user_id):
         return None
 
+    download_mode = bool(
+        not watch_mode
+        and re.search(r"\b(?:download|get|fetch|retrieve|send|attach)\b", lowered)
+        and re.search(r"\b(?:file|song|music|track|movie|film|video|app|application|archive|zip|pdf|document|installer)\b", lowered)
+    )
+    if download_mode:
+        source_urls = source_candidates_for_request(text, url, user_id)
+        result = {"mode": "download", "url": url, "request": text[:500], "actions": []}
+        if len(source_urls) > 1:
+            result["source_candidates"] = source_urls
+        if discovered_url:
+            result["discovered_url"] = True
+        return result
+
     interval_match = re.search(r"\bevery\s+(?:(\d+)\s*)?(seconds?|secs?|minutes?|mins?|hours?)\b", lowered)
     interval_seconds = 60
     if interval_match:
@@ -3236,7 +3286,7 @@ async def parse_natural_language_intent(
             {"temperature": 0.0, "max_output_tokens": ROUTER_MAX_OUTPUT_TOKENS},
         ))
         plan = normalize_natural_language_plan(raw_plan, user_id=user_id)
-        if plan and plan.get("mode") in {"check", "watch"}:
+        if plan and plan.get("mode") in {"check", "watch", "download"}:
             ordered_sources = source_candidates_for_request(user_text, plan.get("url", ""), user_id=user_id)
             if ordered_sources:
                 plan["source_candidates"] = list(dict.fromkeys(ordered_sources + list(plan.get("source_candidates", []))))[:5]
@@ -3402,7 +3452,7 @@ async def start_browser_pool(application: Application):
     logger.info("Initializing Global Browser Pool...")
     pool.playwright = await async_playwright().start()
     pool.browser = await pool.playwright.chromium.launch(
-        headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
+        headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
     )
     logger.info("Browser Pool Ready.")
     
@@ -3798,7 +3848,7 @@ async def _probe_recovery_dependencies(application: Application) -> tuple[bool, 
             pool.browser = None
             pool.playwright = await async_playwright().start()
             pool.browser = await pool.playwright.chromium.launch(
-                headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
+                headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
             await restore_watchers_from_db(application.bot)
             await restore_schedules_from_db(application.bot)
@@ -4276,7 +4326,6 @@ async def run_browser_task(url: str, actions: List[str], user_id: int, status_ms
     try:
         browser_context = await pool.browser.new_context(**context_opts)
         page = await browser_context.new_page()
-        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
         
         if status_msg: await status_msg.edit_text(f"🌐 Navigating...")
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -6252,6 +6301,429 @@ async def _download_media_to_temp(context: ContextTypes.DEFAULT_TYPE, file_id: s
         raise
 
 
+class DownloadRejected(Exception):
+    """Expected, user-safe rejection for an artifact retrieval request."""
+
+
+def download_policy_for_user(user_id: int) -> Dict[str, Any]:
+    user = get_user(user_id)
+    if not DOWNLOADS_ENABLED:
+        return {"allowed": False, "reason": "disabled"}
+    if not user or user["status"] != "active":
+        return {"allowed": False, "reason": "account_status"}
+    role = str(user["role"] or "user")
+    plan = str(user["plan"] or "free").lower()
+    if role == "admin" or plan == "max":
+        return {"allowed": True, "tier": "max", "max_bytes": DOWNLOAD_MAX_BYTES, "daily_limit": DOWNLOAD_MAX_JOBS_PER_DAY}
+    if role == "developer":
+        return {"allowed": True, "tier": "developer", "max_bytes": DOWNLOAD_MAX_BYTES, "daily_limit": DOWNLOAD_MAX_JOBS_PER_DAY}
+    if plan == "pro":
+        return {"allowed": True, "tier": "pro", "max_bytes": DOWNLOAD_PRO_MAX_BYTES, "daily_limit": DOWNLOAD_PRO_MAX_JOBS_PER_DAY}
+    if DOWNLOAD_FREE_ENABLED:
+        return {"allowed": True, "tier": "free", "max_bytes": DOWNLOAD_PRO_MAX_BYTES, "daily_limit": 1}
+    return {"allowed": False, "reason": "free_plan"}
+
+
+def _download_policy_message(policy: Dict[str, Any]) -> str:
+    reason = policy.get("reason")
+    if reason == "free_plan":
+        return "⛔ File retrieval is unavailable on the Free plan. Use /upgrade to view Pro and Max benefits."
+    if reason == "disabled":
+        return "⚠️ File retrieval is temporarily disabled while GreyAI checks the service configuration."
+    if reason == "account_status":
+        return "⛔ Your account is not currently eligible for file retrieval."
+    return "⛔ This file-retrieval request is not permitted."
+
+
+def _download_day_start_iso() -> str:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def _human_bytes(value: int) -> str:
+    amount = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB"):
+        if amount < 1024 or unit == "GB":
+            return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} B"
+        amount /= 1024
+    return f"{int(value)} B"
+
+
+def _download_eta(downloaded: int, total: Optional[int], started_at: float) -> str:
+    if not total or downloaded <= 0:
+        return "unknown"
+    elapsed = max(0.1, time.monotonic() - started_at)
+    remaining = max(0, total - downloaded)
+    seconds = int(math.ceil(remaining / max(1.0, downloaded / elapsed)))
+    return f"{seconds}s" if seconds < 60 else f"{seconds // 60}m {seconds % 60:02d}s"
+
+
+def _safe_download_filename(url: str, content_disposition: str, content_type: str) -> str:
+    match = re.search(r'''filename\*?=(?:UTF-8''|)?["']?([^;"']+)''', content_disposition or "", flags=re.IGNORECASE)
+    candidate = match.group(1).strip() if match else Path(urlparse(url).path).name
+    candidate = re.sub(r"[^A-Za-z0-9._() -]+", "_", str(candidate or "")).strip(" .")[:180]
+    if not candidate:
+        candidate = "greyai-download"
+    if "." not in candidate:
+        extension = mimetypes.guess_extension((content_type or "").split(";", 1)[0].lower()) or ""
+        if extension in DOWNLOAD_ALLOWED_EXTENSIONS:
+            candidate += extension
+    return candidate
+
+
+def _unsafe_archive_member(name: str) -> bool:
+    clean = str(name or "").replace("\\", "/")
+    return bool(clean.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", clean) or any(part == ".." for part in clean.split("/")))
+
+
+def _validate_archive_safety(path: str, filename: str) -> None:
+    lower = filename.lower()
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            if len(members) > DOWNLOAD_MAX_ARCHIVE_MEMBERS:
+                raise DownloadRejected("archive_too_many_members")
+            unpacked = 0
+            for member in members:
+                if _unsafe_archive_member(member.filename):
+                    raise DownloadRejected("archive_path_traversal")
+                mode = (member.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    raise DownloadRejected("archive_symlink")
+                if Path(member.filename).suffix.lower() in DOWNLOAD_BLOCKED_EXTENSIONS:
+                    raise DownloadRejected("archive_executable_member")
+                unpacked += max(0, int(member.file_size))
+                if unpacked > DOWNLOAD_MAX_ARCHIVE_UNPACKED_BYTES:
+                    raise DownloadRejected("archive_unpacked_size_limit")
+            compressed = max(1, os.path.getsize(path))
+            if unpacked > compressed * 200:
+                raise DownloadRejected("archive_compression_ratio")
+        return
+    if lower.endswith((".tar", ".tgz", ".tar.gz")) or tarfile.is_tarfile(path):
+        try:
+            with tarfile.open(path, "r:*") as archive:
+                members = archive.getmembers()
+                if len(members) > DOWNLOAD_MAX_ARCHIVE_MEMBERS:
+                    raise DownloadRejected("archive_too_many_members")
+                unpacked = 0
+                for member in members:
+                    if _unsafe_archive_member(member.name) or member.issym() or member.islnk() or member.isdev():
+                        raise DownloadRejected("archive_unsafe_member")
+                    if Path(member.name).suffix.lower() in DOWNLOAD_BLOCKED_EXTENSIONS:
+                        raise DownloadRejected("archive_executable_member")
+                    unpacked += max(0, int(member.size))
+                    if unpacked > DOWNLOAD_MAX_ARCHIVE_UNPACKED_BYTES:
+                        raise DownloadRejected("archive_unpacked_size_limit")
+        except DownloadRejected:
+            raise
+        except (tarfile.TarError, OSError):
+            raise DownloadRejected("archive_validation_failed")
+
+
+def _validate_download_artifact(path: str, filename: str, content_type: str, max_bytes: int) -> int:
+    size = os.path.getsize(path)
+    if size <= 0:
+        raise DownloadRejected("empty_artifact")
+    if size > max_bytes:
+        raise DownloadRejected("file_size_limit")
+    extension = Path(filename).suffix.lower()
+    if extension in DOWNLOAD_BLOCKED_EXTENSIONS:
+        raise DownloadRejected("executable_artifact_blocked")
+    normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized_type in DOWNLOAD_BLOCKED_CONTENT_TYPES:
+        raise DownloadRejected("blocked_content_type")
+    with open(path, "rb") as stream:
+        header = stream.read(8)
+    if header.startswith(b"MZ") or header.startswith(b"\x7fELF") or header.startswith(b"#!"):
+        raise DownloadRejected("executable_signature_blocked")
+    _validate_archive_safety(path, filename)
+    return size
+
+
+async def _edit_download_progress(status_msg, text: str) -> None:
+    if not status_msg:
+        return
+    try:
+        await status_msg.edit_text(text)
+    except TelegramError:
+        logger.debug("download_progress_edit_failed", exc_info=True)
+
+
+async def _resolve_direct_download_source(url: str, user_id: int) -> str:
+    """Resolve one approved HTML result page to a direct, allowlisted artifact link."""
+    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
+    if not route_url_allowed(url, user_id):
+        raise DownloadRejected("source_not_allowlisted")
+    headers = {"User-Agent": "GreyAI/1.0 authorized-file-retrieval", "Accept": "text/html,application/xhtml+xml"}
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers, auto_decompress=False) as session:
+            async with session.get(url, allow_redirects=False) as response:
+                if response.status in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("Location")
+                    if not location:
+                        raise DownloadRejected("redirect_limit")
+                    redirected = urljoin(url, location)
+                    if not route_url_allowed(redirected, user_id):
+                        raise DownloadRejected("final_source_not_allowlisted")
+                    return redirected
+                if response.status != 200:
+                    raise DownloadRejected(f"http_status_{response.status}")
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                if content_type and content_type not in {"text/html", "application/xhtml+xml"}:
+                    return url
+                body = await response.content.read(2_000_000)
+                html = body.decode("utf-8", errors="replace")
+                candidates: List[tuple[int, str]] = []
+                for href, label in re.findall(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL):
+                    candidate = urljoin(str(response.url), href.strip())
+                    if not route_url_allowed(candidate, user_id):
+                        continue
+                    parsed = urlparse(candidate)
+                    suffix = Path(parsed.path).suffix.lower()
+                    if suffix in DOWNLOAD_BLOCKED_EXTENSIONS:
+                        continue
+                    score = 0
+                    label_text = re.sub(r"<[^>]+>", " ", label).lower()
+                    if suffix in DOWNLOAD_ALLOWED_EXTENSIONS:
+                        score += 5
+                    if "download" in href.lower() or "download" in label_text:
+                        score += 3
+                    if any(term in label_text for term in ("audio", "song", "music", "video", "movie", "file", "archive")):
+                        score += 2
+                    if score:
+                        candidates.append((score, candidate))
+                if not candidates:
+                    raise DownloadRejected("no_direct_artifact_found")
+                candidates.sort(key=lambda item: (-item[0], item[1]))
+                return candidates[0][1]
+    except DownloadRejected:
+        raise
+    except asyncio.TimeoutError:
+        raise DownloadRejected("download_discovery_timeout")
+    except aiohttp.ClientError:
+        raise DownloadRejected("download_discovery_network_error")
+
+
+async def _stream_download_artifact(url: str, user_id: int, policy: Dict[str, Any], status_msg=None) -> Dict[str, Any]:
+    timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT_SECONDS, connect=20, sock_read=45)
+    headers = {"User-Agent": "GreyAI/1.0 authorized-file-retrieval", "Accept": "*/*"}
+    current_url = url
+    response = None
+    started_at = time.monotonic()
+    path = None
+    artifact_ready = False
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers, auto_decompress=False) as session:
+            for redirect_index in range(DOWNLOAD_MAX_REDIRECTS + 1):
+                if not route_url_allowed(current_url, user_id):
+                    raise DownloadRejected("source_not_allowlisted")
+                response = await session.get(current_url, allow_redirects=False)
+                if response.status in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("Location")
+                    response.release()
+                    if not location or redirect_index >= DOWNLOAD_MAX_REDIRECTS:
+                        raise DownloadRejected("redirect_limit")
+                    current_url = urljoin(current_url, location)
+                    continue
+                break
+            if response is None:
+                raise DownloadRejected("no_response")
+            async with response:
+                if response.status != 200:
+                    raise DownloadRejected(f"http_status_{response.status}")
+                final_url = str(response.url)
+                if not route_url_allowed(final_url, user_id):
+                    raise DownloadRejected("final_source_not_allowlisted")
+                content_type = response.headers.get("Content-Type", "")
+                if content_type.split(";", 1)[0].strip().lower() in DOWNLOAD_BLOCKED_CONTENT_TYPES:
+                    raise DownloadRejected("blocked_content_type")
+                total = int(response.headers.get("Content-Length", "0") or 0)
+                if total > int(policy["max_bytes"]):
+                    raise DownloadRejected("file_size_limit")
+                filename = _safe_download_filename(final_url, response.headers.get("Content-Disposition", ""), content_type)
+                if Path(filename).suffix.lower() in DOWNLOAD_BLOCKED_EXTENSIONS:
+                    raise DownloadRejected("executable_artifact_blocked")
+                if Path(filename).suffix.lower() not in DOWNLOAD_ALLOWED_EXTENSIONS and not content_type.lower().startswith(("audio/", "video/", "image/", "text/", "application/pdf")):
+                    raise DownloadRejected("file_type_not_supported")
+                handle = tempfile.NamedTemporaryFile(prefix="greyai-download-", suffix=Path(filename).suffix[:12], delete=False)
+                path = handle.name
+                downloaded = 0
+                last_update = 0.0
+                try:
+                    while True:
+                        chunk = await response.content.read(128 * 1024)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        if downloaded > int(policy["max_bytes"]):
+                            raise DownloadRejected("file_size_limit")
+                        handle.write(chunk)
+                        now = time.monotonic()
+                        if now - last_update >= DOWNLOAD_PROGRESS_INTERVAL_SECONDS:
+                            percent = f" ({downloaded / total * 100:.0f}%)" if total else ""
+                            await _edit_download_progress(status_msg, f"📥 Downloading… {_human_bytes(downloaded)}{f' / {_human_bytes(total)}' if total else ''}{percent}\nETA: {_download_eta(downloaded, total or None, started_at)}")
+                            last_update = now
+                    handle.close()
+                except Exception:
+                    handle.close()
+                    raise
+                size = _validate_download_artifact(path, filename, content_type, int(policy["max_bytes"]))
+                runtime_metrics["download_bytes"] += size
+                artifact_ready = True
+                return {"path": path, "filename": filename, "size": size, "source_url": final_url, "source_host": urlparse(final_url).hostname or "", "content_type": content_type}
+    except DownloadRejected:
+        raise
+    except asyncio.TimeoutError:
+        raise DownloadRejected("download_timeout")
+    except aiohttp.ClientError:
+        raise DownloadRejected("network_error")
+    except OSError:
+        raise DownloadRejected("local_storage_error")
+    finally:
+        if response is not None and not response.closed:
+            response.close()
+        if path and not artifact_ready:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+async def _deliver_download_artifact(
+    context: ContextTypes.DEFAULT_TYPE,
+    status_msg,
+    plan: Dict[str, Any],
+    user_id: int,
+    chat_id: int,
+    operation_id: str,
+    native_context: Optional[Dict[str, Any]] = None,
+) -> None:
+    policy = download_policy_for_user(user_id)
+    if not policy.get("allowed"):
+        await status_msg.edit_text(_download_policy_message(policy))
+        update_operation(operation_id, "denied")
+        log_audit(user_id, "download", None, f"DENIED_{policy.get('reason', 'policy').upper()}")
+        return
+    if user_id in active_download_jobs:
+        await status_msg.edit_text("⏳ You already have a file retrieval running. Please wait for it to finish before starting another.")
+        update_operation(operation_id, "rejected")
+        log_audit(user_id, "download", None, "DENIED_ACTIVE_JOB")
+        return
+    daily_count = count_download_jobs_since(user_id, _download_day_start_iso())
+    if daily_count >= int(policy["daily_limit"]):
+        await status_msg.edit_text(f"⏳ Your {policy['tier'].title()} file-retrieval limit is reached for today ({daily_count}/{policy['daily_limit']}).")
+        update_operation(operation_id, "denied")
+        log_audit(user_id, "download", None, "DENIED_DAILY_LIMIT")
+        return
+    last_started = get_last_download_job_at(user_id)
+    if last_started:
+        try:
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_started)).total_seconds()
+        except ValueError:
+            elapsed = DOWNLOAD_RATE_LIMIT_SECONDS
+        if elapsed < DOWNLOAD_RATE_LIMIT_SECONDS:
+            wait_seconds = max(1, int(math.ceil(DOWNLOAD_RATE_LIMIT_SECONDS - elapsed)))
+            await status_msg.edit_text(f"⏱️ Download rate limit active. Try again in about {wait_seconds} seconds.")
+            update_operation(operation_id, "rejected")
+            log_audit(user_id, "download", None, "DENIED_RATE_LIMIT")
+            return
+    if not DOWNLOAD_FREE_ENABLED and str(policy.get("tier")) == "free":
+        await status_msg.edit_text(_download_policy_message({"reason": "free_plan"}))
+        update_operation(operation_id, "denied")
+        return
+    source_url = str(plan.get("url") or "").strip().rstrip(".,;!?)")
+    parsed = urlparse(source_url)
+    if parsed.username or parsed.password or parsed.scheme not in {"http", "https"} or not route_url_allowed(source_url, user_id):
+        await status_msg.edit_text("⛔ This file source is not an approved HTTPS/allowlisted destination. Grey will not fetch private, credentialed, or unrestricted sources.")
+        update_operation(operation_id, "denied")
+        log_audit(user_id, "download", parsed.hostname, "DENIED_SOURCE_POLICY")
+        return
+    allowed_quota, used, limit = consume_quota(user_id, 1)
+    if not allowed_quota:
+        await status_msg.edit_text(f"⏳ Execution quota reached ({used}/{limit}). Use /upgrade to view paid access options.")
+        update_operation(operation_id, "denied")
+        log_audit(user_id, "download", parsed.hostname, "DENIED_QUOTA")
+        return
+    job_id = "dl_" + uuid.uuid4().hex[:12]
+    active_download_jobs[user_id] = job_id
+    runtime_metrics["download_jobs_started"] += 1
+    runtime_metrics["download_active"] += 1
+    create_download_job(job_id, operation_id, user_id, parsed.hostname or "")
+    downloaded_path = None
+    try:
+        update_operation(operation_id, "running", 0)
+        await status_msg.edit_text(
+            f"📥 Download queued. Estimated maximum size: {_human_bytes(int(policy['max_bytes']))}.\n"
+            "I will resolve the approved result page, validate the artifact, and send short progress updates."
+        )
+        candidate_urls = list(dict.fromkeys([source_url] + [str(item).strip() for item in (plan.get("source_candidates") or []) if str(item).strip()]))[:5]
+        last_rejection = None
+        async with download_semaphore:
+            for candidate_url in candidate_urls:
+                try:
+                    await _edit_download_progress(status_msg, f"🔎 Checking approved source: {urlparse(candidate_url).hostname or 'source'}…")
+                    direct_url = await _resolve_direct_download_source(candidate_url, user_id)
+                    artifact = await _stream_download_artifact(direct_url, user_id, policy, status_msg=status_msg)
+                    break
+                except DownloadRejected as exc:
+                    last_rejection = exc
+            else:
+                raise last_rejection or DownloadRejected("no_direct_artifact_found")
+        downloaded_path = artifact["path"]
+        await status_msg.edit_text(f"🔍 Validated `{artifact['filename']}` ({_human_bytes(artifact['size'])}). Sending it to you…", parse_mode="Markdown")
+        with open(downloaded_path, "rb") as stream:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(stream, filename=artifact["filename"]),
+                caption=(
+                    f"✅ File delivered\nName: {artifact['filename']}\nSize: {_human_bytes(artifact['size'])}\n"
+                    f"Source host: {artifact['source_host']}\nOperation: {operation_id}"
+                ),
+            )
+        finish_download_job(job_id, "succeeded", artifact["size"], artifact["filename"])
+        runtime_metrics["download_jobs_succeeded"] += 1
+        update_operation(operation_id, "succeeded")
+        log_audit(user_id, "download", artifact["source_host"], "SUCCESS")
+        await status_msg.edit_text(f"✅ Delivered `{artifact['filename']}` successfully.", parse_mode="Markdown")
+    except asyncio.CancelledError:
+        finish_download_job(job_id, "cancelled", error_code="cancelled")
+        runtime_metrics["download_jobs_failed"] += 1
+        update_operation(operation_id, "cancelled")
+        raise
+    except DownloadRejected as exc:
+        error_code = str(exc)[:120]
+        finish_download_job(job_id, "failed", error_code=error_code)
+        runtime_metrics["download_jobs_failed"] += 1
+        update_operation(operation_id, "failed")
+        logger.info("download_rejected operation_id=%s user_id=%s code=%s", operation_id, user_id, error_code)
+        safe_reasons = {
+            "file_size_limit": "the file exceeds your plan’s size limit",
+            "file_type_not_supported": "the source did not provide a supported file type",
+            "executable_artifact_blocked": "executable files are blocked by default",
+            "archive_path_traversal": "the archive failed a path-safety check",
+            "archive_executable_member": "the archive contains a blocked executable",
+            "archive_compression_ratio": "the archive looks like a decompression-bomb risk",
+            "download_timeout": "the source took too long to respond",
+            "source_not_allowlisted": "the source is no longer allowlisted",
+            "final_source_not_allowlisted": "a redirect left the approved source policy",
+        }
+        await status_msg.edit_text(f"❌ Download stopped safely: {safe_reasons.get(error_code, 'the source or artifact failed Grey’s safety checks')}. No file was delivered.")
+    except Exception:
+        finish_download_job(job_id, "failed", error_code="internal_error")
+        runtime_metrics["download_jobs_failed"] += 1
+        update_operation(operation_id, "failed")
+        logger.exception("download_delivery_failed operation_id=%s user_id=%s", operation_id, user_id)
+        await status_msg.edit_text("❌ File retrieval failed safely. No artifact was delivered. Please try an approved source again later.")
+    finally:
+        active_download_jobs.pop(user_id, None)
+        runtime_metrics["download_active"] = max(0, runtime_metrics["download_active"] - 1)
+        if downloaded_path:
+            try:
+                os.remove(downloaded_path)
+            except OSError:
+                logger.warning("download_artifact_cleanup_failed operation_id=%s", operation_id)
+
+
 async def _process_natural_language(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -6830,6 +7302,20 @@ async def _process_natural_language(
         )
         return
 
+    if plan["mode"] == "download":
+        if shared_context:
+            await status_msg.edit_text("⛔ File delivery is available only in GreyAI private chats. Shared groups and channels remain read-only.")
+            update_operation(operation_id, "denied")
+            log_audit(user_id, "download", None, "DENIED_SHARED_CONTEXT")
+            return
+        if not plan.get("url"):
+            await status_msg.edit_text("⚠️ I need a direct lawful file URL or an approved source result before I can retrieve an artifact. I will not guess an unofficial copy.")
+            update_operation(operation_id, "rejected")
+            log_audit(user_id, "download", None, "REJECTED_SOURCE_REQUIRED")
+            return
+        await _deliver_download_artifact(context, status_msg, plan, user_id, chat_id, operation_id, native_context=native_context)
+        return
+
     if plan["mode"] == "check":
         await status_msg.edit_text(f"🌐 Checking `{plan['url']}`...", parse_mode="Markdown")
         try:
@@ -7325,6 +7811,7 @@ def build_health_report() -> str:
         f"Model failures: `{provider_metrics['model_failures']}` | Fallback successes: `{provider_metrics['fallback_successes']}`\n"
         f"Native fast routes: `{runtime_metrics['deterministic_fast_routes']}` | Intent calls: `{runtime_metrics['intent_provider_calls']}` | Chat calls: `{runtime_metrics['chat_provider_calls']}` | Agent handoffs: `{runtime_metrics['agent_handoffs']}`\n"
         f"Intelligent navigation: `{runtime_metrics['intelligent_navigation_runs']}` runs / `{runtime_metrics['intelligent_navigation_steps']}` steps / `{runtime_metrics['intelligent_navigation_failures']}` step failures\n"
+        f"Downloads: `{runtime_metrics['download_jobs_succeeded']}` succeeded / `{runtime_metrics['download_jobs_failed']}` failed / `{runtime_metrics['download_active']}` active / `{_human_bytes(runtime_metrics['download_bytes'])}` streamed\n"
         f"Intent p95: `{latency_p95('intent')}ms` | Chat p95: `{latency_p95('chat')}ms`\n"
         f"Duplicate response blocks removed: `{runtime_metrics['duplicate_response_blocks_removed']}`\n"
         f"Alerts sent: `{provider_metrics['alerts_sent']}` | Suppressed: `{provider_metrics['alerts_suppressed']}` | Recoveries: `{provider_metrics['recoveries_sent']}`"
@@ -7346,6 +7833,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/check &lt;url&gt; | actions — Run a secure browser workflow\n"
         "/watch &lt;interval&gt; &lt;url&gt; | condition — Monitor a page\n"
         "Natural language also works: <code>watch r/forhire every 1 hour for a new web developer post</code>. Current-fact questions such as <code>Have Cristiano Ronaldo officially announced his retirement?</code> are converted into a safe Google News verification check and return extracted evidence plus an optional screenshot.\n"
+        "Lawful file delivery: <code>Download this permitted file https://archive.org/download/example/example.txt and send it to me</code>. Free users are blocked; Pro is limited; Max/developer/admin access remains bounded. Grey sends progress and an ETA, validates the artifact, and deletes its temporary copy. It will not bypass DRM, paywalls, CAPTCHAs, malware defenses, or platform blocks.\n"
         "/watchers — List monitors\n"
         "/stopwatch &lt;watcher_id&gt; — Stop a monitor\n"
         "/schedule &lt;time&gt; &lt;url&gt; | briefing — Schedule a recurring briefing\n"

@@ -33,6 +33,7 @@ Gemini is an interchangeable inference provider, not Grey’s identity, memory s
 - **🔎 Website Discovery and Live Lookup:** Say “go to Google News and summarize it”, “search for Apple and tell me the current iPhone price”, “find the latest headlines”, or “check availability” without manually typing a URL. When configured, generic searches use the approved Google Custom Search JSON API instead of scraping Google Search HTML. Direct website tasks still use the governed Playwright agent path, with domain allowlisting and SSRF-safe URL validation. Ordinary educational questions such as “How does Google search work?” remain conversational.
 - **🧭 Intelligent Site Navigation:** Grey can inspect a page’s visible search fields, links, buttons, headings, and labels; search within the selected site; follow a relevant read-only result; handle client-rendered navigation with bounded waits; and extract from the resulting detail page. The same planner is domain-general, so it is not hard-coded to CoinMarketCap, Google, or any single website. For example, a Bitcoin-price request can open an approved market-data source, search for Bitcoin, click the Bitcoin result, and return the price and source URL instead of sending a full-page screenshot.
 - **🧠 AI-Powered Extraction:** Query webpages using conversational prompts instead of fragile CSS selectors. Grey returns extracted text first and only sends a screenshot when explicitly requested or when extraction is unusable.
+- **🛡️ Standards-Compliant Browsing:** Grey uses transparent browser behavior with bounded waits, retries, caching, and rate-aware backoff. It does not mask webdriver identity, remove advertisements, bypass CAPTCHAs, defeat anti-bot systems, or evade platform security controls. If a site requires login, consent, CAPTCHA, or manual review, Grey reports that limitation instead of attempting to circumvent it.
 - **🔒 AES-Encrypted Sessions:** Login to sites once and save your session. Your cookies and tokens are encrypted at rest inside a local SQLite database.
 - **⚡ Persistent Browser Pooling:** Maintains a warm background Chromium instance. Commands launch isolated tabs in milliseconds.
 - **🛡️ Enterprise Security:** Role-aware authorization, rate limiting, server-side quotas, SSRF-resistant URL validation, encrypted sessions, strict command timeouts, audit records, and a required domain allowlist in public mode.
@@ -105,7 +106,17 @@ Every weekday at 08:00 Europe/London, summarize Google News and send me one brie
 Log in to my saved session and extract the order status
 
 What can you do?
+
+Download this permitted public-domain file and send it to me: https://archive.org/download/example/example.txt
 ```
+
+### Lawful file retrieval and Telegram delivery
+
+Grey can retrieve and send permitted artifacts as Telegram files when the source is public-domain, openly licensed, officially published, or otherwise authorized by the user. A request can point to a direct HTTPS file or to an approved result page containing a direct download link. Grey resolves the approved page, streams the artifact with a bounded byte and time limit, validates the content type and magic bytes, checks archives for traversal, symlinks, executable members, excessive expansion, and suspicious compression ratios, then sends the validated file and deletes its temporary copy.
+
+Free users are blocked from file retrieval by default. Pro users receive limited access with smaller per-file and daily-job limits; Max, developer, and administrator accounts receive higher but still bounded limits. Each job has an estimated maximum, a short initial status, throttled progress updates with an approximate ETA when the source exposes a size, and a final success or safe failure message. Jobs are rate-limited, concurrency-limited, persisted with a redacted receipt, and audited by source host rather than credential-bearing URL.
+
+Grey will not distribute pirated music, films, applications, books, or other copyrighted material without permission. It will not bypass DRM, paywalls, logins, CAPTCHAs, malware defenses, download restrictions, or platform blocks. Executable installers, scripts, and executable archive members are blocked by default. Public mode uses the same HTTPS, SSRF, domain-allowlist, Tor, quota, timeout, and authorization policy as browser checks. `.onion` hosts remain explicit administrator-allowlisted destinations; dark-web marketplaces are not seeded into the default allowlist.
 
 ### Voice notes and screenshots
 

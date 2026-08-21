@@ -3,6 +3,10 @@ import os
 import sqlite3
 import json
 import asyncio
+import tempfile
+import zipfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -3433,3 +3437,125 @@ def test_successful_text_extraction_does_not_create_screenshot(monkeypatch, tmp_
 
     assert result["extracted"] == ["Bitcoin is $100,000"]
     assert result["screenshot"] is None
+
+
+def test_deterministic_download_request_requires_explicit_allowed_url(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    plan = bot.parse_deterministic_web_request(
+        "Download the permitted song file https://downloads.example/song.mp3 and send it to me",
+        user_id=42,
+    )
+
+    assert plan["mode"] == "download"
+    assert plan["url"] == "https://downloads.example/song.mp3"
+    assert plan["actions"] == []
+
+
+def test_free_plan_file_retrieval_is_denied_before_network(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "get_user", lambda user_id: {"status": "active", "role": "user", "plan": "free"})
+    policy = bot.download_policy_for_user(42)
+
+    assert policy["allowed"] is False
+    assert policy["reason"] == "free_plan"
+
+
+def test_download_archive_path_traversal_is_rejected():
+    import bot
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as handle:
+        path = handle.name
+    try:
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("../../escape.txt", "not safe")
+        with pytest.raises(bot.DownloadRejected, match="archive_path_traversal"):
+            bot._validate_archive_safety(path, "bundle.zip")
+    finally:
+        os.remove(path)
+
+
+def test_download_executable_signature_is_rejected_by_default():
+    import bot
+
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as handle:
+        path = handle.name
+        handle.write(b"MZ" + b"unsafe executable")
+    try:
+        with pytest.raises(bot.DownloadRejected, match="executable_signature_blocked"):
+            bot._validate_download_artifact(path, "payload.bin", "application/octet-stream", 100000)
+    finally:
+        os.remove(path)
+
+
+def test_stream_download_artifact_reads_allowed_file_and_returns_metadata(monkeypatch):
+    import bot
+
+    payload = b"GreyAI permitted file\n"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Disposition", 'attachment; filename="note.txt"')
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            return
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    artifact = None
+    try:
+        artifact = asyncio.run(bot._stream_download_artifact(
+            f"http://127.0.0.1:{server.server_port}/note.txt",
+            42,
+            {"max_bytes": 1000},
+        ))
+        assert artifact["filename"] == "note.txt"
+        assert artifact["source_host"] == "127.0.0.1"
+        with open(artifact["path"], "rb") as stream:
+            assert stream.read() == payload
+    finally:
+        if artifact and os.path.exists(artifact["path"]):
+            os.remove(artifact["path"])
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_resolve_direct_download_source_follows_approved_result_link(monkeypatch):
+    import bot
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'<html><body><a href="/files/song.mp3">Download song</a></body></html>'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        resolved = asyncio.run(bot._resolve_direct_download_source(
+            f"http://127.0.0.1:{server.server_port}/results",
+            42,
+        ))
+        assert resolved.endswith("/files/song.mp3")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

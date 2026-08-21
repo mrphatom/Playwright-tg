@@ -451,3 +451,21 @@ def test_platform_activity_summary_is_aggregate_only(platform_db):
     assert summary["queue"]["running"] == 0
     assert "users" not in summary
     assert "identities" not in summary
+
+
+def test_download_job_receipts_are_durable_and_countable(platform_db):
+    cp.ensure_user(42)
+    job_id = "dl_test_1"
+    cp.create_download_job(job_id, "op_download_1", 42, "archive.org")
+
+    assert cp.count_download_jobs_since(42, "2000-01-01T00:00:00+00:00") == 1
+    assert cp.get_last_download_job_at(42)
+    assert cp.finish_download_job(job_id, "succeeded", 1234, "sample.txt") is True
+    assert cp.finish_download_job(job_id, "succeeded", 1234, "sample.txt") is False
+
+    with sqlite3.connect(platform_db) as connection:
+        row = connection.execute(
+            "SELECT status, bytes_downloaded, filename, source_host FROM download_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    assert row == ("succeeded", 1234, "sample.txt", "archive.org")

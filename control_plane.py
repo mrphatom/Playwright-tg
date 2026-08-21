@@ -179,6 +179,21 @@ def init_platform_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_operations_user_time ON operations(telegram_user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status);
 
+            CREATE TABLE IF NOT EXISTS download_jobs (
+                job_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                source_host TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'started',
+                bytes_downloaded INTEGER NOT NULL DEFAULT 0,
+                filename TEXT NOT NULL DEFAULT '',
+                error_code TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_download_jobs_user_time ON download_jobs(user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_download_jobs_status ON download_jobs(status, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS reports (
                 report_id TEXT PRIMARY KEY,
                 reporter_user_id INTEGER NOT NULL,
@@ -1055,6 +1070,46 @@ def create_operation(operation_id: str, user_id: int, chat_id: Optional[int], ki
             (operation_id, user_id, chat_id, kind, target_url, json.dumps(metadata or {}, separators=(",", ":")), now, now),
         )
         connection.commit()
+
+
+def create_download_job(job_id: str, operation_id: str, user_id: int, source_host: str) -> None:
+    now = utc_now()
+    with _connect() as connection:
+        connection.execute(
+            "INSERT INTO download_jobs (job_id, operation_id, user_id, source_host, status, created_at) VALUES (?, ?, ?, ?, 'started', ?)",
+            (job_id, operation_id, user_id, str(source_host or '')[:255], now),
+        )
+        connection.commit()
+
+
+def finish_download_job(job_id: str, status: str, bytes_downloaded: int = 0, filename: str = '', error_code: str = '') -> bool:
+    if status not in {'succeeded', 'failed', 'cancelled'}:
+        raise ValueError('invalid download job status')
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE download_jobs SET status = ?, bytes_downloaded = ?, filename = ?, error_code = ?, completed_at = ? WHERE job_id = ? AND status = 'started'",
+            (status, max(0, int(bytes_downloaded)), str(filename or '')[:255], str(error_code or '')[:120] or None, utc_now(), job_id),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def count_download_jobs_since(user_id: int, since_iso: str) -> int:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS count FROM download_jobs WHERE user_id = ? AND created_at >= ?",
+            (user_id, since_iso),
+        ).fetchone()
+    return int(row['count'] if row else 0)
+
+
+def get_last_download_job_at(user_id: int) -> Optional[str]:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT created_at FROM download_jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return str(row['created_at']) if row else None
 
 
 def update_operation(operation_id: str, status: str, attempt_count: Optional[int] = None) -> bool:
