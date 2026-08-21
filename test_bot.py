@@ -196,17 +196,20 @@ def test_green_tier_cannot_use_onion_but_paid_governed_accounts_can(monkeypatch)
     users = {
         1: {"status": "active", "plan": "free", "role": "user"},
         2: {"status": "active", "plan": "pro", "role": "user"},
-        3: {"status": "active", "plan": "free", "role": "developer"},
+        3: {"status": "active", "plan": "max", "role": "user"},
+        4: {"status": "active", "plan": "free", "role": "developer"},
     }
     monkeypatch.setattr(bot, "get_user", lambda user_id: users[user_id])
 
     onion_url = "http://exampleonion.onion/catalog"
     assert bot.user_can_use_onion(1) is False
-    assert bot.user_can_use_onion(2) is True
+    assert bot.user_can_use_onion(2) is False
     assert bot.user_can_use_onion(3) is True
+    assert bot.user_can_use_onion(4) is True
     assert bot.route_url_allowed(onion_url, user_id=1) is False
-    assert bot.route_url_allowed(onion_url, user_id=2) is True
-    assert bot.tor_route_allowed(onion_url, 2) is True
+    assert bot.route_url_allowed(onion_url, user_id=2) is False
+    assert bot.route_url_allowed(onion_url, user_id=3) is True
+    assert bot.tor_route_allowed(onion_url, 3) is True
 
 
 def test_path_specific_plan_preserves_path_and_does_not_force_screenshot(monkeypatch):

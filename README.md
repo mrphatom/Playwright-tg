@@ -240,7 +240,9 @@ They can block a host or family of subdomains immediately:
    BING_SEARCH_ENABLED=true
    BRAVE_SEARCH_ENABLED=true
    STARTPAGE_SEARCH_ENABLED=true
-   # Tor requires an externally managed SOCKS5 proxy; keep disabled unless reviewed.
+   # Self-hosted Tor is optional outside Fly; keep local startup disabled unless tor is installed.
+   TOR_LOCAL_ENABLED=false
+   TOR_LOCAL_SOCKS_PORT=9050
    TOR_PUBLIC_FALLBACK_ENABLED=false
    TOR_ONION_ACCESS_ENABLED=false
    TOR_PROXY_SERVER=
@@ -258,7 +260,7 @@ They can block a host or family of subdomains immediately:
    Then set `GOOGLE_CUSTOM_SEARCH_ENABLED=true` in the deployment environment and redeploy. If the API is enabled but its credentials are missing or its quota is exhausted, GreyAI fails closed and does not retry Google’s HTML search page.
 
 4. **Optional Tor routing**
-   GreyAI can use an externally managed Tor SOCKS5 proxy as a last public-web route when `TOR_PUBLIC_FALLBACK_ENABLED=true` and `TOR_PROXY_SERVER` is configured. `.onion` access is a separate feature: it requires `TOR_ONION_ACCESS_ENABLED=true`, an explicit `TOR_ONION_ALLOWLIST`, an eligible Pro/Max/developer/admin account, and the same URL/action safety checks. Green/free users are denied `.onion` access. GreyAI does not start a Tor daemon or infer broad onion access from a normal domain allowlist.
+   GreyAI’s Fly image includes a self-hosted Tor client. When `TOR_LOCAL_ENABLED=true`, the entrypoint starts Tor as a client, binds `SocksPort` to loopback `127.0.0.1:9050`, waits for readiness, exports the private SOCKS endpoint to GreyAI, and shuts Tor down with the container. `.onion` access is a separate feature: it requires `TOR_ONION_ACCESS_ENABLED=true`, an explicit `TOR_ONION_ALLOWLIST`, an eligible Max account or developer/admin role, and the same URL/action safety checks. Green/free and Pro users are denied `.onion` access. Public-web Tor fallback requires `TOR_PUBLIC_FALLBACK_ENABLED=true`; it does not expose a public SOCKS port.
 
 5. **Deploy with Docker Compose**
    ```bash
@@ -330,7 +332,7 @@ Log in once and reuse the state safely.
 
 ## 🌐 Public Release Configuration
 
-Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and replace the starter `ALLOWED_DOMAINS` list with the domains you are prepared to permit. Public mode rejects private and loopback IP targets and refuses to operate with an empty domain allowlist. Search-provider fallbacks remain allowlist-controlled; optional Tor routing is disabled by default, and Green/free users cannot access `.onion` hosts.
+Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and replace the starter `ALLOWED_DOMAINS` list with the domains you are prepared to permit. Public mode rejects private and loopback IP targets and refuses to operate with an empty domain allowlist. Search-provider fallbacks remain allowlist-controlled; the Fly deployment runs Tor privately on loopback for public fallback, and `.onion` hosts remain unavailable to Green/free and Pro users.
 
 Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, purchase Pro or Max access with `/upgrade pro` or `/upgrade max` using Telegram Stars, submit `/report` and `/appeal` tickets, request developer access with `/devrequest`, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, chat, and developer-management capabilities. Ordinary conversation is routed directly to the chat path; browser-like wording, named-site requests, schedules, watchers, and management actions remain on the task path. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, `/resolveappeal`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, and `/revokedeveloper`.
 
