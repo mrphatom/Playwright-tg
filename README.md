@@ -77,7 +77,7 @@ When a new key is created, GreyAI sends a separate, clearly labeled message cont
 
 ### Generated code archives
 
-Developers can ask GreyAI for a complete code example and then say “package the code above as a zip.” Grey extracts only bounded fenced source from the current authorized conversation, validates safe relative paths, rejects recognized credentials, rejects invalid Python syntax, creates an inert ZIP, and sends it as a Telegram document. The archive is never executed and does not include Telegram tokens, GreyAI keys, cookies, or saved sessions. The dedicated GreyAI Telegram integration starter remains available separately and continues to use its verified fixed template.
+Developers can ask GreyAI for a complete code example and then say “package the code above as a zip.” For a new website, say “give me a landing page website in a zip file”; Grey generates a complete dependency-light static project containing `index.html`, `styles.css`, `script.js`, and `README.md`. Existing code extraction and generated landing pages are validated for bounded size, safe paths, recognized credentials, and Python syntax where applicable. Archives are inert, never executed, and do not include Telegram tokens, GreyAI keys, cookies, or saved sessions. The dedicated GreyAI Telegram integration starter remains available separately and continues to use its verified fixed template.
 
 ### User commands
 

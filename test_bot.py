@@ -5250,3 +5250,100 @@ def test_shared_viewer_escapes_title_markup_without_breaking_page():
     assert "<script>" not in rendered
     assert parse_mode == "HTML"
     assert not markup.inline_keyboard
+
+
+def test_landing_page_generator_returns_complete_static_site_files():
+    from starter_templates import build_landing_page_files
+
+    files = build_landing_page_files("launch-page", "A landing page for a product launch")
+    assert set(files) == {"index.html", "styles.css", "script.js", "README.md"}
+    assert '<meta name="viewport"' in files["index.html"]
+    assert "A landing page for a product launch" in files["index.html"]
+    assert "<script" in files["index.html"]
+    assert "gai_live" not in "".join(files.values())
+
+
+def test_management_parser_routes_landing_page_zip_generation():
+    import bot
+
+    plan = bot.parse_deterministic_management_request("Give me a landing page website in a .zip file")
+    assert plan == {
+        "mode": "developer_landing_page_archive",
+        "language": "html",
+        "project_name": "greyai-landing-page",
+    }
+
+
+def test_natural_language_landing_page_request_delivers_zip(monkeypatch):
+    import bot
+
+    class FakeStatus:
+        message_id = 1100
+
+        def __init__(self):
+            self.edits = []
+
+        async def edit_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+
+    class FakeSource:
+        text = "Give me a landing page website in a .zip file"
+        caption = None
+        chat_id = 123
+        message_id = 1099
+
+        def __init__(self):
+            self.status = FakeStatus()
+
+        async def reply_text(self, text, **kwargs):
+            self.status.edits.append((text, kwargs))
+            return self.status
+
+    class FakeBot:
+        def __init__(self):
+            self.documents = []
+
+        async def send_document(self, **kwargs):
+            self.documents.append(kwargs)
+            return SimpleNamespace(message_id=1101)
+
+    source = FakeSource()
+    fake_bot = FakeBot()
+    update = SimpleNamespace(
+        business_message=None,
+        message=source,
+        channel_post=None,
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_user=SimpleNamespace(id=6411860985),
+    )
+    context = SimpleNamespace(bot=fake_bot)
+
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "classify_message_route", lambda _request: "task")
+    monkeypatch.setattr(bot, "parse_natural_language_intent", lambda *args, **kwargs: asyncio.sleep(0, result={"mode": "developer_landing_page_archive", "language": "html", "project_name": "greyai-landing-page"}))
+    monkeypatch.setattr(bot, "is_developer", lambda _user_id: True)
+    monkeypatch.setattr(bot, "load_chat_history", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(bot, "build_native_grey_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bot, "create_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "update_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "record_contact_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "schedule_ephemeral_message", lambda *args, **kwargs: None)
+
+    asyncio.run(bot._process_natural_language(update, context))
+
+    assert len(fake_bot.documents) == 1
+    document = fake_bot.documents[0]["document"]
+    assert document.filename == "greyai-landing-page.zip"
+    assert "index.html" in fake_bot.documents[0]["caption"]
+
+
+def test_natural_language_update_deduplication_is_transport_scoped():
+    import bot
+
+    bot.recent_natural_language_updates.clear()
+    assert bot.claim_natural_language_update(SimpleNamespace(update_id=1001)) is True
+    assert bot.claim_natural_language_update(SimpleNamespace(update_id=1001)) is False
+    assert bot.claim_natural_language_update(SimpleNamespace(update_id=1002)) is True
+    assert bot.claim_natural_language_update(SimpleNamespace()) is True

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import re
+from html import escape as html_escape
 import zipfile
 from pathlib import Path
 
@@ -200,6 +201,94 @@ def validate_code_archive_files(files: dict[str, str]) -> dict[str, str]:
             raise ValueError("code_archive_duplicate_path")
         safe_files[path] = content
     return safe_files
+
+
+def build_landing_page_files(project_name: str | None, brief: str | None = None) -> dict[str, str]:
+    """Return a dependency-free responsive landing page project as inert source."""
+    safe_name = _safe_project_name(project_name or "greyai-landing-page")
+    user_brief = re.sub(r"\s+", " ", str(brief or "").strip())[:240]
+    escaped_name = html_escape(safe_name.replace("-", " ").title())
+    escaped_brief = html_escape(user_brief or "A focused landing page for your next idea.")
+    return {
+        "index.html": f'''<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{escaped_brief}">
+  <title>{escaped_name}</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="{escaped_name} home">{escaped_name}</a>
+    <a class="header-link" href="#contact">Get started</a>
+  </header>
+  <main id="top">
+    <section class="hero" aria-labelledby="hero-title">
+      <p class="eyebrow">A clearer way forward</p>
+      <h1 id="hero-title">Turn a good idea into a great first impression.</h1>
+      <p class="hero-copy">{escaped_brief}</p>
+      <div class="hero-actions">
+        <a class="button button-primary" href="#contact">Start a conversation</a>
+        <a class="button button-secondary" href="#features">Explore the details</a>
+      </div>
+    </section>
+    <section id="features" class="feature-grid" aria-label="Highlights">
+      <article class="feature-card"><span class="feature-number">01</span><h2>Focused</h2><p>Clear hierarchy keeps attention on the action that matters.</p></article>
+      <article class="feature-card"><span class="feature-number">02</span><h2>Responsive</h2><p>A fluid layout stays comfortable on phones, tablets, and desktops.</p></article>
+      <article class="feature-card"><span class="feature-number">03</span><h2>Ready</h2><p>Clean HTML, CSS, and JavaScript give you a practical starting point.</p></article>
+    </section>
+    <section id="contact" class="contact-card" aria-labelledby="contact-title">
+      <div><p class="eyebrow">Ready when you are</p><h2 id="contact-title">Let’s build something people remember.</h2></div>
+      <a class="button button-primary" href="mailto:hello@example.com">Say hello</a>
+    </section>
+  </main>
+  <footer class="site-footer"><span>{escaped_name}</span><span>Built with semantic HTML and no dependencies.</span></footer>
+  <script src="script.js" defer></script>
+</body>
+</html>
+''',
+        "styles.css": '''@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+:root { --ink:#15231f; --muted:#62716d; --paper:#f5f7f2; --accent:#b8f36b; --line:#dce4dc; }
+* { box-sizing:border-box; }
+html { scroll-behavior:smooth; }
+body { margin:0; color:var(--ink); background:var(--paper); font:16px/1.6 'DM Sans',system-ui,sans-serif; }
+.site-header,.site-footer { width:min(1120px,calc(100% - 48px)); margin:auto; display:flex; justify-content:space-between; align-items:center; padding:28px 0; }
+.site-header { border-bottom:1px solid var(--line); }
+.brand { color:var(--ink); font-family:'Space Grotesk',sans-serif; font-weight:700; text-decoration:none; letter-spacing:-.03em; }
+.header-link { color:var(--ink); font-weight:700; text-decoration:none; }
+main { width:min(1120px,calc(100% - 48px)); margin:auto; }
+.hero { min-height:650px; display:flex; flex-direction:column; justify-content:center; max-width:850px; padding:80px 0; }
+.eyebrow { color:#5e7d37; font-size:.78rem; font-weight:700; letter-spacing:.14em; text-transform:uppercase; }
+h1,h2 { font-family:'Space Grotesk',sans-serif; letter-spacing:-.055em; line-height:1.04; margin:.25em 0; }
+h1 { font-size:clamp(3.2rem,8vw,7.2rem); max-width:850px; }
+h2 { font-size:clamp(1.7rem,3vw,2.5rem); }
+.hero-copy { color:var(--muted); font-size:1.2rem; max-width:580px; margin:28px 0; }
+.hero-actions { display:flex; flex-wrap:wrap; gap:12px; margin-top:12px; }
+.button { display:inline-block; border:1px solid var(--ink); border-radius:999px; padding:12px 20px; color:var(--ink); font-weight:700; text-decoration:none; transition:transform .2s,box-shadow .2s; }
+.button:hover,.button:focus-visible { transform:translateY(-2px); box-shadow:4px 4px 0 var(--ink); outline:none; }
+.button-primary { background:var(--accent); }
+.button-secondary { background:transparent; }
+.feature-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; padding:48px 0 120px; }
+.feature-card { min-height:240px; border:1px solid var(--line); border-radius:24px; padding:28px; background:#fff; }
+.feature-number { color:#91a29b; font-family:'Space Grotesk',sans-serif; font-weight:700; }
+.feature-card p { color:var(--muted); }
+.contact-card { display:flex; align-items:center; justify-content:space-between; gap:24px; border-radius:28px; padding:48px; background:var(--ink); color:#fff; }
+.contact-card .eyebrow { color:var(--accent); }
+.contact-card .button { border-color:#fff; color:#fff; }
+.site-footer { color:var(--muted); font-size:.85rem; border-top:1px solid var(--line); margin-top:120px; }
+@media (max-width:700px) { .site-header,.site-footer,main { width:min(100% - 32px,1120px); } .hero { min-height:560px; padding:48px 0; } .feature-grid { grid-template-columns:1fr; padding-bottom:72px; } .contact-card { align-items:flex-start; flex-direction:column; padding:32px; } .site-footer { align-items:flex-start; flex-direction:column; gap:8px; } }
+''',
+        "script.js": '''document.querySelectorAll('a[href^="#"]').forEach((link) => {
+  link.addEventListener('click', () => {
+    const target = document.querySelector(link.getAttribute('href'));
+    if (target) target.setAttribute('tabindex', '-1');
+  });
+});
+''',
+        "README.md": f'''# {safe_name.replace("-", " ").title()}\n\nA dependency-free responsive landing page generated by GreyAI.\n\n## Files\n\n- `index.html` — semantic page structure\n- `styles.css` — responsive visual system\n- `script.js` — small progressive-enhancement interaction\n\nOpen `index.html` locally or serve this folder with any static web server. Review the content and replace the example contact address before publishing.\n''',
+    }
 
 
 def build_code_archive(

@@ -165,7 +165,7 @@ from control_plane import (
     record_contact_log as persist_contact_log,
 )
 from dashboard import serve_dashboard
-from starter_templates import build_code_archive, build_telegram_bot_starter_archive
+from starter_templates import build_code_archive, build_landing_page_files, build_telegram_bot_starter_archive
 
 # ==========================================
 # CONFIGURATION & LOGGING
@@ -1270,6 +1270,7 @@ active_schedules: dict[str, asyncio.Task] = {}
 active_ad_campaigns: dict[str, asyncio.Task] = {}
 chat_histories: dict[int, list[dict[str, str]]] = {}
 text_viewers: OrderedDict[str, dict[str, Any]] = OrderedDict()
+recent_natural_language_updates: OrderedDict[int, float] = OrderedDict()
 active_session_by_chat: dict[int, str] = {}
 user_cooldowns: dict[int, float] = {}
 business_user_cooldowns: dict[tuple, float] = {}
@@ -2182,11 +2183,23 @@ def parse_deterministic_management_request(
         return {"mode": "developer_revoke_key", "key_id": revoke_key_match.group(1)}
     if re.search(r"\b(?:developer|api)\s+(?:usage|statistics|stats)\b", text):
         return {"mode": "developer_stats"}
-    code_archive_request = bool(
+    archive_request = bool(
         re.search(r"\b(?:zip|archive|bundle|package|downloadable)\b", text)
-        and re.search(r"\b(?:code|files?|project|source|above|snippet)\b", text)
+        and re.search(r"\b(?:code|files?|project|source|above|snippet|website|site|landing\s+page)\b", text)
     )
-    if code_archive_request:
+    landing_page_request = bool(
+        archive_request
+        and re.search(r"\b(?:landing\s+page|website|web\s+page|site)\b", text)
+        and re.search(r"\b(?:give|create|generate|make|build|design|write)\b", text)
+        and not re.search(r"\b(?:above|previous|existing|already)\b", text)
+    )
+    if landing_page_request:
+        language = "javascript" if re.search(r"\b(?:javascript|typescript|node(?:\.js)?)\b", text) else "html"
+        project_match = re.search(r"\b(?:project|archive|zip|website|site)\s+(?:name|called|named)\s*[:=]?\s*([a-z0-9][a-z0-9._-]{2,80})", text)
+        if not project_match:
+            project_match = re.search(r"\b(?:named|called)\s+([a-z0-9][a-z0-9._-]{2,80})\b", text)
+        return {"mode": "developer_landing_page_archive", "language": language, "project_name": project_match.group(1) if project_match else "greyai-landing-page"}
+    if archive_request:
         language = "javascript" if re.search(r"\b(?:javascript|typescript|node(?:\.js)?)\b", text) else "python"
         project_match = re.search(r"\b(?:project|archive|zip|repository|repo)\s+(?:name|called|named)\s*[:=]?\s*([a-z0-9][a-z0-9._-]{2,80})", text)
         if not project_match:
@@ -2467,6 +2480,9 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
             language = "python"
         project_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(raw_plan.get("project_name", "greyai-telegram-integration") or "greyai-telegram-integration")).strip(".-_").lower()[:80] or "greyai-telegram-integration"
         return {"mode": "developer_bot_starter", "language": language, "project_name": project_name}
+    if mode == "developer_landing_page_archive":
+        project_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(raw_plan.get("project_name", "greyai-landing-page") or "greyai-landing-page")).strip(".-_").lower()[:80] or "greyai-landing-page"
+        return {"mode": "developer_landing_page_archive", "language": "html", "project_name": project_name}
     if mode == "developer_code_archive":
         language = str(raw_plan.get("language", "python") or "python").strip().lower()
         if language in {"js", "node", "typescript", "ts"}:
@@ -2598,7 +2614,7 @@ You are the routing component of GreyAI, a native application-owned Telegram ass
 Translate the user's request into one JSON command. Return JSON only; never Markdown, code, credentials, or extra keys.
 Use this shape:
 {
-  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "download" | "ad_campaign" | "developer_api_example" | "developer_bot_starter" | "developer_code_archive" | "unknown",
+  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "download" | "ad_campaign" | "developer_api_example" | "developer_bot_starter" | "developer_code_archive" | "developer_landing_page_archive" | "unknown",
   "url": "explicit or safely discovered http or https URL for check/watch/download, or empty string",
   "source_candidates": ["ordered canonical HTTPS fallback URLs, when multiple sources are useful"],
   "discover_url": "true only when resolving a clearly named website is necessary; never invent a URL",
@@ -2627,7 +2643,8 @@ Use mode download for a user-requested artifact when the request includes either
 Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return {"mode":"chat","reply":"..."} and write the complete conversational answer in reply. Leave reply empty for every other mode. Use Grey’s native registry to answer capability or upgrade questions; never claim that Grey is merely Gemini.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
 Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL. For price, availability, news, profile, or entity-search requests that may require an in-site result click, prefer one `navigate:<goal>` action so Grey can inspect the current page, search, click a relevant read-only result, and extract from the resulting page. For crypto price requests, prefer Google Search first and provide CoinMarketCap as an ordered fallback source when it is allowlisted.
-Use mode schedule for a recurring briefing and put every source URL in urls. Use mode developer_api_example only when the user asks how to integrate GreyAI’s developer API into another bot or application. Use mode developer_bot_starter when the user asks for a complete, full, starter, or repository-ready Telegram bot project using GreyAI; return only the requested language and project name, and let the application generate the files from its verified template. Use mode developer_code_archive only when the user explicitly asks to package, zip, bundle, or download generated code or files; it packages only bounded fenced source from the current authorized chat/reply context and never executes it. Do not invent an endpoint, base URL, scope, payload, response, or feature: return the exact contract supplied by the native application registry, or return mode unknown. Use mode ad_campaign only when the unquoted outer request clearly asks an administrator to create a bounded advertising campaign; include explicit Telegram target IDs or @usernames, title, ad_text or generate_copy=true with a brief, repeat_count, and interval_seconds. This mode only creates a preview and never posts by itself.
+Use mode schedule for a recurring briefing and put every source URL in urls. Use mode developer_api_example only when the user asks how to integrate GreyAI’s developer API into another bot or application. Use mode developer_bot_starter when the user asks for a complete, full, starter, or repository-ready Telegram bot project using GreyAI; return only the requested language and project name, and let the application generate the files from its verified template. Use mode developer_code_archive only when the user explicitly asks to package, zip, bundle, or download already-generated code or files; it packages only bounded fenced source from the current authorized chat/reply context and never executes it. Use mode developer_landing_page_archive when the user explicitly asks GreyAI to generate or create a landing page/website and deliver it as a ZIP; the application uses its validated inert static-site template and does not execute generated source. Do not invent an endpoint, base URL, scope, payload, response, or feature: return the exact contract supplied by the native application registry, or return mode unknown.
+ Use mode ad_campaign only when the unquoted outer request clearly asks an administrator to create a bounded advertising campaign; include explicit Telegram target IDs or @usernames, title, ad_text or generate_copy=true with a brief, repeat_count, and interval_seconds. This mode only creates a preview and never posts by itself.
 Use condition_type contains only for a literal text match; otherwise use ai.
 Default interval_seconds to 60, never below 30. For ad_campaign, default repeat_count to 1 and interval_seconds to 3600. Default schedule timezone to UTC, days to weekdays, and delivery_mode to combined.
 Do not invent URLs, selectors, identifiers, or actions. If the user names a recognizable website without a URL, resolve only its canonical HTTPS URL and set discover_url true; otherwise return mode unknown. Credentialed login requests are handled outside this prompt and must not be represented here; the application requires explicit user approval before executing one and refuses CAPTCHA, anti-bot, automated-traffic, or access-control bypass requests. Never use model output to grant a role, change a plan, bypass a quota, reveal another user, or execute a side effect; the application validates and enforces those decisions.
@@ -7944,6 +7961,28 @@ async def _deliver_download_artifact(
                 logger.warning("download_artifact_cleanup_failed operation_id=%s", operation_id)
 
 
+def claim_natural_language_update(update: Update) -> bool:
+    """Ignore only transport-level duplicate updates; repeated messages have distinct IDs."""
+    update_id = getattr(update, "update_id", None)
+    if update_id is None:
+        return True
+    try:
+        normalized_id = int(update_id)
+    except (TypeError, ValueError):
+        return True
+    now = time.monotonic()
+    for old_id, seen_at in list(recent_natural_language_updates.items()):
+        if now - seen_at > 600:
+            recent_natural_language_updates.pop(old_id, None)
+    if normalized_id in recent_natural_language_updates:
+        return False
+    recent_natural_language_updates[normalized_id] = now
+    recent_natural_language_updates.move_to_end(normalized_id)
+    while len(recent_natural_language_updates) > 1024:
+        recent_natural_language_updates.popitem(last=False)
+    return True
+
+
 async def _process_natural_language(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -7953,6 +7992,9 @@ async def _process_natural_language(
     shared_context: bool = False,
 ):
     """Process authorized text or media-derived text through chat or agent mode."""
+    if not claim_natural_language_update(update):
+        logger.info("duplicate_natural_language_update_ignored update_id=%s", getattr(update, "update_id", None))
+        return
     source_message = update_source_message(update)
     if not source_message:
         return
@@ -8198,6 +8240,51 @@ async def _process_natural_language(
             await status_msg.edit_text(f"✅ Developer access request submitted: `{request_id}`.", parse_mode="Markdown")
         else:
             await status_msg.edit_text(f"Your developer request is already open: `{request_id}`.", parse_mode="Markdown")
+        return
+
+    if plan and plan.get("mode") == "developer_landing_page_archive":
+        if not is_developer(user_id):
+            await status_msg.edit_text("⛔ An active developer role is required to generate a website archive. Use /devrequest to ask an administrator for access.")
+            update_operation(operation_id, "denied")
+            log_audit(user_id, "developer_landing_page_archive", None, "DENIED_NOT_DEVELOPER")
+            return
+        artifact_dir = tempfile.mkdtemp(prefix="greyai-landing-page-")
+        try:
+            project_name = plan.get("project_name", "greyai-landing-page")
+            files = build_landing_page_files(project_name, request_text)
+            archive_path = build_code_archive(project_name, files, output_dir=artifact_dir)
+            await status_msg.edit_text(f"✅ I generated and validated a responsive landing page with {len(files)} source files. I’m sending the ZIP now.")
+            with archive_path.open("rb") as artifact:
+                document = await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(artifact, filename=archive_path.name),
+                    caption="✅ Landing-page website ZIP attached. It contains index.html, styles.css, script.js, and README.md. Review the example contact address before publishing; no credentials are included.",
+                )
+            schedule_ephemeral_message(context, document, delay_seconds=DEVELOPER_ARTIFACT_TTL_SECONDS)
+            remember_assistant_turn(
+                chat_id,
+                f"Generated landing-page archive {archive_path.name} with files: {', '.join(sorted(files))}.",
+                user_id,
+                assistant_message_id=getattr(document, "message_id", None),
+                reply_to_message_id=reply_to_message_id,
+                business_connection_id=business_connection_id,
+                operation_id=operation_id,
+                response_kind="developer_landing_page_archive",
+            )
+            update_operation(operation_id, "succeeded")
+            log_audit(user_id, "developer_landing_page_archive", None, "SUCCESS")
+        except ValueError as exc:
+            update_operation(operation_id, "failed")
+            log_audit(user_id, "developer_landing_page_archive", None, f"VALIDATION_FAILED_{type(exc).__name__}")
+            logger.exception("developer_landing_page_archive_validation_failed user_id=%s", user_id)
+            await status_msg.edit_text("⚠️ I couldn’t validate the landing-page source, so no archive was sent. No source was executed and no key was exposed.")
+        except Exception:
+            update_operation(operation_id, "failed")
+            log_audit(user_id, "developer_landing_page_archive", None, "DELIVERY_FAILED")
+            logger.exception("developer_landing_page_archive_delivery_failed user_id=%s", user_id)
+            await status_msg.edit_text("⚠️ I couldn’t deliver the landing-page archive this time. No source was executed and no key was exposed.")
+        finally:
+            shutil.rmtree(artifact_dir, ignore_errors=True)
         return
 
     if plan and plan.get("mode") == "developer_code_archive":
@@ -9391,6 +9478,7 @@ def build_help_sections(user_id: int | None = None) -> list[tuple[str, str]]:
             "/revokekey <key_id> — Revoke an owned key",
             "/developerstats — View key usage and denied events",
             "Ask Grey for a complete code example, then say ‘package the code above as a zip’ to receive a validated inert source archive.",
+            "Ask ‘give me a landing page website in a zip file’ to generate and receive a complete static landing-page project archive.",
             "Use POST /api/v1/check with Authorization: Bearer <key> from another authorized Telegram bot.",
             "Never send an API secret again after copying it. If a key is exposed, revoke it immediately.",
         ))))
