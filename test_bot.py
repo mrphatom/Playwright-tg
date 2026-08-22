@@ -4387,3 +4387,87 @@ def test_dynamic_artifact_candidates_rejects_route_disallowed_artifact(monkeypat
     ))
 
     assert candidates == []
+
+
+def test_help_command_escapes_ad_campaign_angle_brackets(monkeypatch):
+    import bot
+
+    sent = {}
+
+    class FakeMessage:
+        async def reply_text(self, text, **kwargs):
+            sent["text"] = text
+            sent["kwargs"] = kwargs
+
+    async def fake_audit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "ensure_user", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "is_allowed_user", lambda _user_id: True)
+    monkeypatch.setattr(bot, "log_audit", fake_audit)
+    update = SimpleNamespace(
+        message=FakeMessage(),
+        effective_user=SimpleNamespace(id=42, username="tester", full_name="Test User"),
+    )
+
+    asyncio.run(bot.help_command(update, SimpleNamespace()))
+
+    assert sent["kwargs"]["parse_mode"] == "HTML"
+    assert "<chat_id|@username,...>" not in sent["text"]
+    assert "&lt;chat_id|@username,...&gt;" in sent["text"]
+
+
+def test_login_requires_explicit_approval_before_browser_execution(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    request = "Login to https://example.com with username 'alice' and password 'secret'"
+    plan = bot.parse_deterministic_login_request(request)
+    approved_plan = bot.parse_deterministic_login_request(
+        "I explicitly approve GreyAI to log in to https://example.com with username 'alice' and password 'secret'"
+    )
+
+    assert plan["mode"] == "login"
+    assert plan["consent_granted"] is False
+    assert approved_plan["consent_granted"] is True
+
+
+def test_login_rejects_captcha_or_antibot_bypass_requests(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    plan = bot.parse_deterministic_login_request(
+        "I approve GreyAI to log in to https://example.com and bypass the CAPTCHA and anti-bot checks"
+    )
+
+    assert plan == {"mode": "login_blocked", "reason": "captcha_or_antibot_bypass"}
+
+
+
+
+def test_global_error_handler_does_not_enter_maintenance_for_telegram_bad_request(monkeypatch):
+    import bot
+    from telegram.error import BadRequest
+
+    maintenance_calls = []
+    replies = []
+
+    async def fake_enter_maintenance(*args, **kwargs):
+        maintenance_calls.append((args, kwargs))
+
+    class FakeMessage:
+        async def reply_text(self, text, **kwargs):
+            replies.append((text, kwargs))
+
+    monkeypatch.setattr(bot, "enter_hard_maintenance", fake_enter_maintenance)
+    update = SimpleNamespace(effective_message=FakeMessage())
+    context = SimpleNamespace(
+        error=BadRequest('Can\'t parse entities: unsupported start tag "chat_id|@username,..."'),
+        bot=SimpleNamespace(),
+    )
+
+    asyncio.run(bot.global_error_handler(update, context))
+
+    assert maintenance_calls == []
+    assert replies
+    assert "formatting" in replies[0][0].lower()
