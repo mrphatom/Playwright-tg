@@ -3705,6 +3705,7 @@ def test_primary_artifact_site_gets_site_search_and_public_fallback_candidates(m
     assert any("freemusicarchive.org/search/" in candidate for candidate in candidates)
     assert any("quicksearch=Nihilore" in candidate for candidate in candidates)
     assert any("duckduckgo.com" in candidate for candidate in candidates)
+    assert any("google.com/search" in candidate for candidate in candidates)
     assert "https://freemusicarchive.org" not in bot.artifact_discovery_query(request)
 
 
@@ -3827,7 +3828,7 @@ def test_resolve_direct_download_source_uses_dynamic_fallback_for_empty_html(mon
 
     monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
 
-    async def dynamic_fallback(url, user_id, goal):
+    async def dynamic_fallback(url, user_id, goal, *_args):
         assert url.endswith("/search")
         assert user_id == 42
         assert "Believer" in goal
@@ -3848,6 +3849,94 @@ def test_resolve_direct_download_source_uses_dynamic_fallback_for_empty_html(mon
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_dynamic_download_navigation_searches_clicks_and_finds_generic_artifact(monkeypatch):
+    import bot
+
+    events = []
+
+    class FakeLocator:
+        def __init__(self, page):
+            self.page = page
+
+        async def evaluate_all(self, _script):
+            if self.page.url.endswith("/detail"):
+                return [{"href": "/media/song.mp3", "dataUrl": "", "dataDownloadUrl": "", "dataFileUrl": "", "trackInfo": "", "text": "Download song"}]
+            return []
+
+        async def all(self):
+            return []
+
+    class FakePage:
+        def __init__(self):
+            self.url = "https://provider.example/search"
+
+        def locator(self, _selector):
+            return FakeLocator(self)
+
+        async def goto(self, url, **_kwargs):
+            self.url = url
+
+        async def evaluate(self, _script):
+            return "Search results"
+
+        async def title(self):
+            return "Provider search"
+
+        async def wait_for_timeout(self, _milliseconds):
+            return None
+
+        async def close(self):
+            return None
+
+    page = FakePage()
+
+    class FakeContext:
+        async def new_page(self):
+            return page
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        def is_connected(self):
+            return True
+
+        async def new_context(self, **_kwargs):
+            return FakeContext()
+
+    monkeypatch.setattr(bot.pool, "browser", FakeBrowser())
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+    decisions = iter([
+        {"action": "search", "query": "requested song"},
+        {"action": "click", "target": "Download song"},
+    ])
+    async def choose(*_args, **_kwargs):
+        return next(decisions)
+
+    monkeypatch.setattr(bot, "_choose_navigation_action", choose)
+
+    async def search(page_obj, query):
+        events.append(("search", query))
+        page_obj.url = "https://provider.example/results"
+
+    async def click(page_obj, target, user_id):
+        events.append(("click", target, user_id))
+        page_obj.url = "https://provider.example/detail"
+
+    monkeypatch.setattr(bot, "_fill_navigation_search", search)
+    monkeypatch.setattr(bot, "_click_navigation_target", click)
+
+    resolved = asyncio.run(bot._resolve_dynamic_download_source(
+        "https://provider.example/search",
+        42,
+        "Find the requested song and send the file",
+        {"identity": "GreyAI"},
+    ))
+
+    assert resolved == "https://provider.example/media/song.mp3"
+    assert events == [("search", "requested song"), ("click", "Download song", 42)]
 
 
 def test_resolve_direct_download_source_accepts_single_quoted_search_result_links(monkeypatch):
@@ -4263,3 +4352,38 @@ def test_native_chat_contract_describes_file_delivery_without_false_media_denial
     assert "lawful file retrieval" in prompt
     assert "Never claim" in prompt
     assert "cannot stream" in prompt
+
+
+def test_dynamic_artifact_candidates_rejects_route_disallowed_artifact(monkeypatch):
+    import bot
+
+    class FakeLocator:
+        async def evaluate_all(self, _script):
+            return [{
+                "href": "https://outside.example/download/believer.mp3",
+                "dataUrl": "",
+                "dataDownloadUrl": "",
+                "dataFileUrl": "",
+                "trackInfo": "",
+                "text": "Download Believer",
+            }]
+
+    class FakePage:
+        url = "https://provider.example/detail"
+
+        def locator(self, _selector):
+            return FakeLocator()
+
+    monkeypatch.setattr(
+        bot,
+        "route_url_allowed",
+        lambda candidate, user_id=None: candidate.startswith("https://provider.example/"),
+    )
+
+    candidates = asyncio.run(bot._dynamic_artifact_candidates(
+        FakePage(),
+        "Find Imagine Dragons Believer and send the song",
+        42,
+    ))
+
+    assert candidates == []

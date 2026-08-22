@@ -2294,6 +2294,8 @@ def artifact_discovery_source_candidates(
 ) -> list[str]:
     query = artifact_discovery_query(user_text)
     candidates: list[str] = []
+    if query:
+        candidates.append("https://www.google.com/search?q=" + quote_plus(query))
     site_search = _artifact_site_search_candidate(primary_url, user_text)
     if site_search:
         candidates.append(site_search)
@@ -6710,8 +6712,69 @@ async def _edit_download_progress(status_msg, text: str) -> None:
         logger.debug("download_progress_edit_failed", exc_info=True)
 
 
-async def _resolve_dynamic_download_source(url: str, user_id: int, goal: str = "") -> str | None:
-    """Resolve an approved JavaScript-rendered page without bypassing site controls."""
+async def _dynamic_artifact_candidates(page, goal: str, user_id: int) -> list[tuple[int, str]]:
+    rows = await page.locator("[data-track-info], a[href], [data-url], [data-download-url], [data-file-url]").evaluate_all(
+        """elements => elements.map(element => ({
+            href: element.getAttribute('href') || '',
+            dataUrl: element.getAttribute('data-url') || '',
+            dataDownloadUrl: element.getAttribute('data-download-url') || '',
+            dataFileUrl: element.getAttribute('data-file-url') || '',
+            trackInfo: element.getAttribute('data-track-info') || '',
+            text: element.innerText || element.textContent || ''
+        }))"""
+    )
+    target_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", artifact_discovery_query(goal).lower())
+        if len(token) > 2
+    }
+    candidates: list[tuple[int, str]] = []
+    for row in rows:
+        metadata = {}
+        encoded_metadata = str(row.get("trackInfo") or "").strip()
+        if encoded_metadata:
+            try:
+                metadata = json.loads(html_unescape(encoded_metadata))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+        metadata_text = f"{metadata.get('title', '')} {metadata.get('artistName', '')}".lower()
+        metadata_match_score = min(96, sum(12 for token in target_tokens if token in metadata_text))
+        for key in ("playbackUrl", "playback_url", "downloadUrl", "fileUrl", "download_url", "file_url"):
+            raw_candidate = str(metadata.get(key) or "").strip()
+            if raw_candidate:
+                candidate = urljoin(str(page.url), html_unescape(raw_candidate))
+                if route_url_allowed(candidate, user_id):
+                    priority = 36 if key in {"playbackUrl", "playback_url"} else 30
+                    candidates.append((priority + metadata_match_score, candidate))
+        for raw_candidate in (row.get("dataDownloadUrl"), row.get("dataFileUrl"), row.get("dataUrl"), row.get("href")):
+            raw_candidate = str(raw_candidate or "").strip()
+            if not raw_candidate or raw_candidate.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            candidate = urljoin(str(page.url), html_unescape(raw_candidate))
+            if not route_url_allowed(candidate, user_id):
+                continue
+            parsed = urlparse(candidate)
+            suffix = Path(parsed.path).suffix.lower()
+            label = str(row.get("text") or "").lower()
+            link_text = f"{candidate} {label}".lower()
+            token_score = min(48, sum(6 for token in target_tokens if token in link_text))
+            score = token_score
+            if suffix in DOWNLOAD_ALLOWED_EXTENSIONS:
+                score += 14
+            if "download" in link_text or "stream" in link_text or "file" in link_text:
+                score += 10
+            if score and suffix not in DOWNLOAD_BLOCKED_EXTENSIONS:
+                candidates.append((score, candidate))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return list(dict.fromkeys(candidates))[:20]
+
+
+async def _resolve_dynamic_download_source(
+    url: str,
+    user_id: int,
+    goal: str = "",
+    native_context: dict[str, Any] | None = None,
+) -> str | None:
+    """Resolve approved pages by bounded search/click/inspect navigation, without evasion or policy bypass."""
     if not pool.browser or not pool.browser.is_connected():
         return None
     browser_context = None
@@ -6720,61 +6783,36 @@ async def _resolve_dynamic_download_source(url: str, user_id: int, goal: str = "
         browser_context = await pool.browser.new_context(viewport={"width": 1280, "height": 800})
         page = await browser_context.new_page()
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(1500)
-        rows = await page.locator("[data-track-info], a[href], [data-url], [data-download-url], [data-file-url]").evaluate_all(
-            """elements => elements.map(element => ({
-                href: element.getAttribute('href') || '',
-                dataUrl: element.getAttribute('data-url') || '',
-                dataDownloadUrl: element.getAttribute('data-download-url') || '',
-                dataFileUrl: element.getAttribute('data-file-url') || '',
-                trackInfo: element.getAttribute('data-track-info') || '',
-                text: element.innerText || element.textContent || ''
-            }))"""
-        )
-        target_tokens = {
-            token for token in re.findall(r"[a-z0-9]+", artifact_discovery_query(goal).lower())
-            if len(token) > 2
-        }
-        candidates: list[tuple[int, str]] = []
-        for row in rows:
-            metadata = {}
-            encoded_metadata = str(row.get("trackInfo") or "").strip()
-            if encoded_metadata:
-                try:
-                    metadata = json.loads(html_unescape(encoded_metadata))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    metadata = {}
-            metadata_text = f"{metadata.get('title', '')} {metadata.get('artistName', '')}".lower()
-            metadata_match_score = min(80, sum(8 for token in target_tokens if token in metadata_text))
-            for key in ("playbackUrl", "playback_url", "downloadUrl", "fileUrl", "download_url", "file_url"):
-                raw_candidate = str(metadata.get(key) or "").strip()
-                if raw_candidate:
-                    candidate = urljoin(str(page.url), html_unescape(raw_candidate))
-                    if route_url_allowed(candidate, user_id):
-                        priority = 26 if key in {"playbackUrl", "playback_url"} else 20
-                        candidates.append((priority + metadata_match_score, candidate))
-            for raw_candidate in (row.get("dataDownloadUrl"), row.get("dataFileUrl"), row.get("dataUrl"), row.get("href")):
-                candidate = urljoin(str(page.url), html_unescape(str(raw_candidate or "").strip()))
-                if not route_url_allowed(candidate, user_id):
-                    continue
-                parsed = urlparse(candidate)
-                suffix = Path(parsed.path).suffix.lower()
-                label = str(row.get("text") or "").lower()
-                score = 0
-                if suffix in DOWNLOAD_ALLOWED_EXTENSIONS:
-                    score += 10
-                if "download" in candidate.lower() or "download" in label:
-                    score += 8
-                if score and suffix not in DOWNLOAD_BLOCKED_EXTENSIONS:
-                    candidates.append((score, candidate))
-        if candidates:
-            candidates.sort(key=lambda item: (-item[0], item[1]))
-            return candidates[0][1]
-        return None
+        await page.wait_for_timeout(1200)
+        seen_pages = {str(page.url)}
+        for step in range(INTELLIGENT_NAVIGATION_MAX_STEPS):
+            candidates = await _dynamic_artifact_candidates(page, goal, user_id)
+            if candidates:
+                return candidates[0][1]
+            snapshot = await _page_navigation_snapshot(page)
+            decision = await _choose_navigation_action(goal, snapshot, native_context)
+            action = decision["action"]
+            if action in {"extract", "stop"}:
+                break
+            if action == "search":
+                await _fill_navigation_search(page, decision["query"])
+            elif action == "click":
+                await _click_navigation_target(page, decision["target"], user_id)
+            elif action == "wait":
+                await page.wait_for_timeout(int(decision["seconds"] * 1000))
+            if not route_url_allowed(str(page.url), user_id):
+                return None
+            await page.wait_for_timeout(250)
+            current_url = str(page.url)
+            if action == "click" and current_url in seen_pages:
+                break
+            seen_pages.add(current_url)
+        candidates = await _dynamic_artifact_candidates(page, goal, user_id)
+        return candidates[0][1] if candidates else None
     except (PlaywrightTimeoutError, OSError):
         return None
     except Exception:
-        logger.info("dynamic_download_discovery_failed", exc_info=True)
+        logger.info("dynamic_download_navigation_failed", exc_info=True)
         return None
     finally:
         if page:
@@ -6789,7 +6827,12 @@ async def _resolve_dynamic_download_source(url: str, user_id: int, goal: str = "
                 pass
 
 
-async def _resolve_direct_download_source(url: str, user_id: int, goal: str = "") -> str:
+async def _resolve_direct_download_source(
+    url: str,
+    user_id: int,
+    goal: str = "",
+    native_context: dict[str, Any] | None = None,
+) -> str:
     """Resolve approved search/detail pages to a direct, allowlisted artifact link."""
     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
     current_url = str(url or "").strip()
@@ -6874,7 +6917,7 @@ async def _resolve_direct_download_source(url: str, user_id: int, goal: str = ""
             raise DownloadRejected("discovery_hop_limit")
     except DownloadRejected as exc:
         if str(exc) == "no_direct_artifact_found":
-            dynamic_url = await _resolve_dynamic_download_source(url, user_id, goal)
+            dynamic_url = await _resolve_dynamic_download_source(url, user_id, goal, native_context)
             if dynamic_url:
                 return dynamic_url
         raise
@@ -7043,7 +7086,12 @@ async def _deliver_download_artifact(
             for candidate_url in candidate_urls:
                 try:
                     await _edit_download_progress(status_msg, f"🔎 Checking approved source: {urlparse(candidate_url).hostname or 'source'}…")
-                    direct_url = await _resolve_direct_download_source(candidate_url, user_id, str(plan.get("request") or ""))
+                    direct_url = await _resolve_direct_download_source(
+                        candidate_url,
+                        user_id,
+                        str(plan.get("request") or ""),
+                        native_context,
+                    )
                     artifact = await _stream_download_artifact(direct_url, user_id, policy, status_msg=status_msg)
                     break
                 except DownloadRejected as exc:
