@@ -4811,3 +4811,222 @@ def test_developer_download_entitlement_follows_paid_plan(monkeypatch):
     max_policy = bot.download_policy_for_user(77)
     assert max_policy["allowed"] is True
     assert max_policy["tier"] == "max"
+
+
+def test_shared_text_viewer_preserves_every_character_and_short_text_stays_single(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kwargs):
+            self.sent.append((text, kwargs))
+            return SimpleNamespace(message_id=501)
+
+    long_text = "Section one\n" + ("0123456789" * 900) + "\nSection two\n" + ("end-" * 900)
+    long_message = FakeMessage()
+    sent = asyncio.run(bot.deliver_text_response(long_message, long_text, owner_user_id=42))
+
+    assert sent.message_id == 501
+    assert len(long_message.sent) == 1
+    rendered, options = long_message.sent[0]
+    assert len(rendered) <= 3900
+    callback_data = options["reply_markup"].inline_keyboard[0][0].callback_data
+    viewer_id = callback_data.split(":")[1]
+    viewer = bot.text_viewers[viewer_id]
+    assert "".join(viewer["pages"]) == long_text
+    assert all(len(page) <= bot.TEXT_VIEWER_BODY_LENGTH for page in viewer["pages"])
+
+    short_message = FakeMessage()
+    asyncio.run(bot.deliver_text_response(short_message, "Short **answer**", owner_user_id=42))
+    assert len(short_message.sent) == 1
+    assert "reply_markup" not in short_message.sent[0][1]
+    assert short_message.sent[0][1]["parse_mode"] == "HTML"
+
+
+def test_shared_text_viewer_rejects_foreign_and_expired_callbacks(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "is_allowed_user", lambda _user_id: True)
+
+    class FakeMessage:
+        def __init__(self):
+            self.edited = []
+
+        async def edit_text(self, text, **kwargs):
+            self.edited.append((text, kwargs))
+
+    class FakeQuery:
+        def __init__(self, user_id, data):
+            self.from_user = SimpleNamespace(id=user_id)
+            self.data = data
+            self.message = FakeMessage()
+            self.answers = []
+
+        async def answer(self, text=None, **kwargs):
+            self.answers.append((text, kwargs))
+
+    viewer_id = bot.create_text_viewer(42, "A" * 8000)
+    foreign = FakeQuery(99, f"page:{viewer_id}:1")
+    asyncio.run(bot.text_viewer_callback(SimpleNamespace(callback_query=foreign), SimpleNamespace()))
+    assert foreign.answers[0][1]["show_alert"] is True
+    assert foreign.message.edited == []
+
+    bot.text_viewers[viewer_id]["expires_at"] = 0
+    expired = FakeQuery(42, f"page:{viewer_id}:1")
+    asyncio.run(bot.text_viewer_callback(SimpleNamespace(callback_query=expired), SimpleNamespace()))
+    assert expired.answers[0][1]["show_alert"] is True
+    assert expired.message.edited == []
+
+
+def test_shared_text_viewer_redacts_sensitive_fields(monkeypatch):
+    import bot
+
+    viewer_id = bot.create_text_viewer(42, "safe\napi_key=super-secret-value\npassword=hunter2\nAuthorization: Bearer gai_live.secret-value-123456")
+    content = "".join(bot.text_viewers[viewer_id]["pages"])
+    assert "super-secret-value" not in content
+    assert "hunter2" not in content
+    assert "gai_live.secret-value-123456" not in content
+    assert "[redacted]" in content
+
+
+def test_long_chat_reply_uses_shared_viewer_instead_of_truncation(monkeypatch):
+    import bot
+
+    class FakeSourceMessage:
+        text = "Give me the long answer"
+        caption = None
+        chat_id = 123
+
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kwargs):
+            self.sent.append((text, kwargs))
+            return SimpleNamespace(message_id=777)
+
+    source = FakeSourceMessage()
+    update = SimpleNamespace(
+        business_message=None,
+        message=source,
+        channel_post=None,
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_user=SimpleNamespace(id=6411860985),
+    )
+
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "classify_message_route", lambda request: "chat")
+
+    async def no_interpreted_chat_reply(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "parse_natural_language_intent", no_interpreted_chat_reply)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args: None)
+
+    async def fake_chat_reply(*args, **kwargs):
+        return "BEGIN\n" + ("complete-" * 900) + "\nEND"
+
+    monkeypatch.setattr(bot, "generate_chat_reply", fake_chat_reply)
+    asyncio.run(bot._process_natural_language(update, SimpleNamespace()))
+
+    assert len(source.sent) == 1
+    rendered, options = source.sent[0]
+    assert options["parse_mode"] == "HTML"
+    assert options["reply_markup"].inline_keyboard
+    viewer_id = options["reply_markup"].inline_keyboard[0][0].callback_data.split(":")[1]
+    assert "".join(bot.text_viewers[viewer_id]["pages"]) == "BEGIN\n" + ("complete-" * 900) + "\nEND"
+
+
+def test_shared_viewer_callback_advances_only_with_valid_page(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "is_allowed_user", lambda _user_id: True)
+
+    class FakeMessage:
+        def __init__(self):
+            self.edited = []
+
+        async def edit_text(self, text, **kwargs):
+            self.edited.append((text, kwargs))
+
+    class FakeQuery:
+        def __init__(self, data):
+            self.from_user = SimpleNamespace(id=42)
+            self.data = data
+            self.message = FakeMessage()
+            self.answers = []
+
+        async def answer(self, text=None, **kwargs):
+            self.answers.append((text, kwargs))
+
+    viewer_id = bot.create_text_viewer(42, "first\n" + ("second-" * 900))
+    query = FakeQuery(f"page:{viewer_id}:1:42")
+    asyncio.run(bot.text_viewer_callback(SimpleNamespace(callback_query=query), SimpleNamespace()))
+    assert query.answers == [(None, {})]
+    assert "page 2/" in query.message.edited[0][0]
+    assert query.message.edited[0][1]["reply_markup"].inline_keyboard[0][0].callback_data == f"page:{viewer_id}:0:42"
+
+
+def test_bounded_route_decision_honors_validated_plan_and_browser_continuation():
+    import bot
+
+    assert bot.decide_message_route("hello", {"mode": "chat"}, "task") == "chat"
+    assert bot.decide_message_route("check it", {"mode": "check"}, "chat") == "task"
+    assert bot.decide_message_route(
+        "continue with that",
+        None,
+        "chat",
+        reply_context={"text": "GreyAI completed a browser check for https://example.com."},
+    ) == "task"
+    assert bot.decide_message_route(
+        "how does a browser work?",
+        None,
+        "chat",
+        reply_context={"text": "GreyAI completed a browser check for https://example.com."},
+    ) == "chat"
+
+
+def test_durable_assistant_result_keeps_operation_receipt_metadata(monkeypatch):
+    import bot
+
+    bot.remember_assistant_turn(
+        7010,
+        "The browser result is complete.",
+        6411860985,
+        assistant_message_id=111,
+        operation_id="op-continuity",
+        response_kind="web_extraction",
+    )
+    rows = bot.load_chat_history(6411860985, 7010, limit=4)
+    assert rows[-1]["text"] == "The browser result is complete."
+    stored = bot.get_conversation_turn_by_telegram_message_id(6411860985, 7010, 111)
+    assert stored is not None
+    assert "op-continuity" in stored["metadata_json"]
+    assert "web_extraction" in stored["metadata_json"]
+
+
+def test_long_search_result_reaches_shared_viewer_without_upstream_cutoff():
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kwargs):
+            self.sent.append((text, kwargs))
+            return SimpleNamespace(message_id=888)
+
+    results = [{
+        "title": "Result",
+        "link": "https://example.com/result",
+        "snippet": "detail-" * 900,
+    }]
+    formatted = bot.format_google_search_results("long query", results)
+    assert len(formatted) > bot.TELEGRAM_TEXT_LIMIT
+    message = FakeMessage()
+    asyncio.run(bot.deliver_text_response(message, formatted, 42, title="Search results"))
+    callback = message.sent[0][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    viewer_id = callback.split(":")[1]
+    assert "detail-" * 900 in "".join(bot.text_viewers[viewer_id]["pages"])

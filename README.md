@@ -19,6 +19,12 @@ Gemini is an interchangeable inference provider, not Grey’s identity, memory s
 
 > A literal weight-level training or fine-tuning pipeline is a separate concern. This release provides native Grey grounding and orchestration; weight-level tuning requires a curated consented dataset, provider support, evaluation gates, and a rollback plan.
 
+### Navigable responses and bounded adaptive routing
+
+GreyAI applies one response-delivery boundary across ordinary chat, natural-language Agent tasks, browser extraction, search results, scheduled briefings, watcher alerts, health and status reports, administrator feeds, developer event feeds, and inline answers. Short text stays in one normal Telegram message. When rendered content is too long for Telegram, GreyAI keeps the complete redacted response in a short-lived, owner-scoped viewer and presents **Previous** and **Next** buttons instead of silently clipping the tail or dumping a chain of static messages. Viewer callbacks are opaque, size-bounded, validated, expired automatically, and rejected for foreign or no-longer-authorized users. Screenshots and documents remain separate Telegram media deliveries with bounded captions.
+
+The adaptive layer is deliberately bounded and application-owned. It combines the validated intent plan, deterministic route signals, the current user role and plan, chat scope, reply-to metadata, recent durable turns, operation receipts, provider availability, and existing policy gates to decide whether a message is conversational, a browser task, a continuation, or a request that needs clarification. Gemini keys are interchangeable inference providers: switching keys does not reset the owner-scoped conversation or operation receipt. This is native grounding and orchestration, not unsupported self-training or a claim of autonomous self-awareness.
+
 ## ✨ Core Features
 
 - **👀 Continuous Watchers:** Monitor websites in the background. If a condition is met (e.g., "In Stock" or an AI evaluation), the bot alerts you and stops automatically. Watchers survive server reboots!
@@ -129,7 +135,7 @@ A voice note is transcribed and then routed as either a normal chat message or a
 
 In a private chat, Grey uses a warmer persona than it uses in groups or inline mode. Very short social messages such as greetings, thanks, “cry”, or playful profanity can receive an immediate local response, keeping the conversation responsive during provider latency or quota pressure. Longer or ambiguous messages still use the private-chat Gemini prompt. Grey may be witty, but it does not use slurs, threats, coercion, or encouragement of self-harm or violence, and private-chat personality instructions never suppress a recognized browser-agent task.
 
-Conversation memory is keyed to the authorized Telegram owner and chat rather than to a Gemini API key. Each Gemini fallback therefore receives the same durable conversation context. Contact logs retain bounded message metadata, reply relationships, and timestamps; credential-like strings are redacted before persistence. The active prompt window is controlled by `CHAT_CONTEXT_TURNS` and remains bounded to protect latency and provider context limits.
+Conversation memory is keyed to the authorized Telegram owner and chat rather than to a Gemini API key. Each Gemini fallback therefore receives the same durable conversation context. Contact logs retain bounded message metadata, reply relationships, and timestamps; credential-like strings are redacted before persistence. The active prompt window is controlled by `CHAT_CONTEXT_TURNS`, while the in-process mirror is bounded by `CHAT_MEMORY_TURNS` and `CHAT_MEMORY_TEXT_CHARS` to improve continuity without unbounded memory growth.
 
 ### Telegram Secretary Mode (Telegram Business Bot)
 
@@ -251,6 +257,11 @@ They can block a host or family of subdomains immediately:
    BROWSER_READY_TIMEOUT_MS=4000
    BROWSER_RETRY_BACKOFF_SECONDS=2
    CHAT_CONTEXT_TURNS=32
+   CHAT_MEMORY_TURNS=48
+   CHAT_MEMORY_TEXT_CHARS=6000
+   TEXT_VIEWER_TTL_SECONDS=900
+   TEXT_VIEWER_MAX_ACTIVE=256
+   TEXT_VIEWER_BODY_LENGTH=3300
    MEDIA_TIMEOUT_SECONDS=45
    MEDIA_MAX_BYTES=12000000
    MAX_MEDIA_CONTEXT_CHARS=6000

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from collections import OrderedDict
 import hashlib
 import ipaddress
 import json
@@ -184,6 +185,8 @@ MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", "12000000"))
 MAX_MEDIA_CONTEXT_CHARS = int(os.getenv("MAX_MEDIA_CONTEXT_CHARS", "6000"))
 CHAT_TIMEOUT_SECONDS = int(os.getenv("CHAT_TIMEOUT_SECONDS", "20"))
 CHAT_CONTEXT_TURNS = max(8, min(100, int(os.getenv("CHAT_CONTEXT_TURNS", "32"))))
+CHAT_MEMORY_TURNS = max(CHAT_CONTEXT_TURNS, min(100, int(os.getenv("CHAT_MEMORY_TURNS", "48"))))
+CHAT_MEMORY_TEXT_CHARS = max(2000, min(6000, int(os.getenv("CHAT_MEMORY_TEXT_CHARS", "6000"))))
 ROUTER_MAX_OUTPUT_TOKENS = max(256, min(1024, int(os.getenv("ROUTER_MAX_OUTPUT_TOKENS", "768"))))
 MEDIA_TIMEOUT_SECONDS = int(os.getenv("MEDIA_TIMEOUT_SECONDS", "45"))
 API_KEY_MESSAGE_TTL_SECONDS = max(30, min(300, int(os.getenv("API_KEY_MESSAGE_TTL_SECONDS", "90"))))
@@ -319,6 +322,10 @@ ALLOWED_USERS = set(int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_USER
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "90"))
 PROGRESS_FEEDBACK_DELAY_SECONDS = max(0.5, min(3.0, float(os.getenv("PROGRESS_FEEDBACK_DELAY_SECONDS", "1.2"))))
+TEXT_VIEWER_TTL_SECONDS = max(60, min(3600, int(os.getenv("TEXT_VIEWER_TTL_SECONDS", "900"))))
+TEXT_VIEWER_MAX_ACTIVE = max(16, min(2000, int(os.getenv("TEXT_VIEWER_MAX_ACTIVE", "256"))))
+TEXT_VIEWER_BODY_LENGTH = max(1200, min(3600, int(os.getenv("TEXT_VIEWER_BODY_LENGTH", "3300"))))
+TELEGRAM_TEXT_LIMIT = 3900
 CRYPTO_CHECKOUT_URL = os.getenv("CRYPTO_CHECKOUT_URL")
 DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "")
 PRO_PLAN_STARS = int(os.getenv("PRO_PLAN_STARS", "750"))
@@ -724,7 +731,7 @@ def format_google_search_results(query: str, results: list[dict[str, str]]) -> s
             result["snippet"] or "No snippet was provided.",
             "",
         ])
-    return truncate_text("\n".join(lines).strip(), 3900)
+    return "\n".join(lines).strip()
 
 
 class ProviderAlertManager:
@@ -1222,6 +1229,7 @@ active_watchers: dict[int, dict[str, asyncio.Task]] = {}
 active_schedules: dict[str, asyncio.Task] = {}
 active_ad_campaigns: dict[str, asyncio.Task] = {}
 chat_histories: dict[int, list[dict[str, str]]] = {}
+text_viewers: OrderedDict[str, dict[str, Any]] = OrderedDict()
 active_session_by_chat: dict[int, str] = {}
 user_cooldowns: dict[int, float] = {}
 business_user_cooldowns: dict[tuple, float] = {}
@@ -1278,6 +1286,11 @@ runtime_metrics = {
     "manual_challenge_completions": 0,
     "manual_challenge_timeouts": 0,
     "manual_challenge_failures": 0,
+    "text_viewers_created": 0,
+    "text_viewer_navigation_success": 0,
+    "text_viewer_navigation_rejected": 0,
+    "text_viewer_expired": 0,
+    "long_output_fallbacks": 0,
 }
 # ==========================================
 # DATABASE ENGINE (SQLITE)
@@ -2388,7 +2401,7 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
     mode = str(raw_plan.get("mode", "")).strip().lower()
     mode = {"monitor": "watch", "poll": "watch", "track": "watch"}.get(mode, mode)
     if mode == "chat":
-        reply = str(raw_plan.get("reply", raw_plan.get("response", "")) or "").strip()[:4000]
+        reply = str(raw_plan.get("reply", raw_plan.get("response", "")) or "").strip()
         plan = {"mode": "chat"}
         if reply:
             plan["reply"] = reply
@@ -2730,6 +2743,35 @@ def is_live_web_lookup_request(user_text: str) -> bool:
 
 
 
+def decide_message_route(
+    user_text: str,
+    plan: dict[str, Any] | None,
+    route_hint: str,
+    reply_context: dict[str, Any] | None = None,
+) -> str:
+    """Choose chat or Agent mode from validated plan, signals, and bounded reply continuity."""
+    mode = str((plan or {}).get("mode") or "").lower()
+    if mode == "chat":
+        return "chat"
+    if mode and mode not in {"unknown", "chat"}:
+        return "task"
+    if route_hint == "task":
+        return "task"
+    lowered = str(user_text or "").lower()
+    replied_text = str((reply_context or {}).get("text") or "").lower()
+    continuation_request = bool(re.search(
+        r"\b(?:continue|proceed|go\s+ahead|try\s+again|do\s+it|open\s+that|check\s+that|use\s+that|next)\b",
+        lowered,
+    ))
+    replied_operation = bool(re.search(
+        r"https?://|\b(?:browser|webpage|website|operation|watcher|extraction|screenshot|source)\b",
+        replied_text,
+    ))
+    if continuation_request and replied_operation:
+        return "task"
+    return "chat"
+
+
 def classify_message_route(user_text: str) -> str:
     """Select chat only for conversation; route supported operational requests to the agent."""
     text = str(user_text or "").strip()
@@ -2908,10 +2950,10 @@ def remember_chat_turn(
     owner_id = int(owner_user_id if owner_user_id is not None else chat_id)
     history = chat_histories.setdefault(chat_id, [])
     history.extend([
-        {"role": "user", "text": str(user_text)[:2000]},
-        {"role": "assistant", "text": str(reply_text)[:2000]},
+        {"role": "user", "text": str(user_text)[:CHAT_MEMORY_TEXT_CHARS]},
+        {"role": "assistant", "text": str(reply_text)[:CHAT_MEMORY_TEXT_CHARS]},
     ])
-    chat_histories[chat_id] = history[-8:]
+    chat_histories[chat_id] = history[-CHAT_MEMORY_TURNS:]
     metadata = {"source": "telegram", "owner_user_id": owner_id}
     record_conversation_turn(
         owner_id,
@@ -2934,6 +2976,39 @@ def remember_chat_turn(
         reply_to_message_id=reply_to_message_id,
         business_connection_id=business_connection_id,
         metadata=metadata,
+    )
+
+
+def remember_assistant_turn(
+    chat_id: int,
+    reply_text: str,
+    owner_user_id: int,
+    *,
+    assistant_message_id: int | None = None,
+    reply_to_message_id: int | None = None,
+    business_connection_id: str | None = None,
+    operation_id: str | None = None,
+    response_kind: str = "agent_result",
+) -> None:
+    """Persist a completed assistant result without duplicating the user request."""
+    owner_id = int(owner_user_id)
+    history = chat_histories.setdefault(chat_id, [])
+    history.append({"role": "assistant", "text": str(reply_text)[:CHAT_MEMORY_TEXT_CHARS]})
+    chat_histories[chat_id] = history[-CHAT_MEMORY_TURNS:]
+    record_conversation_turn(
+        owner_id,
+        chat_id,
+        "assistant",
+        reply_text,
+        telegram_message_id=assistant_message_id,
+        reply_to_message_id=reply_to_message_id,
+        business_connection_id=business_connection_id,
+        metadata={
+            "source": "telegram",
+            "owner_user_id": owner_id,
+            "response_kind": str(response_kind or "agent_result")[:40],
+            "operation_id": str(operation_id or "")[:40] or None,
+        },
     )
 
 
@@ -3529,7 +3604,7 @@ async def parse_natural_language_intent(
 def sanitize_session_name(name: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_-]', '_', name.strip())
 
-def clean_grey_response(text: str, max_length: int = 4000) -> str:
+def clean_grey_response(text: str, max_length: int | None = None) -> str:
     """Normalize provider prose without rewriting meaning or touching fenced code blocks."""
     source = str(text or "").replace("\r\n", "\n").strip()
     for _ in range(3):
@@ -3551,7 +3626,8 @@ def clean_grey_response(text: str, max_length: int = 4000) -> str:
             continue
         seen.add(key)
         blocks.append(cleaned_block)
-    return truncate_text("\n\n".join(blocks), max_length)
+    cleaned = "\n\n".join(blocks)
+    return truncate_text(cleaned, max_length) if max_length is not None else cleaned
 
 
 def truncate_text(text: str, max_length: int = 4000) -> str:
@@ -3580,9 +3656,11 @@ async def _send_delayed_thinking_feedback(source_message, state: dict[str, Any],
         logger.exception("delayed_thinking_feedback_failed")
 
 
-def telegram_safe_html(text: str, max_length: int = 4000) -> str:
+def telegram_safe_html(text: str, max_length: int | None = 4000) -> str:
     """Convert common AI Markdown into Telegram-supported HTML without leaking markup."""
-    source = truncate_text(str(text or ""), max_length)
+    source = str(text or "")
+    if max_length is not None:
+        source = truncate_text(source, max_length)
     tokens: list[str] = []
 
     def stash(value: str) -> str:
@@ -3628,30 +3706,177 @@ def telegram_safe_html(text: str, max_length: int = 4000) -> str:
 
 
 def split_telegram_message(text: str, max_length: int = 3900) -> list[str]:
-    """Split text below Telegram's message limit, preferring line boundaries."""
+    """Split text below Telegram's limit without dropping separators or characters."""
     limit = max(512, min(3900, int(max_length)))
     source = str(text or "")
+    if not source:
+        return [""]
     chunks: list[str] = []
-    current = ""
-    for line in source.splitlines(keepends=True):
-        if current and len(current) + len(line) > limit:
-            chunks.append(current.rstrip("\n"))
-            current = ""
-        if len(line) > limit:
-            if current:
-                chunks.append(current.rstrip("\n"))
-                current = ""
-            for offset in range(0, len(line), limit):
-                part = line[offset:offset + limit]
-                if len(part) == limit:
-                    chunks.append(part.rstrip("\n"))
-                else:
-                    current = part
-        else:
-            current += line
-    if current:
-        chunks.append(current.rstrip("\n"))
-    return chunks or [""]
+    start = 0
+    while start < len(source):
+        end = min(start + limit, len(source))
+        if end < len(source):
+            boundary = source.rfind("\n", start, end)
+            if boundary > start:
+                end = boundary + 1
+        chunks.append(source[start:end])
+        start = end
+    return chunks
+
+
+_VIEWER_SECRET_PATTERN = re.compile(
+    r"(?i)(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*[^\s,;]+"
+)
+_VIEWER_BEARER_PATTERN = re.compile(r"(?i)\b(?:bearer|gai_live|AIza|sk-|ghp-)[A-Za-z0-9._:/+-]{8,}")
+
+
+def _sanitize_viewer_text(text: str) -> str:
+    """Redact obvious credentials before putting text in ephemeral viewer state."""
+    value = _VIEWER_SECRET_PATTERN.sub(r"\1=[redacted]", str(text or ""))
+    return _VIEWER_BEARER_PATTERN.sub("[redacted]", value)
+
+
+def _cleanup_text_viewers() -> None:
+    now = time.monotonic()
+    for viewer_id, viewer in list(text_viewers.items()):
+        if float(viewer.get("expires_at", 0)) <= now:
+            text_viewers.pop(viewer_id, None)
+            runtime_metrics["text_viewer_expired"] += 1
+
+
+def create_text_viewer(owner_user_id: int, text: str, title: str = "GreyAI response") -> str:
+    """Create a short-lived, owner-scoped viewer for a complete redacted response."""
+    _cleanup_text_viewers()
+    while len(text_viewers) >= TEXT_VIEWER_MAX_ACTIVE:
+        text_viewers.popitem(last=False)
+    viewer_id = secrets.token_urlsafe(7).replace("=", "")
+    safe_text = _sanitize_viewer_text(str(text or ""))
+    pages = split_telegram_message(safe_text, TEXT_VIEWER_BODY_LENGTH)
+    text_viewers[viewer_id] = {
+        "owner_user_id": int(owner_user_id),
+        "pages": pages,
+        "title": _sanitize_viewer_text(str(title or "GreyAI response"))[:80],
+        "created_at": time.monotonic(),
+        "expires_at": time.monotonic() + TEXT_VIEWER_TTL_SECONDS,
+    }
+    text_viewers.move_to_end(viewer_id)
+    runtime_metrics["text_viewers_created"] += 1
+    return viewer_id
+
+
+def _text_viewer_keyboard(viewer_id: str, owner_user_id: int, page_index: int, total_pages: int) -> InlineKeyboardMarkup:
+    buttons = []
+    if page_index > 0:
+        buttons.append(InlineKeyboardButton("‹ Previous", callback_data=f"page:{viewer_id}:{page_index - 1}:{int(owner_user_id)}"))
+    if page_index < total_pages - 1:
+        buttons.append(InlineKeyboardButton("Next ›", callback_data=f"page:{viewer_id}:{page_index + 1}:{int(owner_user_id)}"))
+    return InlineKeyboardMarkup([buttons] if buttons else [])
+
+
+def _render_text_viewer_page(viewer_id: str, page_index: int) -> tuple[str, InlineKeyboardMarkup, str]:
+    viewer = text_viewers[viewer_id]
+    pages = viewer["pages"]
+    body = str(pages[page_index])
+    header = f"{viewer['title']} — page {page_index + 1}/{len(pages)}\n\n"
+    rendered_body = telegram_safe_html(body, max_length=None)
+    rendered = header + rendered_body
+    if len(rendered) <= TELEGRAM_TEXT_LIMIT:
+        return rendered, _text_viewer_keyboard(viewer_id, int(viewer["owner_user_id"]), page_index, len(pages)), "HTML"
+    # Escaping can expand pathological text. Fall back to plain text, never truncate.
+    plain = header + telegram_plain_text(body)
+    if len(plain) > TELEGRAM_TEXT_LIMIT:
+        # The page splitter normally makes this impossible; retain a hard safety net
+        # while preserving the page registry for deterministic recovery.
+        plain = plain[:TELEGRAM_TEXT_LIMIT]
+    return plain, _text_viewer_keyboard(viewer_id, int(viewer["owner_user_id"]), page_index, len(pages)), ""
+
+
+async def deliver_text_response(
+    target,
+    text: str,
+    owner_user_id: int | None = None,
+    *,
+    edit: bool = False,
+    title: str = "GreyAI response",
+    bot_chat_id: int | None = None,
+    business_connection_id: str | None = None,
+    reply_markup=None,
+):
+    """Deliver text once, or as one owner-scoped navigable viewer when it is long."""
+    safe_text = _sanitize_viewer_text(str(text or ""))
+    rendered = telegram_safe_html(safe_text, max_length=None)
+    if len(rendered) <= TELEGRAM_TEXT_LIMIT:
+        kwargs = {"parse_mode": "HTML"}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        if business_connection_id:
+            kwargs["business_connection_id"] = business_connection_id
+        if bot_chat_id is not None:
+            return await target.send_message(chat_id=bot_chat_id, text=rendered, **kwargs)
+        method = target.edit_text if edit else target.reply_text
+        return await method(rendered, **kwargs)
+
+    if owner_user_id is None:
+        # Every normal user path supplies an owner. This bounded fallback is for
+        # system broadcasts where interactive ownership is unavailable.
+        runtime_metrics["long_output_fallbacks"] += 1
+        chunks = split_telegram_message(telegram_plain_text(safe_text), TELEGRAM_TEXT_LIMIT)
+        last_message = None
+        for chunk in chunks:
+            if bot_chat_id is not None:
+                last_message = await target.send_message(chat_id=bot_chat_id, text=chunk, business_connection_id=business_connection_id)
+            else:
+                method = target.edit_text if edit and last_message is None else target.reply_text
+                last_message = await method(chunk)
+        return last_message
+
+    viewer_id = create_text_viewer(int(owner_user_id), safe_text, title)
+    viewer_text, viewer_markup, parse_mode = _render_text_viewer_page(viewer_id, 0)
+    kwargs = {"reply_markup": viewer_markup}
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    if business_connection_id:
+        kwargs["business_connection_id"] = business_connection_id
+    if bot_chat_id is not None:
+        return await target.send_message(chat_id=bot_chat_id, text=viewer_text, **kwargs)
+    method = target.edit_text if edit else target.reply_text
+    return await method(viewer_text, **kwargs)
+
+
+async def text_viewer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    match = re.fullmatch(r"page:([A-Za-z0-9_-]{6,24}):(\d{1,4}):(\d{1,20})", str(query.data or ""))
+    if not match:
+        runtime_metrics["text_viewer_navigation_rejected"] += 1
+        await query.answer("That response page is no longer available.", show_alert=True)
+        return
+    viewer_id, page_raw, owner_raw = match.groups()
+    _cleanup_text_viewers()
+    viewer = text_viewers.get(viewer_id)
+    if not viewer or int(viewer.get("owner_user_id", -1)) != int(owner_raw) or int(query.from_user.id) != int(owner_raw) or not is_allowed_user(int(owner_raw)):
+        runtime_metrics["text_viewer_navigation_rejected"] += 1
+        await query.answer("This response viewer belongs to another user or has expired.", show_alert=True)
+        return
+    page_index = int(page_raw)
+    if page_index < 0 or page_index >= len(viewer["pages"]):
+        runtime_metrics["text_viewer_navigation_rejected"] += 1
+        await query.answer("That response page is no longer available.", show_alert=True)
+        return
+    page_text, markup, parse_mode = _render_text_viewer_page(viewer_id, page_index)
+    await query.answer()
+    kwargs = {"reply_markup": markup}
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    if query.message:
+        await query.message.edit_text(page_text, **kwargs)
+    elif getattr(query, "inline_message_id", None):
+        await query.edit_message_text(page_text, **kwargs)
+    else:
+        runtime_metrics["text_viewer_navigation_rejected"] += 1
+        return
+    runtime_metrics["text_viewer_navigation_success"] += 1
 
 
 def telegram_plain_text(text: str) -> str:
@@ -4032,21 +4257,23 @@ async def run_scheduled_briefing(schedule: dict[str, Any], context_bot):
 
     if not sections:
         return
+    owner_user_id = int(schedule["user_id"])
     if config["delivery_mode"] == "separate":
         for section in sections:
-            await context_bot.send_message(
-                chat_id=schedule["chat_id"],
-                text=truncate_text("☀️ *Scheduled briefing*\n\n" + section, 4000),
-                parse_mode="Markdown",
+            await deliver_text_response(
+                context_bot,
+                "☀️ Scheduled briefing\n\n" + section,
+                owner_user_id,
+                bot_chat_id=int(schedule["chat_id"]),
+                title="Scheduled briefing",
             )
     else:
-        await context_bot.send_message(
-            chat_id=schedule["chat_id"],
-            text=truncate_text(
-                "☀️ *Scheduled morning briefing*\n\n" + "\n\n".join(sections),
-                4000,
-            ),
-            parse_mode="Markdown",
+        await deliver_text_response(
+            context_bot,
+            "☀️ Scheduled morning briefing\n\n" + "\n\n".join(sections),
+            owner_user_id,
+            bot_chat_id=int(schedule["chat_id"]),
+            title="Scheduled morning briefing",
         )
 
 
@@ -4991,11 +5218,13 @@ async def watcher_loop(
                             business_connection_id=business_connection_id,
                         )
                     if res.get("extracted"):
-                        await context_bot.send_message(
-                            chat_id=chat_id,
-                            text=truncate_text("\n\n".join(res["extracted"]), 4000),
-                            parse_mode="Markdown",
+                        await deliver_text_response(
+                            context_bot,
+                            "\n\n".join(res["extracted"]),
+                            chat_id if chat_id > 0 else None,
+                            bot_chat_id=chat_id,
                             business_connection_id=business_connection_id,
+                            title=f"Watcher {watcher_id} result",
                         )
                     await notify(f"✅ Condition met. Auto-stopping watcher `{watcher_id}`.")
                     deactivate_watcher_in_db(watcher_id)
@@ -5113,7 +5342,7 @@ async def list_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not schedules:
         return await update.message.reply_text("You have no active scheduled briefings.")
     message = "*Scheduled briefings:*\n" + "\n".join(format_schedule(schedule) for schedule in schedules)
-    await update.message.reply_text(truncate_text(message, 4000), parse_mode="Markdown")
+    await deliver_text_response(update.message, message, update.effective_user.id, title="Scheduled briefings")
 
 
 @restricted
@@ -5179,7 +5408,13 @@ async def check_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode='Markdown')
 
         if res["extracted"]:
-            await context.bot.send_message(chat_id=chat_id, text=truncate_text("\n\n".join(res["extracted"]), 4000), parse_mode='Markdown')
+            await deliver_text_response(
+                context.bot,
+                "\n\n".join(res["extracted"]),
+                user_id,
+                bot_chat_id=chat_id,
+                title="Web extraction",
+            )
 
         os.remove(res["screenshot"])
         await status_msg.delete()
@@ -5704,12 +5939,12 @@ async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         metadata.update(schedule)
     state = set_maintenance_state(mode, parts[1][:1000], reason[:1000], update.effective_user.id, metadata=metadata)
     record_admin_action(update.effective_user.id, "maintenance_update", None, reason[:500], {"mode": mode})
-    await update.message.reply_text(_maintenance_message(state))
+    await deliver_text_response(update.message, _maintenance_message(state), update.effective_user.id, title="GreyAI maintenance status")
 
 
 @restricted
 async def maintenance_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(_maintenance_message())
+    await deliver_text_response(update.message, _maintenance_message(), update.effective_user.id, title="GreyAI maintenance status")
 
 
 @restricted
@@ -5720,7 +5955,7 @@ async def maintenance_log_command(update: Update, context: ContextTypes.DEFAULT_
     lines = ["GreyAI status history"]
     for row in rows:
         lines.append(f"{row['created_at']} — {row['mode'].replace('_', ' ').title()}\n{row['message'][:300]}\nReason: {row['reason'][:300]}")
-    await update.message.reply_text("\n\n".join(lines)[:3900])
+    await deliver_text_response(update.message, "\n\n".join(lines), update.effective_user.id, title="GreyAI status history")
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6173,7 +6408,12 @@ async def list_ad_campaigns_command(update: Update, context: ContextTypes.DEFAUL
     rows = list_ad_campaigns_for_admin(update.effective_user.id, 20)
     if not rows:
         return await update.message.reply_text("No advertising campaigns found.")
-    await update.message.reply_text("\n\n".join(f"{row['campaign_id']} [{row['status']}] repeats={row['repeat_count']} next={row['next_run_at'] or '-'} title={row['title'][:120]}" + (f" pause_reason={row['pause_reason'][:180]}" if row['status'] == 'paused' and row['pause_reason'] else "") for row in rows))
+    await deliver_text_response(
+        update.message,
+        "\n\n".join(f"{row['campaign_id']} [{row['status']}] repeats={row['repeat_count']} next={row['next_run_at'] or '-'} title={row['title'][:120]}" + (f" pause_reason={row['pause_reason'][:180]}" if row['status'] == 'paused' and row['pause_reason'] else "") for row in rows),
+        update.effective_user.id,
+        title="Advertising campaigns",
+    )
 
 
 @admin_only
@@ -6538,7 +6778,12 @@ async def confirm_bulk_command(update: Update, context: ContextTypes.DEFAULT_TYP
 @admin_only
 async def banned_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_users_by_status("banned", 100)
-    await update.message.reply_text("No banned users." if not rows else "\n".join(_format_user_row(row) for row in rows[:50]))
+    await deliver_text_response(
+        update.message,
+        "No banned users." if not rows else "\n".join(_format_user_row(row) for row in rows[:50]),
+        update.effective_user.id,
+        title="Banned users",
+    )
 
 
 @admin_only
@@ -6552,7 +6797,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         section("Suspicious users awaiting human review", data["suspicious_users"], "risk_score"),
         section("Most risky users", data["most_risky_users"], "risk_score"),
     ])
-    await update.message.reply_text(text[:3900])
+    await deliver_text_response(update.message, text, update.effective_user.id, title="Administrator analytics")
 
 
 @admin_only
@@ -6561,11 +6806,14 @@ async def developer_requests_command(update: Update, context: ContextTypes.DEFAU
     rows = list_developer_access_requests(status)
     if not rows:
         return await update.message.reply_text(f"No {status} developer access requests.")
-    await update.message.reply_text(
+    await deliver_text_response(
+        update.message,
         "\n\n".join(
-            f"{row['request_id']} user={row['user_id']} [{row['status']}]\n{row['message'][:500]}"
+            f"{row['request_id']} user={row['user_id']} [{row['status']}]\n{row['message']}"
             for row in rows[:30]
-        )
+        ),
+        update.effective_user.id,
+        title="Developer access requests",
     )
 
 
@@ -6692,7 +6940,12 @@ async def admin_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not query:
         return await update.message.reply_text("Usage: /admin_user <Telegram ID or username>")
     rows = search_users(query)
-    await update.message.reply_text("No matching users." if not rows else "\n".join(_format_user_row(row) for row in rows))
+    await deliver_text_response(
+        update.message,
+        "No matching users." if not rows else "\n".join(_format_user_row(row) for row in rows),
+        update.effective_user.id,
+        title="User search",
+    )
 
 
 @admin_only
@@ -6741,7 +6994,12 @@ async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reports = list_reports()
     if not reports:
         return await update.message.reply_text("No open reports.")
-    await update.message.reply_text("\n\n".join(f"{row['report_id']} from {row['reporter_user_id']} [{row['category']}]\n{row['description'][:500]}" for row in reports))
+    await deliver_text_response(
+        update.message,
+        "\n\n".join(f"{row['report_id']} from {row['reporter_user_id']} [{row['category']}]\n{row['description']}" for row in reports),
+        update.effective_user.id,
+        title="Open reports",
+    )
 
 
 @admin_only
@@ -6749,7 +7007,12 @@ async def appeals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     appeals = list_appeals()
     if not appeals:
         return await update.message.reply_text("No open appeals.")
-    await update.message.reply_text("\n\n".join(f"{row['appeal_id']} from {row['user_id']}\n{row['message'][:500]}" for row in appeals))
+    await deliver_text_response(
+        update.message,
+        "\n\n".join(f"{row['appeal_id']} from {row['user_id']}\n{row['message']}" for row in appeals),
+        update.effective_user.id,
+        title="Open appeals",
+    )
 
 
 @restricted
@@ -6837,10 +7100,10 @@ async def devevents_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 key_text = str(key)
                 safe_payload[key_text] = "[redacted]" if any(marker in key_text.lower() for marker in ("secret", "token", "password", "authorization", "api_key", "key")) else value
             payload = safe_payload
-        compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))[:700]
+        compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         lines.append(f"{row['event_id']} | {row['created_at']} | {row['event_type']}\n{compact}")
     lines.append(f"\nNext cursor: {rows[-1]['event_id']}\nUse /devevents {rows[-1]['event_id']} for the next page.")
-    await update.message.reply_text("\n\n".join(lines)[:3900])
+    await deliver_text_response(update.message, "\n\n".join(lines), update.effective_user.id, title="Developer events")
 
 
 @developer_only
@@ -7576,7 +7839,7 @@ async def _process_natural_language(
 
     contextual_reply = resolve_contextual_watcher_followup(chat_id, request_text)
     if contextual_reply:
-        sent_reply = await source_message.reply_text(telegram_safe_html(contextual_reply), parse_mode="HTML")
+        sent_reply = await deliver_text_response(source_message, contextual_reply, user_id, title="GreyAI watcher context")
         remember_chat_turn(
             chat_id,
             request_text,
@@ -7597,7 +7860,7 @@ async def _process_natural_language(
     if private_chat:
         micro_reply = private_chat_micro_reply(request_text)
         if micro_reply:
-            sent_reply = await source_message.reply_text(telegram_safe_html(micro_reply), parse_mode="HTML")
+            sent_reply = await deliver_text_response(source_message, micro_reply, user_id, title="GreyAI chat")
             remember_chat_turn(
                 chat_id,
                 request_text,
@@ -7614,10 +7877,8 @@ async def _process_natural_language(
     progress_state: dict[str, Any] = {}
     progress_task = asyncio.create_task(_send_delayed_thinking_feedback(source_message, progress_state))
     route_hint = classify_message_route(request_text)
-    chat_history: list[dict[str, str]] = []
-    if route_hint == "chat":
-        durable_history = load_chat_history(user_id, chat_id, CHAT_CONTEXT_TURNS)
-        chat_history = durable_history or chat_histories.get(chat_id, [])
+    durable_history = load_chat_history(user_id, chat_id, CHAT_CONTEXT_TURNS)
+    chat_history: list[dict[str, str]] = durable_history or chat_histories.get(chat_id, [])
     native_context = build_native_grey_context(
         user_id,
         chat_id,
@@ -7650,8 +7911,7 @@ async def _process_natural_language(
         except asyncio.CancelledError:
             pass
 
-    interpreted_task = bool(plan and plan.get("mode") not in {"chat", "unknown"})
-    route = "task" if interpreted_task or route_hint == "task" else "chat"
+    route = decide_message_route(request_text, plan, route_hint, reply_context)
     if route == "task":
         runtime_metrics["agent_handoffs"] += 1
     if route == "chat":
@@ -7666,10 +7926,9 @@ async def _process_natural_language(
             )
         progress_message = progress_state.get("message")
         if progress_message:
-            await progress_message.edit_text(telegram_safe_html(reply), parse_mode="HTML")
-            sent_reply = progress_message
+            sent_reply = await deliver_text_response(progress_message, reply, user_id, edit=True, title="GreyAI chat")
         else:
-            sent_reply = await source_message.reply_text(telegram_safe_html(reply), parse_mode="HTML")
+            sent_reply = await deliver_text_response(source_message, reply, user_id, title="GreyAI chat")
         remember_chat_turn(
             chat_id,
             request_text,
@@ -7875,15 +8134,15 @@ async def _process_natural_language(
         mode = plan["mode"]
         if mode == "admin_search_user":
             rows = search_users(plan["query"])
-            await status_msg.edit_text("No matching users." if not rows else "\n".join(_format_user_row(row) for row in rows))
+            await deliver_text_response(status_msg, "No matching users." if not rows else "\n".join(_format_user_row(row) for row in rows), user_id, edit=True, title="User search")
             return
         if mode == "admin_reports":
             rows = list_reports()
-            await status_msg.edit_text("No open reports." if not rows else "\n\n".join(f"{row['report_id']} from {row['reporter_user_id']} [{row['category']}]\n{row['description'][:500]}" for row in rows))
+            await deliver_text_response(status_msg, "No open reports." if not rows else "\n\n".join(f"{row['report_id']} from {row['reporter_user_id']} [{row['category']}]\n{row['description']}" for row in rows), user_id, edit=True, title="Open reports")
             return
         if mode == "admin_appeals":
             rows = list_appeals()
-            await status_msg.edit_text("No open appeals." if not rows else "\n\n".join(f"{row['appeal_id']} from {row['user_id']}\n{row['message'][:500]}" for row in rows))
+            await deliver_text_response(status_msg, "No open appeals." if not rows else "\n\n".join(f"{row['appeal_id']} from {row['user_id']}\n{row['message']}" for row in rows), user_id, edit=True, title="Open appeals")
             return
         if mode == "admin_ban":
             target = get_user(plan["target_user_id"])
@@ -7938,9 +8197,12 @@ async def _process_natural_language(
                 google_custom_search_provider.search(plan["query"]),
                 timeout=GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS + 1,
             )
-            await status_msg.edit_text(
-                telegram_safe_html(format_google_search_results(plan["query"], results)),
-                parse_mode="HTML",
+            await deliver_text_response(
+                status_msg,
+                format_google_search_results(plan["query"], results),
+                user_id,
+                edit=True,
+                title="Search results",
             )
             update_operation(operation_id, "succeeded")
             log_audit(user_id, "custom_search", None, "SUCCESS")
@@ -7968,7 +8230,7 @@ async def _process_natural_language(
             log_audit(user_id, "natural_language", None, "UNINTERPRETED_TASK")
             return
         reply = clean_grey_response(await generate_chat_reply(chat_id, request_text, private_chat=private_chat, owner_user_id=user_id, reply_context=reply_context))
-        await status_msg.edit_text(telegram_safe_html(reply), parse_mode="HTML")
+        await deliver_text_response(status_msg, reply, user_id, edit=True, title="GreyAI chat")
         remember_chat_turn(
             chat_id,
             request_text,
@@ -8097,9 +8359,32 @@ async def _process_natural_language(
             photo = await _input_file_from_path(result["screenshot"])
             await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
             if result["extracted"]:
-                await source_message.reply_text(
-                    telegram_safe_html("\n\n".join(result["extracted"]), 4000),
-                    parse_mode="HTML",
+                extracted_text = "\n\n".join(result["extracted"])
+                extracted_message = await deliver_text_response(
+                    source_message,
+                    extracted_text,
+                    user_id,
+                    title="Login extraction",
+                )
+                remember_assistant_turn(
+                    chat_id,
+                    extracted_text,
+                    user_id,
+                    assistant_message_id=getattr(extracted_message, "message_id", None),
+                    reply_to_message_id=reply_to_message_id,
+                    business_connection_id=business_connection_id,
+                    operation_id=operation_id,
+                    response_kind="login_extraction",
+                )
+            else:
+                remember_assistant_turn(
+                    chat_id,
+                    f"Login flow completed for {plan['url']} with no extracted text.",
+                    user_id,
+                    reply_to_message_id=reply_to_message_id,
+                    business_connection_id=business_connection_id,
+                    operation_id=operation_id,
+                    response_kind="login_receipt",
                 )
             os.remove(result["screenshot"])
             await status_msg.delete()
@@ -8162,15 +8447,40 @@ async def _process_natural_language(
                 f"📄 **Title:** {result.get('title')}\n🔗 **Requested path:** {plan['url']}\n🔎 **Source used:** {source_url}",
                 1024,
             )
-            if result.get("extracted"):
-                await source_message.reply_text(
-                    telegram_safe_html("\n\n".join(result["extracted"]), 4000),
-                    parse_mode="HTML",
+            extracted_message = None
+            extracted_text = "\n\n".join(result.get("extracted") or [])
+            if extracted_text:
+                extracted_message = await deliver_text_response(
+                    source_message,
+                    extracted_text,
+                    user_id,
+                    title="Web extraction",
                 )
             if plan.get("screenshot_requested") or not result.get("extracted"):
                 photo = await _input_file_from_path(result["screenshot"])
                 await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
             screenshot_path = result.get("screenshot")
+            if extracted_text:
+                remember_assistant_turn(
+                    chat_id,
+                    extracted_text,
+                    user_id,
+                    assistant_message_id=getattr(extracted_message, "message_id", None),
+                    reply_to_message_id=reply_to_message_id,
+                    business_connection_id=business_connection_id,
+                    operation_id=operation_id,
+                    response_kind="web_extraction",
+                )
+            else:
+                remember_assistant_turn(
+                    chat_id,
+                    f"Web check completed for {source_url}; no extracted text was returned.",
+                    user_id,
+                    reply_to_message_id=reply_to_message_id,
+                    business_connection_id=business_connection_id,
+                    operation_id=operation_id,
+                    response_kind="web_check_receipt",
+                )
             if screenshot_path and os.path.exists(screenshot_path):
                 os.remove(screenshot_path)
             await status_msg.delete()
@@ -8256,7 +8566,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     try:
         reply = await asyncio.wait_for(generate_chat_reply(user.id, query), timeout=INLINE_TIMEOUT_SECONDS)
-        text = truncate_text(f"GreyAI: {reply}", 4000)
+        text = f"GreyAI: {reply}"
     except asyncio.TimeoutError:
         text = "GreyAI is taking longer than Telegram's inline response window. Open the private bot chat for a full answer."
     except TextProviderUnavailable:
@@ -8264,11 +8574,19 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         logger.exception("inline_query_failed user_id=%s", user.id)
         text = "GreyAI could not answer this inline request right now. Please try again shortly."
+    viewer_markup = None
+    rendered_text = telegram_safe_html(text, max_length=None)
+    if len(rendered_text) > TELEGRAM_TEXT_LIMIT:
+        viewer_id = create_text_viewer(user.id, text, title="GreyAI inline answer")
+        rendered_text, viewer_markup, viewer_parse_mode = _render_text_viewer_page(viewer_id, 0)
+    else:
+        viewer_parse_mode = "HTML"
     result = InlineQueryResultArticle(
         id=uuid.uuid4().hex,
         title="GreyAI answer",
         description=truncate_text(text.replace("\n", " "), 180),
-        input_message_content=InputTextMessageContent(telegram_safe_html(text), parse_mode="HTML"),
+        input_message_content=InputTextMessageContent(rendered_text, parse_mode=viewer_parse_mode or None),
+        reply_markup=viewer_markup,
     )
     await update.inline_query.answer([result], cache_time=5, is_personal=True)
     log_audit(user.id, "inline_query", None, "ANSWERED")
@@ -8590,7 +8908,7 @@ async def list_watchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if row.get("last_error"):
             lines.append(f"  Last error: `{row['last_error']}`")
-    await update.message.reply_markdown("\n".join(lines)[:3900])
+    await deliver_text_response(update.message, "\n".join(lines), update.effective_user.id, title="Active watchers")
 
 @restricted
 async def stop_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8612,7 +8930,7 @@ async def list_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     sessions = list_user_sessions(user_id)
     if not sessions: return await update.message.reply_text("No encrypted sessions found.")
-    await update.message.reply_markdown("*Saved Encrypted Sessions:*\n" + "\n".join(f"• `{s}`" for s in sessions))
+    await deliver_text_response(update.message, "*Saved Encrypted Sessions:*\n" + "\n".join(f"• `{s}`" for s in sessions), user_id, title="Saved encrypted sessions")
 
 @restricted
 async def delete_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8975,7 +9293,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_health_report(), parse_mode="Markdown")
+    await deliver_text_response(update.message, build_health_report(), update.effective_user.id, title="GreyAI health")
 
 
 def main():
@@ -8990,6 +9308,7 @@ def main():
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(settings:|session:delete:)"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(text_viewer_callback, pattern=r"^page:[A-Za-z0-9_-]{6,24}:\d{1,4}:\d{1,20}$"))
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("enablegreyai", enable_group_command))
     app.add_handler(CommandHandler("disablegreyai", disable_group_command))
