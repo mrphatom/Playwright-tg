@@ -1738,6 +1738,46 @@ def attach_payment_charge(order_id: str, charge_id: str) -> bool:
         return True
 
 
+def grant_plan_entitlement(user_id: int, plan: str, duration_days: int = 30) -> dict[str, Any]:
+    if plan not in {"pro", "max"}:
+        raise ValueError("invalid entitlement plan")
+    if not isinstance(duration_days, int) or not 1 <= duration_days <= 365:
+        raise ValueError("duration_days must be between 1 and 365")
+    ensure_user(int(user_id))
+    quota_limit = int(os.getenv("PRO_PLAN_QUOTA", "1000")) if plan == "pro" else int(os.getenv("MAX_PLAN_QUOTA", "5000"))
+    now_dt = datetime.now(timezone.utc).replace(microsecond=0)
+    expires_at = (now_dt + timedelta(days=duration_days)).isoformat()
+    source_order_id = "admin_grant_" + secrets.token_urlsafe(10)
+    now = now_dt.isoformat()
+    with _connect() as connection:
+        connection.execute(
+            "INSERT INTO entitlements (user_id, plan, expires_at, source_order_id, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET plan = excluded.plan, expires_at = excluded.expires_at, source_order_id = excluded.source_order_id, updated_at = excluded.updated_at",
+            (int(user_id), plan, expires_at, source_order_id, now),
+        )
+        connection.execute(
+            "UPDATE users SET plan = ?, quota_limit = ?, updated_at = ? WHERE telegram_user_id = ?",
+            (plan, quota_limit, now, int(user_id)),
+        )
+        row = connection.execute(
+            "SELECT telegram_user_id, plan, quota_limit, quota_used, status FROM users WHERE telegram_user_id = ?",
+            (int(user_id),),
+        ).fetchone()
+        connection.commit()
+    if row is None:
+        raise RuntimeError("plan grant target disappeared")
+    return {
+        "user_id": int(row["telegram_user_id"]),
+        "plan": str(row["plan"]),
+        "quota_limit": int(row["quota_limit"]),
+        "quota_used": int(row["quota_used"]),
+        "status": str(row["status"]),
+        "expires_at": expires_at,
+        "duration_days": duration_days,
+        "source_order_id": source_order_id,
+    }
+
+
 def mark_payment_success(order_id: str, plan: str, expires_at: str | None = None) -> bool:
     if plan not in {"pro", "max"}:
         raise ValueError("invalid entitlement plan")

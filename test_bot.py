@@ -156,6 +156,68 @@ def test_stars_command_denies_non_admin_without_calling_telegram(monkeypatch):
     assert message.replies == ["⛔ Administrator permission is required for this action."]
 
 
+def test_grant_plan_command_allows_admin_self_grant_and_notifies(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append((text, kwargs))
+
+    class FakeTelegramBot:
+        def __init__(self):
+            self.notifications = []
+
+        async def send_message(self, **kwargs):
+            self.notifications.append(kwargs)
+
+    admin_id = 6411860985
+    message = FakeMessage()
+    telegram_bot = FakeTelegramBot()
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=admin_id), message=message)
+    context = SimpleNamespace(args=[str(admin_id), "max"], bot=telegram_bot)
+    monkeypatch.setattr(bot, "ensure_user", lambda user_id, *args, **kwargs: {"status": "active", "role": "admin" if user_id == admin_id else "user"})
+    monkeypatch.setattr(bot, "is_admin", lambda user_id: user_id == admin_id)
+    monkeypatch.setattr(
+        bot,
+        "grant_plan_entitlement",
+        lambda user_id, plan: {"duration_days": 30, "expires_at": "2026-09-21T00:00:00+00:00", "quota_limit": 5000},
+    )
+    monkeypatch.setattr(bot, "record_admin_action", lambda *args, **kwargs: "adm_test")
+
+    asyncio.run(bot.grant_plan_command(update, context))
+
+    assert "MAX plan granted" in message.replies[0][0]
+    assert telegram_bot.notifications[0]["chat_id"] == admin_id
+    assert "MAX plan" in telegram_bot.notifications[0]["text"]
+
+
+def test_grant_plan_command_denies_non_admin_and_rejects_invalid_plan(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    message = FakeMessage()
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=99), message=message)
+    context = SimpleNamespace(args=["42", "max"], bot=SimpleNamespace())
+    monkeypatch.setattr(bot, "ensure_user", lambda *args, **kwargs: {"status": "active", "role": "user"})
+    monkeypatch.setattr(bot, "is_admin", lambda _user_id: False)
+    asyncio.run(bot.grant_plan_command(update, context))
+    assert message.replies == ["⛔ Administrator permission is required for this action."]
+
+    monkeypatch.setattr(bot, "is_admin", lambda _user_id: True)
+    context.args = ["42", "free"]
+    asyncio.run(bot.grant_plan_command(update, context))
+    assert "Usage: /grantplan" in message.replies[-1]
+
+
 def test_subscription_purchase_alerts_are_idempotent_per_admin(monkeypatch):
     import bot
 

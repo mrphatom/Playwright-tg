@@ -224,6 +224,35 @@ def test_payment_order_is_idempotent_and_grants_entitlement(platform_db, monkeyp
     assert cp.get_user(42)["quota_limit"] == 5000
 
 
+def test_manual_plan_grant_updates_entitlement_and_user_quota(platform_db, monkeypatch):
+    monkeypatch.setenv("PRO_PLAN_QUOTA", "1000")
+    monkeypatch.setenv("MAX_PLAN_QUOTA", "5000")
+    cp.ensure_user(42)
+
+    pro_grant = cp.grant_plan_entitlement(42, "pro")
+    assert pro_grant["plan"] == "pro"
+    assert pro_grant["quota_limit"] == 1000
+    assert pro_grant["duration_days"] == 30
+    assert pro_grant["source_order_id"].startswith("admin_grant_")
+    assert cp.get_user(42)["plan"] == "pro"
+
+    with sqlite3.connect(platform_db) as connection:
+        entitlement = connection.execute(
+            "SELECT plan, expires_at, source_order_id FROM entitlements WHERE user_id = ?",
+            (42,),
+        ).fetchone()
+    assert entitlement[0] == "pro"
+    assert entitlement[1].endswith("+00:00")
+    assert entitlement[2] == pro_grant["source_order_id"]
+
+    max_grant = cp.grant_plan_entitlement(42, "max")
+    assert max_grant["plan"] == "max"
+    assert max_grant["quota_limit"] == 5000
+    assert cp.get_user(42)["plan"] == "max"
+    with pytest.raises(ValueError):
+        cp.grant_plan_entitlement(42, "free")
+
+
 def test_legacy_users_table_migrates_to_include_developer_role(tmp_path, monkeypatch):
     path = tmp_path / "legacy.db"
     monkeypatch.setenv("DB_PATH", str(path))

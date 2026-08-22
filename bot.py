@@ -100,6 +100,7 @@ from control_plane import (
     get_queue_stats,
     get_referral_stats,
     get_user,
+    grant_plan_entitlement,
     init_platform_db,
     is_admin,
     is_allowed_user,
@@ -239,6 +240,7 @@ GREY_COMMAND_CATALOG = (
     ("deletesession", "delete an encrypted session"),
     ("dashboard", "open the secure operations dashboard"),
     ("upgrade", "view Pro and Max plan benefits"),
+    ("grantplan", "grant Pro or Max access to a user (admin)"),
     ("referral", "create a referral link"),
     ("report", "open a support or safety report"),
     ("appeal", "open an account review appeal"),
@@ -522,6 +524,7 @@ async def configure_bot_profile(bot) -> None:
         BotCommand("deletesession", "Delete an encrypted browser session"),
         BotCommand("dashboard", "Open the secure operations dashboard"),
         BotCommand("upgrade", "View Pro and Max Telegram Stars plans"),
+        BotCommand("grantplan", "Grant Pro or Max access to a user (admin)"),
         BotCommand("stars", "View the bot Telegram Stars balance and revenue"),
         BotCommand("withdrawstars", "Open the owner-side Telegram Stars withdrawal flow"),
         BotCommand("adcreate", "Preview an administrator advertising campaign"),
@@ -6223,6 +6226,36 @@ async def deny_developer_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 @admin_only
+async def grant_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1].lower() not in {"pro", "max"}:
+        return await update.message.reply_text("Usage: /grantplan <Telegram ID> <pro|max>\nExample: /grantplan 123456789 max")
+    target_id = int(context.args[0])
+    plan = context.args[1].lower()
+    target = ensure_user(target_id)
+    if target["status"] == "banned":
+        return await update.message.reply_text("Banned users must be unbanned before receiving a paid plan.")
+    grant = grant_plan_entitlement(target_id, plan)
+    action_id = record_admin_action(
+        update.effective_user.id,
+        "grant_plan",
+        target_id,
+        f"{plan} plan granted by administrator",
+        {"plan": plan, "expires_at": grant["expires_at"], "duration_days": grant["duration_days"], "source": "admin_grant"},
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"✅ An administrator granted you the GreyAI {plan.upper()} plan for {grant['duration_days']} days. It expires at {grant['expires_at']} UTC.",
+        )
+    except TelegramError:
+        logger.warning("plan_grant_notification_failed target_id=%s", target_id)
+    await update.message.reply_text(
+        f"✅ {plan.upper()} plan granted to {target_id} for {grant['duration_days']} days. "
+        f"Quota: {grant['quota_limit']} units. Expires: {grant['expires_at']} UTC. Admin action: {action_id}"
+    )
+
+
+@admin_only
 async def grant_developer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or not context.args[0].isdigit():
         return await update.message.reply_text("Usage: /grantdeveloper <Telegram ID>")
@@ -8225,6 +8258,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/maintenance &lt;mode&gt; | &lt;public message&gt; | &lt;reason&gt; — publish status/update and maintenance reason\n"
         "/status, /maintenance_log — view current status and timestamped status history\n"
         "/analytics — top users, top referrers, suspicious queue, and most risky accounts\n"
+        "/grantplan &lt;Telegram ID&gt; &lt;pro|max&gt; — manually grant a 30-day Pro or Max plan, including to yourself; /upgrade remains the self-service Stars checkout\n"
         "/stars or /starsbalance — view the bot’s current Telegram Stars balance and recent revenue summary\n"
         "/withdrawstars — open the owner-side Telegram/Fragment withdrawal handoff\n"
         "/adcreate <chat_id|@username,...> | <title> | <copy or ai: brief> | <repeat/timing options> — preview an ad campaign\n"
@@ -8317,6 +8351,7 @@ def main():
     app.add_handler(CommandHandler("devrequest", devrequest_command))
     app.add_handler(CommandHandler("devrequests", developer_requests_command))
     app.add_handler(CommandHandler("grantdeveloper", grant_developer_command))
+    app.add_handler(CommandHandler("grantplan", grant_plan_command))
     app.add_handler(CommandHandler("denydeveloper", deny_developer_command))
     app.add_handler(CommandHandler("revokedeveloper", revoke_developer_command))
     app.add_handler(CommandHandler("devkeys", devkeys_command))
