@@ -8799,7 +8799,21 @@ def build_help_sections(user_id: int | None = None) -> list[tuple[str, str]]:
     admin_view = bool(user_id is not None and is_admin(int(user_id)))
     developer_view = bool(user_id is not None and is_developer(int(user_id)))
     plan = str(user["plan"] if user is not None else "free").lower()
-    access_label = "Administrator" if admin_view else ("Developer" if developer_view else plan.title())
+    access_label = "Administrator" if admin_view else (f"Developer + {plan.title()}" if developer_view else plan.title())
+    download_allowed = bool(user_id is not None and download_policy_for_user(int(user_id)).get("allowed"))
+
+    web_lines = [
+        "/check <url> | actions — Run a secure browser workflow",
+        "/watch <interval> <url> | condition — Monitor a page",
+        "Natural language also works for browsing, current-fact verification, summaries, and permitted web retrieval.",
+    ]
+    if download_allowed:
+        web_lines.extend((
+            "/fetch <url or request> — Fetch an authorized page or retrieve a permitted artifact",
+            "File delivery is enabled for your effective entitlement. Grey sends progress and an ETA, validates artifacts, and deletes temporary copies.",
+        ))
+    else:
+        web_lines.append("File delivery is not available on this effective entitlement; use /upgrade to compare eligible plans.")
 
     sections: list[tuple[str, str]] = [
         ("GreyAI overview", "\n".join((
@@ -8807,13 +8821,9 @@ def build_help_sections(user_id: int | None = None) -> list[tuple[str, str]]:
             "Send an ordinary message for fast chat. Send a voice note or screenshot for transcription and visual identification. Browser-like wording, named websites, schedules, watchers, and management requests enter Agent mode.",
             "Credentialed login flows require explicit approval in your request and remain subject to the site’s normal security checks. GreyAI will not bypass CAPTCHAs, anti-bot challenges, automated-traffic controls, or access restrictions.",
         ))),
-        ("Web agent and files", "\n".join((
-            "/check <url> | actions — Run a secure browser workflow",
-            "/fetch <url or request> — Fetch an authorized page or retrieve a permitted artifact",
-            "/watch <interval> <url> | condition — Monitor a page",
-            "Natural language also works for browsing, current-fact verification, summaries, and permitted file retrieval. Grey sends progress and an ETA, validates artifacts, and deletes temporary copies.",
-            "File access is controlled by account entitlement and safety validation. GreyAI will not bypass DRM, paywalls, CAPTCHAs, malware defenses, or platform blocks.",
-        ))),
+        ("Web agent and files", "\n".join(web_lines + [
+            "GreyAI will not bypass DRM, paywalls, CAPTCHAs, malware defenses, or platform blocks.",
+        ])),
         ("Monitors and schedules", "\n".join((
             "/watchers — List monitors",
             "/stopwatch <watcher_id> — Stop a monitor",

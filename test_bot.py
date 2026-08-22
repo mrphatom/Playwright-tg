@@ -4428,7 +4428,7 @@ def test_help_sections_retain_sensitive_content_for_admins(monkeypatch):
 
     monkeypatch.setattr(bot, "is_admin", lambda _user_id: True)
     monkeypatch.setattr(bot, "is_developer", lambda _user_id: True)
-    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"plan": "max"})
+    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"plan": "max", "role": "admin", "status": "active"})
 
     text = "\n".join(bot.build_help_pages(6411860985))
     assert "/grantplan <Telegram ID> <pro|max>" in text
@@ -4767,9 +4767,16 @@ def test_help_role_views_keep_client_sections_short_and_filter_admin_controls(mo
 
     monkeypatch.setattr(bot, "is_admin", lambda _user_id: False)
     monkeypatch.setattr(bot, "is_developer", lambda user_id: user_id == 77)
+    monkeypatch.setattr(bot, "DOWNLOADS_ENABLED", True)
+    monkeypatch.setattr(bot, "DOWNLOAD_FREE_ENABLED", False)
+
+    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"plan": "free", "role": "user", "status": "active"})
+    free_text = "\n".join(bot.build_help_pages(41))
+    assert "/fetch <url or request>" not in free_text
+    assert "File delivery is not available" in free_text
 
     for user_id, plan in ((42, "pro"), (43, "max")):
-        monkeypatch.setattr(bot, "get_user", lambda _user_id, plan=plan: {"plan": plan})
+        monkeypatch.setattr(bot, "get_user", lambda _user_id, plan=plan: {"plan": plan, "role": "user", "status": "active"})
         pages = bot.build_help_pages(user_id)
         text = "\n".join(pages)
         assert len(pages) >= 6
@@ -4779,7 +4786,7 @@ def test_help_role_views_keep_client_sections_short_and_filter_admin_controls(mo
         assert "/allowdomain" not in text
         assert "/devrequest <reason>" in text
 
-    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"plan": "max"})
+    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"plan": "max", "role": "developer", "status": "active"})
     developer_text = "\n".join(bot.build_help_pages(77))
     assert "/newkey <name> check" in developer_text
     assert "Authorization: Bearer <key>" in developer_text
