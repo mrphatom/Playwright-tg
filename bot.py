@@ -3627,6 +3627,39 @@ def telegram_safe_html(text: str, max_length: int = 4000) -> str:
     return rendered
 
 
+def split_telegram_message(text: str, max_length: int = 3900) -> list[str]:
+    """Split text below Telegram's message limit, preferring line boundaries."""
+    limit = max(512, min(3900, int(max_length)))
+    source = str(text or "")
+    chunks: list[str] = []
+    current = ""
+    for line in source.splitlines(keepends=True):
+        if current and len(current) + len(line) > limit:
+            chunks.append(current.rstrip("\n"))
+            current = ""
+        if len(line) > limit:
+            if current:
+                chunks.append(current.rstrip("\n"))
+                current = ""
+            for offset in range(0, len(line), limit):
+                part = line[offset:offset + limit]
+                if len(part) == limit:
+                    chunks.append(part.rstrip("\n"))
+                else:
+                    current = part
+        else:
+            current += line
+    if current:
+        chunks.append(current.rstrip("\n"))
+    return chunks or [""]
+
+
+def telegram_plain_text(text: str) -> str:
+    """Remove GreyAI's known HTML tags and decode entities for a final safe fallback."""
+    without_tags = re.sub(r"</?(?:b|code|i|s)(?:\s[^>]*)?>", "", str(text or ""), flags=re.IGNORECASE)
+    return html_unescape(without_tags)
+
+
 def mask_sensitive_action(action: str) -> str:
     if action.startswith(("type:", "type_username:", "type_password:")):
         parts = action.split("=", 1) if action.startswith("type:") else action.split(":", 1)
@@ -8739,7 +8772,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    help_text = (
         "<b>GreyAI command guide</b>\n\n"
         "<b>Conversation and multimodal input</b>\n"
         "Send an ordinary message for fast chat. Send a voice note or screenshot for transcription and visual identification. Browser-like wording, named websites, schedules, watchers, and management requests enter agent mode.\n"
@@ -8802,8 +8835,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n"
         "/allowdomain &lt;domain|*.domain&gt;, /disallowdomain &lt;pattern&gt;, /resetdomain &lt;pattern&gt;, /domains\n\n"
         "Never send an API secret again after copying it. If a key is exposed, revoke it immediately with /revokekey.",
-        parse_mode="HTML",
     )
+    plain_help = telegram_plain_text(help_text)
+    for chunk in split_telegram_message(plain_help):
+        await update.message.reply_text(chunk)
 
 
 @restricted

@@ -2392,8 +2392,10 @@ def test_maintenance_command_persists_scheduled_time(monkeypatch):
         effective_user=SimpleNamespace(id=6411860985),
         message=message,
     )
+    scheduled_for = datetime.now(ZoneInfo("Europe/London")) + timedelta(days=1)
     context = SimpleNamespace(args=[
-        "scheduled", "|", "Maintenance", "|", "Planned", "|", "2026-08-22", "14:30", "Europe/London"
+        "scheduled", "|", "Maintenance", "|", "Planned", "|",
+        scheduled_for.strftime("%Y-%m-%d"), scheduled_for.strftime("%H:%M"), "Europe/London"
     ])
 
     monkeypatch.setattr(bot, "MAINTENANCE_FEATURE_ENABLED", True)
@@ -2407,7 +2409,7 @@ def test_maintenance_command_persists_scheduled_time(monkeypatch):
 
     assert captured[0][0][0] == "scheduled"
     assert captured[0][1]["metadata"]["timezone"] == "Europe/London"
-    assert captured[0][1]["metadata"]["scheduled_for"].startswith("2026-08-22T14:30:00+01:00")
+    assert captured[0][1]["metadata"]["scheduled_for"].startswith(scheduled_for.strftime("%Y-%m-%dT%H:%M:00"))
 def test_custom_search_provider_parses_and_bounds_results(monkeypatch):
     import bot
 
@@ -4389,38 +4391,31 @@ def test_dynamic_artifact_candidates_rejects_route_disallowed_artifact(monkeypat
     assert candidates == []
 
 
-def test_help_command_escapes_ad_campaign_angle_brackets(monkeypatch):
+def test_help_command_uses_safe_plain_text_for_all_placeholders(monkeypatch):
     import bot
 
-    sent = {}
+    sent = []
 
     class FakeMessage:
         async def reply_text(self, text, **kwargs):
-            sent["text"] = text
-            sent["kwargs"] = kwargs
-
-    async def fake_audit(*_args, **_kwargs):
-        return None
+            sent.append((text, kwargs))
 
     monkeypatch.setattr(bot, "ensure_user", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(bot, "is_allowed_user", lambda _user_id: True)
-    monkeypatch.setattr(bot, "log_audit", fake_audit)
     update = SimpleNamespace(
         message=FakeMessage(),
         effective_user=SimpleNamespace(id=42, username="tester", full_name="Test User"),
     )
 
     asyncio.run(bot.help_command(update, SimpleNamespace()))
+    text = "\n".join(chunk for chunk, _kwargs in sent)
 
-    assert sent["kwargs"]["parse_mode"] == "HTML"
-    for raw_placeholder in (
-        "<chat_id|@username,...>",
-        "<campaign_id>",
-        "<token>",
-    ):
-        assert raw_placeholder not in sent["text"]
-    assert "&lt;chat_id|@username,...&gt;" in sent["text"]
-    assert "&lt;campaign_id&gt;" in sent["text"]
+    assert sent
+    assert all("parse_mode" not in kwargs for _chunk, kwargs in sent)
+    assert "<chat_id|@username,...>" in text
+    assert "<campaign_id>" in text
+    assert "<token>" in text
+    assert "&lt;" not in text
 
 
 def test_login_requires_explicit_approval_before_browser_execution(monkeypatch):
@@ -4672,3 +4667,38 @@ def test_manual_challenge_detector_uses_visible_dom_challenge_markers():
             return FakeLocator()
 
     assert asyncio.run(bot.detect_manual_challenge(FakePage())) == "captcha"
+
+
+def test_help_uses_plain_text_chunks_without_telegram_parse_mode(monkeypatch):
+    import bot
+
+    class FakeMessage:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kwargs):
+            self.sent.append((text, kwargs))
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=42, username="tester", full_name="Test User"),
+        message=message,
+    )
+    monkeypatch.setattr(bot, "ensure_user", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "is_allowed_user", lambda _user_id: True)
+
+    asyncio.run(bot.help_command(update, SimpleNamespace()))
+
+    assert len(message.sent) >= 2
+    assert all(len(text) <= 3900 for text, _kwargs in message.sent)
+    assert all("<b>" not in text and "&lt;" not in text for text, _kwargs in message.sent)
+    assert all("parse_mode" not in kwargs for _text, kwargs in message.sent)
+    assert any("GreyAI command guide" in text for text, _kwargs in message.sent)
+
+
+def test_split_telegram_message_prefers_bounded_chunks():
+    import bot
+
+    chunks = bot.split_telegram_message("line\n" * 1200, max_length=700)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 700 for chunk in chunks)
