@@ -4273,6 +4273,7 @@ async def run_browser_task_with_retry(url: str, actions: list[str], user_id: int
     """Retry transient browser work with a bounded attempt count and correlation ID."""
     last_error = None
     for attempt in range(1, max(1, attempts) + 1):
+        browser_work = None
         try:
             update_operation(operation_id, "running", attempt)
             runtime_metrics["browser_tasks_total"] += 1
@@ -4280,12 +4281,30 @@ async def run_browser_task_with_retry(url: str, actions: list[str], user_id: int
             task_kwargs = {"screenshot_requested": True} if screenshot_requested else {}
             if native_context is not None:
                 task_kwargs["native_context"] = native_context
-            browser_work = run_browser_task(url, actions, user_id, status_msg, **task_kwargs)
-            result = await asyncio.wait_for(browser_work, timeout=COMMAND_TIMEOUT)
+            browser_work = asyncio.create_task(run_browser_task(url, actions, user_id, status_msg, **task_kwargs))
+            deadline = time.monotonic() + COMMAND_TIMEOUT
+            while True:
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(browser_work),
+                        timeout=max(0.001, deadline - time.monotonic()),
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    handoff_deadline = manual_challenge_deadline_for_operation(operation_id)
+                    if handoff_deadline is not None and handoff_deadline > time.monotonic():
+                        deadline = max(deadline, handoff_deadline + 1.0)
+                        continue
+                    browser_work.cancel()
+                    await asyncio.gather(browser_work, return_exceptions=True)
+                    raise
             update_operation(operation_id, "succeeded", attempt)
             asyncio.create_task(review_recent_activity_with_ai(user_id, operation_id))
             return result
         except asyncio.CancelledError:
+            if browser_work is not None and not browser_work.done():
+                browser_work.cancel()
+                await asyncio.gather(browser_work, return_exceptions=True)
             raise
         except ManualChallengeRequired:
             update_operation(operation_id, "paused", attempt)
@@ -4983,6 +5002,18 @@ def cleanup_manual_challenges_for_operation(operation_id: str) -> None:
             record["status"] = "cancelled"
             record["event"].set()
             manual_challenges.pop(token, None)
+
+
+def manual_challenge_deadline_for_operation(operation_id: str) -> float | None:
+    """Return the latest active handoff deadline for one operation, if any."""
+    _manual_challenge_cleanup()
+    deadlines = [
+        float(record.get("expires_at", 0))
+        for record in manual_challenges.values()
+        if str(record.get("operation_id")) == str(operation_id)
+        and str(record.get("status", "waiting")) in {"waiting", "resume_requested"}
+    ]
+    return max(deadlines) if deadlines else None
 
 
 def manual_challenge_status(token: str) -> dict[str, Any] | None:

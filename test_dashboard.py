@@ -215,6 +215,33 @@ def test_dashboard_registers_manual_challenge_handoff_routes(dashboard_db):
     assert "/challenge/{token}/cancel" in paths
 
 
+def test_challenge_page_loads_fresh_registered_handoff(dashboard_db, monkeypatch):
+    import asyncio
+    import bot
+
+    class Request(SimpleNamespace):
+        def __setitem__(self, key, value):
+            setattr(self, key, value)
+
+    token = "fresh-handoff-token"
+    bot.manual_challenges.pop(token, None)
+    bot.manual_challenges[token] = {
+        "status": "waiting",
+        "challenge_kind": "captcha",
+        "expires_at": bot.time.monotonic() + 600,
+    }
+    monkeypatch.setattr(dashboard.secrets, "token_urlsafe", lambda _size: "nonce")
+
+    try:
+        request = Request(match_info={"token": token})
+        response = asyncio.run(dashboard.challenge_page_handler(request))
+
+        assert response.status == 200
+        assert token in response.text
+    finally:
+        bot.manual_challenges.pop(token, None)
+
+
 def test_challenge_page_rejects_unknown_or_malformed_token(dashboard_db, monkeypatch):
     import asyncio
     monkeypatch.setattr(dashboard, "_challenge_token", lambda _request: "unknown")

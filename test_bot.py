@@ -1158,6 +1158,62 @@ def test_source_fallback_tries_next_provider_after_empty_extraction(monkeypatch)
     assert result["source_url"].startswith("https://coinmarketcap.com/")
 
 
+def test_cancelling_retry_wrapper_cancels_shielded_browser_task(monkeypatch):
+    import bot
+
+    cancelled = asyncio.Event()
+    started = asyncio.Event()
+
+    async def hanging_browser(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(bot, "COMMAND_TIMEOUT", 10)
+    monkeypatch.setattr(bot, "run_browser_task", hanging_browser)
+    monkeypatch.setattr(bot, "update_operation", lambda *args, **kwargs: None)
+
+    async def exercise():
+        task = asyncio.create_task(bot.run_browser_task_with_retry("https://example.com", [], 42, "cancel-operation", attempts=1))
+        await started.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0.01)
+        return cancelled.is_set()
+
+    assert asyncio.run(exercise())
+
+
+def test_active_manual_handoff_outlives_normal_browser_timeout(monkeypatch):
+    import bot
+
+    async def delayed_browser(*args, **kwargs):
+        await asyncio.sleep(0.03)
+        return {"extracted": ["challenge completed"]}
+
+    monkeypatch.setattr(bot, "COMMAND_TIMEOUT", 0.01)
+    monkeypatch.setattr(bot, "MANUAL_CHALLENGE_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(bot, "run_browser_task", delayed_browser)
+    monkeypatch.setattr(bot, "update_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "review_recent_activity_with_ai", lambda *args, **kwargs: asyncio.sleep(0))
+    bot.manual_challenges.clear()
+    bot.manual_challenges["active_handoff_test"] = {
+        "operation_id": "handoff-operation",
+        "expires_at": bot.time.monotonic() + 1,
+        "status": "waiting",
+    }
+
+    try:
+        result = asyncio.run(bot.run_browser_task_with_retry("https://example.com", [], 42, "handoff-operation", attempts=1))
+    finally:
+        bot.manual_challenges.pop("active_handoff_test", None)
+
+    assert result["extracted"] == ["challenge completed"]
+
+
 def test_queue_worker_resolves_future_after_outer_boundary_failure(monkeypatch):
     import bot
 
