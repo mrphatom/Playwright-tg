@@ -3610,6 +3610,67 @@ def test_deterministic_download_request_without_url_enters_search_first_discover
     assert "Imagine Dragons" in plan["request"]
 
 
+def test_fetch_command_is_cataloged_and_direct_file_requests_parse_as_downloads(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+    assert any(name == "fetch" for name, _description in bot.GREY_COMMAND_CATALOG)
+    plan = bot.parse_deterministic_web_request(
+        "fetch file https://archive.org/download/example/example.txt",
+        user_id=42,
+    )
+    assert plan["mode"] == "download"
+    assert plan["url"].endswith("/example.txt")
+    direct_plan = bot.parse_deterministic_web_request(
+        "fetch https://archive.org/download/example/example.txt",
+        user_id=42,
+    )
+    assert direct_plan["mode"] == "download"
+
+
+def test_primary_artifact_site_gets_site_search_and_public_fallback_candidates(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+    monkeypatch.setattr(
+        bot,
+        "public_search_source_candidates",
+        lambda query: ["https://duckduckgo.com/?q=" + bot.quote_plus(query)],
+    )
+    request = "Fetch the song The Water and the Well by Nihilore from https://freemusicarchive.org and send the file"
+    candidates = bot.source_candidates_for_request(request, "https://freemusicarchive.org", 42)
+    assert candidates[0] == "https://freemusicarchive.org"
+    assert any("freemusicarchive.org/search/" in candidate for candidate in candidates)
+    assert any("quicksearch=Nihilore" in candidate for candidate in candidates)
+    assert any("duckduckgo.com" in candidate for candidate in candidates)
+    assert "https://freemusicarchive.org" not in bot.artifact_discovery_query(request)
+
+
+def test_model_download_plan_with_site_url_gets_artifact_search_fallbacks(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+    monkeypatch.setattr(
+        bot,
+        "public_search_source_candidates",
+        lambda query: ["https://duckduckgo.com/?q=" + bot.quote_plus(query)],
+    )
+    plan = bot.normalize_natural_language_plan(
+        {
+            "mode": "download",
+            "url": "https://freemusicarchive.org",
+            "request": "Fetch The Water and the Well by Nihilore and send the file",
+            "actions": [],
+        },
+        user_id=42,
+    )
+
+    assert plan["mode"] == "download"
+    assert plan["source_candidates"][0] == "https://freemusicarchive.org"
+    assert any("freemusicarchive.org/search/" in candidate for candidate in plan["source_candidates"])
+    assert any("duckduckgo.com" in candidate for candidate in plan["source_candidates"])
+
+
 def test_model_download_plan_without_url_is_normalized_to_search_source(monkeypatch):
     import bot
 
@@ -3685,6 +3746,46 @@ def test_google_and_reddit_proxy_routing_is_disabled_for_transparent_browsing():
     assert bot.proxy_routing_allowed_for_url("https://www.google.com/search?q=bitcoin") is False
     assert bot.proxy_routing_allowed_for_url("https://www.reddit.com/r/forhire") is False
     assert bot.proxy_routing_allowed_for_url("https://archive.org/details/example") is True
+
+
+def test_resolve_direct_download_source_uses_dynamic_fallback_for_empty_html(monkeypatch):
+    import bot
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html><body><div id='app'></div></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+
+    async def dynamic_fallback(url, user_id, goal):
+        assert url.endswith("/search")
+        assert user_id == 42
+        assert "Believer" in goal
+        return "https://127.0.0.1/files/believer.mp3"
+
+    monkeypatch.setattr(bot, "_resolve_dynamic_download_source", dynamic_fallback)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        resolved = asyncio.run(bot._resolve_direct_download_source(
+            f"http://127.0.0.1:{server.server_port}/search",
+            42,
+            "Find Believer by Imagine Dragons and send the file",
+        ))
+        assert resolved.endswith("/files/believer.mp3")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_resolve_direct_download_source_accepts_single_quoted_search_result_links(monkeypatch):
@@ -3805,6 +3906,47 @@ def test_resolve_direct_download_source_accepts_embedded_track_metadata_url(monk
             42,
         ))
         assert resolved.endswith("/files/free-song.mp3")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_resolve_direct_download_source_accepts_fma_download_url_metadata(monkeypatch):
+    import bot
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            metadata = (
+                '{&quot;title&quot;:&quot;The Water and the Well&quot;,'
+                '&quot;artistName&quot;:&quot;Nihilore&quot;,'
+                '&quot;downloadUrl&quot;:&quot;http:\\/\\/127.0.0.1:'
+                + str(server.server_port)
+                + '\\/track\\/download\\/\",'
+                '&quot;playbackUrl&quot;:&quot;http:\\/\\/127.0.0.1:'
+                + str(server.server_port)
+                + '\\/track\\/stream\\/&quot;}'
+            )
+            body = f'<html><body><div data-track-info=\'{metadata}\'>The Water and the Well</div></body></html>'.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        resolved = asyncio.run(bot._resolve_direct_download_source(
+            f"http://127.0.0.1:{server.server_port}/search",
+            42,
+        ))
+        assert resolved.endswith("/track/stream/")
     finally:
         server.shutdown()
         server.server_close()

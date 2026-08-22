@@ -228,6 +228,7 @@ GREY_COMMAND_CATALOG = (
     ("disallowdomain", "deny a domain or subdomain pattern"),
     ("resetdomain", "remove a runtime domain override"),
     ("check", "run an authorized browser check"),
+    ("fetch", "fetch an authorized page or permitted artifact"),
     ("watch", "create a persistent web monitor"),
     ("watchers", "list active monitors"),
     ("stopwatch", "stop a monitor"),
@@ -2233,29 +2234,72 @@ DOWNLOAD_REQUEST_ACTION_TERMS = ("download", "get", "fetch", "retrieve", "send",
 DOWNLOAD_REQUEST_ARTIFACT_TERMS = ("file", "song", "music", "track", "movie", "film", "video", "app", "application", "archive", "zip", "pdf", "document", "installer", "book", "image", "photo")
 
 
+def is_direct_artifact_url_request(user_text: str) -> bool:
+    return bool(re.search(
+        r"https?://[^\s,]+\.(?:mp3|m4a|wav|ogg|flac|mp4|webm|mkv|mov|avi|pdf|zip|tar|gz|tgz|7z|txt|csv|json|xml|html|jpg|jpeg|png|webp|gif)(?:[?#][^\s,]*)?$",
+        str(user_text or ""),
+        flags=re.IGNORECASE,
+    ))
+
+
 def is_artifact_download_request(user_text: str) -> bool:
     text = str(user_text or "").strip().lower()
     if not text or any(marker in text for marker in ("how do i download", "how to download", "what is downloading")):
         return False
     has_action = any(re.search(r"\b" + re.escape(term) + r"\b", text) for term in DOWNLOAD_REQUEST_ACTION_TERMS)
     has_artifact = any(re.search(r"\b" + re.escape(term) + r"\b", text) for term in DOWNLOAD_REQUEST_ARTIFACT_TERMS)
+    direct_artifact_url = is_direct_artifact_url_request(text)
     title_artist_send = bool(re.search(
         r"\b(?:find|search|look\s+for)\b.+\bby\b.+\b(?:send|attach|get|fetch|retrieve)\b",
         text,
         flags=re.IGNORECASE,
     ))
-    return bool((has_action and has_artifact) or title_artist_send)
+    return bool((has_action and (has_artifact or direct_artifact_url)) or title_artist_send)
 
 
 def artifact_discovery_query(user_text: str) -> str:
-    text = re.sub(r"\s+", " ", str(user_text or "").strip())
-    text = re.sub(r"\b(?:please|can you|could you|find|search|look for|download|get|fetch|retrieve|send|attach|to me|for me|and send it)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"https?://[^\s,]+", " ", str(user_text or "").strip(), flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\b(?:please|can you|could you|find|search|look for|download|get|fetch|retrieve|send|attach|to me|for me|and send it|the file|the song|song|music|track|movie|film|video|app|application|archive|zip|pdf|document|book|image|photo|from|on)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+\band\s*$", "", text, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", text).strip(" .,!?:;-")[:240] or str(user_text or "").strip()[:240]
 
 
-def artifact_discovery_source_candidates(user_text: str, user_id: int | None = None) -> list[str]:
+def _artifact_site_search_candidate(primary_url: str, user_text: str) -> str | None:
+    parsed = urlparse(str(primary_url or "").strip())
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    query = quote_plus(artifact_discovery_query(user_text))
+    if not host or not query:
+        return None
+    if host == "freemusicarchive.org":
+        return "https://freemusicarchive.org/search/?quicksearch=" + query
+    if host == "archive.org":
+        return "https://archive.org/search?query=" + query
+    if host == "sourceforge.net":
+        return "https://sourceforge.net/directory/?q=" + query
+    if host == "pypi.org":
+        return "https://pypi.org/search/?q=" + query
+    if host == "npmjs.com":
+        return "https://www.npmjs.com/search?q=" + query
+    return None
+
+
+def artifact_discovery_source_candidates(
+    user_text: str,
+    user_id: int | None = None,
+    primary_url: str = "",
+) -> list[str]:
     query = artifact_discovery_query(user_text)
-    candidates = public_search_source_candidates(query)
+    candidates: list[str] = []
+    site_search = _artifact_site_search_candidate(primary_url, user_text)
+    if site_search:
+        candidates.append(site_search)
+    primary_host = (urlparse(str(primary_url or "")).hostname or "").lower().removeprefix("www.")
+    if primary_host == "freemusicarchive.org":
+        artist_match = re.search(r"\bby\s+(.+)$", query, flags=re.IGNORECASE)
+        if artist_match:
+            candidates.append("https://freemusicarchive.org/search/?quicksearch=" + quote_plus(artist_match.group(1).strip()))
+    candidates.extend(public_search_source_candidates(query))
     lowered = str(user_text or "").lower()
     if re.search(r"\b(?:public[- ]domain|creative commons|open(?:ly)? licensed|archive)\b", lowered):
         candidates.insert(0, "https://archive.org/search?query=" + quote_plus(query))
@@ -2295,10 +2339,10 @@ def source_candidates_for_request(user_text: str, primary_url: str = "", user_id
         crypto_sources = crypto_source_candidates(user_text)
         primary_is_google = bool(primary_url and (urlparse(primary_url).hostname or "").lower().removeprefix("www.") in {"google.com"})
         ordered = [primary_url, *crypto_sources] if primary_is_google else [*crypto_sources, primary_url]
+    elif is_artifact_download_request(user_text):
+        ordered = [primary_url, *artifact_discovery_source_candidates(user_text, user_id, primary_url)]
     elif primary_url:
         ordered = [primary_url]
-    elif is_artifact_download_request(user_text):
-        ordered = artifact_discovery_source_candidates(user_text, user_id)
     elif is_live_web_lookup_request(user_text):
         ordered = public_search_source_candidates(user_text)
     else:
@@ -2380,6 +2424,10 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
             return None
         url = discovered_sources[0]
         raw_plan = {**raw_plan, "source_candidates": list(dict.fromkeys([*discovered_sources, *(raw_plan.get("source_candidates") or [])]))[:5]}
+    if mode == "download" and url and request:
+        discovered_sources = source_candidates_for_request(request, url, user_id)
+        if discovered_sources:
+            raw_plan = {**raw_plan, "source_candidates": list(dict.fromkeys([*discovered_sources, *(raw_plan.get("source_candidates") or [])]))[:5]}
     if mode not in {"check", "watch", "download"} or not route_url_allowed(url, user_id):
         return None
 
@@ -3207,7 +3255,7 @@ def parse_deterministic_web_request(user_text: str, default_session_name: str | 
     download_mode = bool(
         not watch_mode
         and re.search(r"\b(?:download|get|fetch|retrieve|send|attach)\b", lowered)
-        and re.search(r"\b(?:file|song|music|track|movie|film|video|app|application|archive|zip|pdf|document|installer)\b", lowered)
+        and (re.search(r"\b(?:file|song|music|track|movie|film|video|app|application|archive|zip|pdf|document|installer)\b", lowered) or is_direct_artifact_url_request(text))
     )
     if download_mode:
         source_urls = source_candidates_for_request(text, url, user_id)
@@ -4496,7 +4544,7 @@ async def run_browser_task(url: str, actions: list[str], user_id: int, status_ms
         browser_context = await pool.browser.new_context(**context_opts)
         page = await browser_context.new_page()
         
-        if status_msg: await status_msg.edit_text(f"🌐 Navigating...")
+        if status_msg: await status_msg.edit_text("🌐 Navigating...")
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(2000)
 
@@ -4724,6 +4772,17 @@ async def unschedule_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE
         return await update.message.reply_text("⚠️ Schedule not found.")
     log_audit(update.effective_user.id, "/unschedule", None, f"STOPPED_SCHEDULE_{schedule_id}")
     await update.message.reply_text(f"✅ Schedule `{schedule_id}` stopped.", parse_mode="Markdown")
+
+
+@restricted
+@rate_limited
+async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    request = " ".join(context.args).strip()
+    if not request:
+        return await update.message.reply_text(
+            "Usage: /fetch <URL or request>\nExample: /fetch https://archive.org/download/example/example.txt"
+        )
+    return await _process_natural_language(update, context, request_text_override=f"fetch {request}")
 
 
 @restricted
@@ -6618,7 +6677,86 @@ async def _edit_download_progress(status_msg, text: str) -> None:
         logger.debug("download_progress_edit_failed", exc_info=True)
 
 
-async def _resolve_direct_download_source(url: str, user_id: int) -> str:
+async def _resolve_dynamic_download_source(url: str, user_id: int, goal: str = "") -> str | None:
+    """Resolve an approved JavaScript-rendered page without bypassing site controls."""
+    if not pool.browser or not pool.browser.is_connected():
+        return None
+    browser_context = None
+    page = None
+    try:
+        browser_context = await pool.browser.new_context(viewport={"width": 1280, "height": 800})
+        page = await browser_context.new_page()
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(1500)
+        rows = await page.locator("[data-track-info], a[href], [data-url], [data-download-url], [data-file-url]").evaluate_all(
+            """elements => elements.map(element => ({
+                href: element.getAttribute('href') || '',
+                dataUrl: element.getAttribute('data-url') || '',
+                dataDownloadUrl: element.getAttribute('data-download-url') || '',
+                dataFileUrl: element.getAttribute('data-file-url') || '',
+                trackInfo: element.getAttribute('data-track-info') || '',
+                text: element.innerText || element.textContent || ''
+            }))"""
+        )
+        target_tokens = {
+            token for token in re.findall(r"[a-z0-9]+", artifact_discovery_query(goal).lower())
+            if len(token) > 2
+        }
+        candidates: list[tuple[int, str]] = []
+        for row in rows:
+            metadata = {}
+            encoded_metadata = str(row.get("trackInfo") or "").strip()
+            if encoded_metadata:
+                try:
+                    metadata = json.loads(html_unescape(encoded_metadata))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    metadata = {}
+            metadata_text = f"{metadata.get('title', '')} {metadata.get('artistName', '')}".lower()
+            metadata_match_score = min(80, sum(8 for token in target_tokens if token in metadata_text))
+            for key in ("playbackUrl", "playback_url", "downloadUrl", "fileUrl", "download_url", "file_url"):
+                raw_candidate = str(metadata.get(key) or "").strip()
+                if raw_candidate:
+                    candidate = urljoin(str(page.url), html_unescape(raw_candidate))
+                    if route_url_allowed(candidate, user_id):
+                        priority = 26 if key in {"playbackUrl", "playback_url"} else 20
+                        candidates.append((priority + metadata_match_score, candidate))
+            for raw_candidate in (row.get("dataDownloadUrl"), row.get("dataFileUrl"), row.get("dataUrl"), row.get("href")):
+                candidate = urljoin(str(page.url), html_unescape(str(raw_candidate or "").strip()))
+                if not route_url_allowed(candidate, user_id):
+                    continue
+                parsed = urlparse(candidate)
+                suffix = Path(parsed.path).suffix.lower()
+                label = str(row.get("text") or "").lower()
+                score = 0
+                if suffix in DOWNLOAD_ALLOWED_EXTENSIONS:
+                    score += 10
+                if "download" in candidate.lower() or "download" in label:
+                    score += 8
+                if score and suffix not in DOWNLOAD_BLOCKED_EXTENSIONS:
+                    candidates.append((score, candidate))
+        if candidates:
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+            return candidates[0][1]
+        return None
+    except (PlaywrightTimeoutError, OSError):
+        return None
+    except Exception:
+        logger.info("dynamic_download_discovery_failed", exc_info=True)
+        return None
+    finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        if browser_context:
+            try:
+                await browser_context.close()
+            except Exception:
+                pass
+
+
+async def _resolve_direct_download_source(url: str, user_id: int, goal: str = "") -> str:
     """Resolve approved search/detail pages to a direct, allowlisted artifact link."""
     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
     current_url = str(url or "").strip()
@@ -6673,15 +6811,25 @@ async def _resolve_direct_download_source(url: str, user_id: int) -> str:
                             metadata = json.loads(html_unescape(encoded_metadata))
                         except (TypeError, ValueError, json.JSONDecodeError):
                             continue
-                        metadata_url = str(metadata.get("fileUrl") or "").replace("\\\\/", "/").strip()
+                        metadata_is_playback = bool(metadata.get("playbackUrl") or metadata.get("playback_url"))
+                        metadata_is_download = bool(metadata.get("downloadUrl") or metadata.get("download_url"))
+                        metadata_url = str(
+                            metadata.get("playbackUrl")
+                            or metadata.get("playback_url")
+                            or metadata.get("downloadUrl")
+                            or metadata.get("fileUrl")
+                            or metadata.get("download_url")
+                            or ""
+                        ).replace("\\\\/", "/").strip()
+
                         if not metadata_url:
                             continue
                         candidate = urljoin(str(response.url), html_unescape(metadata_url))
                         if not route_url_allowed(candidate, user_id):
                             continue
                         suffix = Path(urlparse(candidate).path).suffix.lower()
-                        if suffix in DOWNLOAD_ALLOWED_EXTENSIONS and suffix not in DOWNLOAD_BLOCKED_EXTENSIONS:
-                            direct_candidates.append((12, candidate))
+                        if suffix not in DOWNLOAD_BLOCKED_EXTENSIONS and (metadata_is_playback or metadata_is_download or suffix in DOWNLOAD_ALLOWED_EXTENSIONS):
+                            direct_candidates.append((18 if metadata_is_playback else 12, candidate))
                     if direct_candidates:
                         direct_candidates.sort(key=lambda item: (-item[0], item[1]))
                         return direct_candidates[0][1]
@@ -6691,7 +6839,11 @@ async def _resolve_direct_download_source(url: str, user_id: int) -> str:
                         continue
                     raise DownloadRejected("no_direct_artifact_found")
             raise DownloadRejected("discovery_hop_limit")
-    except DownloadRejected:
+    except DownloadRejected as exc:
+        if str(exc) == "no_direct_artifact_found":
+            dynamic_url = await _resolve_dynamic_download_source(url, user_id, goal)
+            if dynamic_url:
+                return dynamic_url
         raise
     except asyncio.TimeoutError:
         raise DownloadRejected("download_discovery_timeout")
@@ -6858,7 +7010,7 @@ async def _deliver_download_artifact(
             for candidate_url in candidate_urls:
                 try:
                     await _edit_download_progress(status_msg, f"🔎 Checking approved source: {urlparse(candidate_url).hostname or 'source'}…")
-                    direct_url = await _resolve_direct_download_source(candidate_url, user_id)
+                    direct_url = await _resolve_direct_download_source(candidate_url, user_id, str(plan.get("request") or ""))
                     artifact = await _stream_download_artifact(direct_url, user_id, policy, status_msg=status_msg)
                     break
                 except DownloadRejected as exc:
@@ -8035,6 +8187,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Channels: channel invocation is disabled by default and requires administrator configuration of CHANNEL_INVOCATION_ENABLED and ALLOWED_CHANNEL_IDS. Channel mode is read-only and requires a bot mention; forms, saved sessions, logins, and interactive actions are rejected.\n\n"
         "<b>Web agent</b>\n"
         "/check &lt;url&gt; | actions — Run a secure browser workflow\n"
+        "/fetch &lt;url or request&gt; — Fetch an authorized page or retrieve a permitted artifact\n"
         "/watch &lt;interval&gt; &lt;url&gt; | condition — Monitor a page\n"
         "Natural language also works: <code>watch r/forhire every 1 hour for a new web developer post</code>. Current-fact questions such as <code>Have Cristiano Ronaldo officially announced his retirement?</code> are converted into a safe Google News verification check and return extracted evidence plus an optional screenshot.\n"
         "Lawful file delivery: <code>Download this permitted file https://archive.org/download/example/example.txt and send it to me</code>. Free users are blocked; Pro is limited; Max/developer/admin access remains bounded. Grey sends progress and an ETA, validates the artifact, and deletes its temporary copy. It will not bypass DRM, paywalls, CAPTCHAs, malware defenses, or platform blocks.\n"
@@ -8219,6 +8372,7 @@ def main():
         app.add_handler(ChosenInlineResultHandler(chosen_inline_result_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CommandHandler("check", check_url))
+    app.add_handler(CommandHandler("fetch", fetch_command))
     app.add_handler(CommandHandler("watch", watch_url))
     app.add_handler(CommandHandler("schedule", schedule_briefing))
     app.add_handler(CommandHandler("schedules", list_schedules))
