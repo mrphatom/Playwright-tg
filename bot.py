@@ -6939,8 +6939,6 @@ def download_policy_for_user(user_id: int) -> dict[str, Any]:
     plan = str(user["plan"] or "free").lower()
     if role == "admin" or plan == "max":
         return {"allowed": True, "tier": "max", "max_bytes": DOWNLOAD_MAX_BYTES, "daily_limit": DOWNLOAD_MAX_JOBS_PER_DAY}
-    if role == "developer":
-        return {"allowed": True, "tier": "developer", "max_bytes": DOWNLOAD_MAX_BYTES, "daily_limit": DOWNLOAD_MAX_JOBS_PER_DAY}
     if plan == "pro":
         return {"allowed": True, "tier": "pro", "max_bytes": DOWNLOAD_PRO_MAX_BYTES, "daily_limit": DOWNLOAD_PRO_MAX_JOBS_PER_DAY}
     if DOWNLOAD_FREE_ENABLED:

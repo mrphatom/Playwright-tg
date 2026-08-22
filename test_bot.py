@@ -4791,3 +4791,23 @@ def test_help_role_views_keep_client_sections_short_and_filter_admin_controls(mo
     assert "/newkey <name> check" in developer_text
     assert "Authorization: Bearer <key>" in developer_text
     assert "/grantplan" not in developer_text
+
+
+def test_developer_download_entitlement_follows_paid_plan(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "DOWNLOADS_ENABLED", True)
+    monkeypatch.setattr(bot, "DOWNLOAD_FREE_ENABLED", False)
+
+    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"status": "active", "role": "developer", "plan": "free"})
+    assert bot.download_policy_for_user(77)["allowed"] is False
+
+    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"status": "active", "role": "developer", "plan": "pro"})
+    pro_policy = bot.download_policy_for_user(77)
+    assert pro_policy["allowed"] is True
+    assert pro_policy["tier"] == "pro"
+
+    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"status": "active", "role": "developer", "plan": "max"})
+    max_policy = bot.download_policy_for_user(77)
+    assert max_policy["allowed"] is True
+    assert max_policy["tier"] == "max"
