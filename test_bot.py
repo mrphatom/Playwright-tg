@@ -4391,7 +4391,7 @@ def test_dynamic_artifact_candidates_rejects_route_disallowed_artifact(monkeypat
     assert candidates == []
 
 
-def test_help_command_uses_safe_plain_text_for_all_placeholders(monkeypatch):
+def test_help_command_filters_sensitive_admin_content_for_clients(monkeypatch):
     import bot
 
     sent = []
@@ -4408,18 +4408,33 @@ def test_help_command_uses_safe_plain_text_for_all_placeholders(monkeypatch):
     )
 
     asyncio.run(bot.help_command(update, SimpleNamespace()))
-    pages = bot.build_help_pages()
-    text = "\n".join(pages)
+    text = "\n".join(bot.build_help_pages(42))
 
     assert len(sent) == 1
     assert "page 1/" in sent[0][0]
     assert all("parse_mode" not in kwargs for _chunk, kwargs in sent)
-    assert "<chat_id|@username,...>" in text
-    assert "<campaign_id>" in text
-    assert "<token>" in text
+    assert "<chat_id|@username,...>" not in text
+    assert "/grantplan" not in text
+    assert "/massban" not in text
+    assert "/maintenance <mode>" not in text
+    assert "/devrequest <reason>" in text
     assert "&lt;" not in text
     keyboard = sent[0][1]["reply_markup"]
     assert keyboard.inline_keyboard[0][0].callback_data == "help:42:1"
+
+
+def test_help_sections_retain_sensitive_content_for_admins(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "is_admin", lambda _user_id: True)
+    monkeypatch.setattr(bot, "is_developer", lambda _user_id: True)
+    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"plan": "max"})
+
+    text = "\n".join(bot.build_help_pages(6411860985))
+    assert "/grantplan <Telegram ID> <pro|max>" in text
+    assert "/massban" in text
+    assert "/maintenance <mode>" in text
+    assert "/allowdomain <domain|*.domain>" in text
 
 
 def test_login_requires_explicit_approval_before_browser_execution(monkeypatch):
@@ -4745,3 +4760,27 @@ def test_help_callback_is_user_scoped_and_navigates_pages(monkeypatch):
     asyncio.run(bot.help_callback(SimpleNamespace(callback_query=foreign_query), SimpleNamespace()))
     assert foreign_query.answers[0][1]["show_alert"] is True
     assert foreign_query.message.edited == []
+
+
+def test_help_role_views_keep_client_sections_short_and_filter_admin_controls(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "is_admin", lambda _user_id: False)
+    monkeypatch.setattr(bot, "is_developer", lambda user_id: user_id == 77)
+
+    for user_id, plan in ((42, "pro"), (43, "max")):
+        monkeypatch.setattr(bot, "get_user", lambda _user_id, plan=plan: {"plan": plan})
+        pages = bot.build_help_pages(user_id)
+        text = "\n".join(pages)
+        assert len(pages) >= 6
+        assert all(len(page) <= bot.HELP_PAGE_LENGTH + 100 for page in pages)
+        assert "/grantplan" not in text
+        assert "/massban" not in text
+        assert "/allowdomain" not in text
+        assert "/devrequest <reason>" in text
+
+    monkeypatch.setattr(bot, "get_user", lambda _user_id: {"plan": "max"})
+    developer_text = "\n".join(bot.build_help_pages(77))
+    assert "/newkey <name> check" in developer_text
+    assert "Authorization: Bearer <key>" in developer_text
+    assert "/grantplan" not in developer_text

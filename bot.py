@@ -8773,10 +8773,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 HELP_PAGE_LENGTH = 3300
 
 
-def build_help_pages() -> list[str]:
-    plain = telegram_plain_text(build_help_text())
-    plain = re.sub(r"^GreyAI command guide\s*\n\n", "", plain, count=1)
-    return split_telegram_message(plain, max_length=HELP_PAGE_LENGTH)
+def build_help_pages(user_id: int | None = None) -> list[str]:
+    pages: list[str] = []
+    for title, body in build_help_sections(user_id):
+        pages.extend(split_telegram_message(f"{title}\n\n{body}", max_length=HELP_PAGE_LENGTH))
+    return pages
 
 
 def help_page_keyboard(user_id: int, page_index: int, total_pages: int) -> InlineKeyboardMarkup:
@@ -8793,77 +8794,100 @@ def help_page_text(pages: list[str], page_index: int) -> str:
     return f"GreyAI command guide — page {page_index + 1}/{total_pages}\n\n{pages[page_index]}"
 
 
-def build_help_text() -> str:
-    help_text = (
-        "<b>GreyAI command guide</b>\n\n"
-        "<b>Conversation and multimodal input</b>\n"
-        "Send an ordinary message for fast chat. Send a voice note or screenshot for transcription and visual identification. Browser-like wording, named websites, schedules, watchers, and management requests enter agent mode.\n"
-        "Credentialed login flows require explicit approval in your request and remain subject to the site’s normal security checks. GreyAI will not bypass CAPTCHAs, anti-bot challenges, automated-traffic controls, or access restrictions.\n\n"
-        "<b>Use GreyAI in shared chats</b>\n"
-        "Private chat: enable inline mode with @BotFather using /setinline, then type <code>@GreyBrowserBot your question</code> in any private chat, group, or channel and choose the answer. Inline mode is for questions and read-only public-page explanations; full browser tasks stay in the private GreyAI chat.\n"
-        "Secretary Mode: in @BotFather open GreyAI → Bot Settings → Mode Settings and switch <b>Secretary Mode</b> on. Then open Telegram Settings → Chat Automation, select GreyAI, choose the chats it may access, and grant read/reply permissions. The original contact message remains visible and Grey replies separately.\n"
-        "Groups: a group administrator first uses /enablegreyai. GreyAI then responds only to @GreyBrowserBot mentions, replies to GreyAI messages, and /ask requests. Ordinary group messages are ignored. Use /disablegreyai to turn it off.\n"
-        "Channels: channel invocation is disabled by default and requires administrator configuration of CHANNEL_INVOCATION_ENABLED and ALLOWED_CHANNEL_IDS. Channel mode is read-only and requires a bot mention; forms, saved sessions, logins, and interactive actions are rejected.\n\n"
-        "<b>Web agent</b>\n"
-        "/check &lt;url&gt; | actions — Run a secure browser workflow\n"
-        "/fetch &lt;url or request&gt; — Fetch an authorized page or retrieve a permitted artifact\n"
-        "/watch &lt;interval&gt; &lt;url&gt; | condition — Monitor a page\n"
-        "Natural language also works: <code>watch r/forhire every 1 hour for a new web developer post</code>. Current-fact questions such as <code>Have Cristiano Ronaldo officially announced his retirement?</code> are converted into a safe Google News verification check and return extracted evidence plus an optional screenshot.\n"
-        "Lawful file delivery: <code>Download this permitted file https://archive.org/download/example/example.txt and send it to me</code>. Free users are blocked; Pro is limited; Max/developer/admin access remains bounded. Grey sends progress and an ETA, validates the artifact, and deletes its temporary copy. It will not bypass DRM, paywalls, CAPTCHAs, malware defenses, or platform blocks.\n"
-        "/watchers — List monitors\n"
-        "/stopwatch &lt;watcher_id&gt; — Stop a monitor\n"
-        "/schedule &lt;time&gt; &lt;url&gt; | briefing — Schedule a recurring briefing\n"
-        "/schedules — List briefings\n"
-        "/unschedule &lt;schedule_id&gt; — Cancel a briefing\n\n"
-        "<b>Encrypted sessions</b>\n"
-        "/sessions — List your saved sessions\n"
-        "/deletesession &lt;name&gt; — Delete a session\n"
-        "Use <code>save_session:name</code> and <code>load_session:name</code> inside browser workflows.\n\n"
-        "<b>Account and platform</b>\n"
-        "/settings — Open button-driven personal settings for persistent login, auto-save, handoffs, and session cleanup\n"
-        "/start — Start GreyAI and get your referral link\n"
-        "/dashboard — Open the secure operations dashboard\n"
-        "/health — View service health\n"
-        "/upgrade — Compare Pro and Max benefits, then choose a plan with buttons\n"
-        "/referral — Create your invite link\n"
-        "/report &lt;text&gt; — Send a support or safety report\n"
-        "/appeal &lt;text&gt; — Request account review\n\n"
-        "<b>Shared-chat commands</b>\n"
-        "/ask &lt;request&gt; — Ask GreyAI in a private chat or enabled group\n"
-        "/enablegreyai — Enable mention/reply handling in a group (group admin)\n"
-        "/disablegreyai — Disable GreyAI handling in a group (group admin)\n\n"
-        "<b>Developer integrations</b>\n"
-        "/devrequest &lt;reason&gt; — Request governed developer access\n"
-        "/newkey &lt;name&gt; check — Create a scoped key; the secret appears once in a self-deleting message\n"
-        "/devkeys — View labeled key metadata without secrets\n"
-        "/revokekey &lt;key_id&gt; — Revoke an owned key\n"
-        "/developerstats — View key usage and denied events\n"
-        "Use <code>POST /api/v1/check</code> with <code>Authorization: Bearer &lt;key&gt;</code> from another Telegram bot.\n\n"
-        "<b>Administrator controls</b>\n"
-        "/admin, /admin_user, /ban, /unban, /banned, /reports, /appeals, /review, /resolveappeal\n"
-        "/announce, /dm, /massdm, /massrole &lt;users|developers|admins&gt; | &lt;message&gt;, /massban, /massunban, /massappeals, /confirmbulk\n"
-        "/maintenance &lt;mode&gt; | &lt;public message&gt; | &lt;reason&gt; — publish status/update and maintenance reason\n"
-        "/status, /maintenance_log — view current status and timestamped status history\n"
-        "/analytics — top users, top referrers, suspicious queue, and most risky accounts\n"
-        "/grantplan &lt;Telegram ID&gt; &lt;pro|max&gt; — manually grant a 30-day Pro or Max plan, including to yourself; /upgrade remains the self-service Stars checkout\n"
-        "/stars or /starsbalance — view the bot’s current Telegram Stars balance and recent revenue summary\n"
-        "/withdrawstars — open the owner-side Telegram/Fragment withdrawal handoff\n"
-        "/adcreate &lt;chat_id|@username,...&gt; | &lt;title&gt; | &lt;copy or ai: brief&gt; | &lt;repeat/timing options&gt; — preview an ad campaign\n"
-        "/confirmad &lt;campaign_id&gt; &lt;token&gt; — confirm a campaign and start delivery\n"
-        "/adlist — list your campaigns; /cancelad &lt;campaign_id&gt; — cancel one\n"
-        "/resumead &lt;campaign_id&gt; — resume a paused campaign after restoring permissions\n"
-        "Admins receive a durable alert when a Pro or Max subscription is successfully purchased.\n"
-        "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n"
-        "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n"
-        "/allowdomain &lt;domain|*.domain&gt;, /disallowdomain &lt;pattern&gt;, /resetdomain &lt;pattern&gt;, /domains\n\n"
-        "Never send an API secret again after copying it. If a key is exposed, revoke it immediately with /revokekey."
-    )
-    return help_text
+def build_help_sections(user_id: int | None = None) -> list[tuple[str, str]]:
+    user = get_user(int(user_id)) if user_id is not None else None
+    admin_view = bool(user_id is not None and is_admin(int(user_id)))
+    developer_view = bool(user_id is not None and is_developer(int(user_id)))
+    plan = str(user["plan"] if user is not None else "free").lower()
+    access_label = "Administrator" if admin_view else ("Developer" if developer_view else plan.title())
+
+    sections: list[tuple[str, str]] = [
+        ("GreyAI overview", "\n".join((
+            f"Access view: {access_label}.",
+            "Send an ordinary message for fast chat. Send a voice note or screenshot for transcription and visual identification. Browser-like wording, named websites, schedules, watchers, and management requests enter Agent mode.",
+            "Credentialed login flows require explicit approval in your request and remain subject to the site’s normal security checks. GreyAI will not bypass CAPTCHAs, anti-bot challenges, automated-traffic controls, or access restrictions.",
+        ))),
+        ("Web agent and files", "\n".join((
+            "/check <url> | actions — Run a secure browser workflow",
+            "/fetch <url or request> — Fetch an authorized page or retrieve a permitted artifact",
+            "/watch <interval> <url> | condition — Monitor a page",
+            "Natural language also works for browsing, current-fact verification, summaries, and permitted file retrieval. Grey sends progress and an ETA, validates artifacts, and deletes temporary copies.",
+            "File access is controlled by account entitlement and safety validation. GreyAI will not bypass DRM, paywalls, CAPTCHAs, malware defenses, or platform blocks.",
+        ))),
+        ("Monitors and schedules", "\n".join((
+            "/watchers — List monitors",
+            "/stopwatch <watcher_id> — Stop a monitor",
+            "/schedule <time> <url> | briefing — Schedule a recurring briefing",
+            "/schedules — List briefings",
+            "/unschedule <schedule_id> — Cancel a briefing",
+        ))),
+        ("Sessions and personal settings", "\n".join((
+            "/sessions — List your encrypted browser sessions",
+            "/deletesession <name> — Delete a saved session",
+            "Use save_session:name and load_session:name inside authorized browser workflows.",
+            "/settings — Open button-driven settings for persistent login, automatic session saving, handoffs, and session cleanup.",
+            "Login state is encrypted and reused only for approved sites and authorized tasks.",
+        ))),
+        ("Account and support", "\n".join((
+            "/start — Start GreyAI and get your referral link",
+            "/dashboard — Open the secure operations dashboard",
+            "/health — View service health",
+            "/upgrade — Compare Pro and Max benefits, then choose a plan with buttons",
+            "/referral — Create your invite link",
+            "/report <text> — Send a support or safety report",
+            "/appeal <text> — Request account review",
+        ))),
+        ("Shared chats", "\n".join((
+            "Private chat: use inline mode with @BotFather using /setinline, then type @GreyBrowserBot followed by your question in a permitted chat.",
+            "/ask <request> — Ask GreyAI in a private chat or enabled group",
+            "/enablegreyai — Enable mention/reply handling in a group (group admin)",
+            "/disablegreyai — Disable GreyAI handling in a group (group admin)",
+            "Groups and channels still require the applicable Telegram permissions and GreyAI policy controls.",
+        ))),
+    ]
+
+    if developer_view:
+        sections.append(("Developer integrations", "\n".join((
+            "/devrequest <reason> — Request governed developer access",
+            "/newkey <name> check — Create a scoped key; the secret appears once in a self-deleting message",
+            "/devkeys — View labeled key metadata without secrets",
+            "/revokekey <key_id> — Revoke an owned key",
+            "/developerstats — View key usage and denied events",
+            "Use POST /api/v1/check with Authorization: Bearer <key> from another authorized Telegram bot.",
+            "Never send an API secret again after copying it. If a key is exposed, revoke it immediately.",
+        ))))
+    else:
+        sections.append(("Developer access", "/devrequest <reason> — Request governed developer access. An administrator must approve it before developer tools become available."))
+
+    if admin_view:
+        sections.append(("Administrator controls", "\n".join((
+            "/admin, /admin_user, /ban, /unban, /banned, /reports, /appeals, /review, /resolveappeal",
+            "/announce, /dm, /massdm, /massrole <users|developers|admins> | <message>, /massban, /massunban, /massappeals, /confirmbulk",
+            "/maintenance <mode> | <public message> | <reason> — publish status/update and maintenance reason",
+            "/status, /maintenance_log — view current status and timestamped status history",
+            "/analytics — top users, top referrers, suspicious queue, and most risky accounts",
+            "/grantplan <Telegram ID> <pro|max> — manually grant a 30-day Pro or Max plan, including to yourself; /upgrade remains the self-service Stars checkout",
+            "/stars or /starsbalance — view the bot’s current Telegram Stars balance and recent revenue summary",
+            "/withdrawstars — open the owner-side Telegram/Fragment withdrawal handoff",
+            "/adcreate <chat_id|@username,...> | <title> | <copy or ai: brief> | <repeat/timing options> — preview an ad campaign",
+            "/confirmad <campaign_id> <token> — confirm a campaign and start delivery",
+            "/adlist — list your campaigns; /cancelad <campaign_id> — cancel one",
+            "/resumead <campaign_id> — resume a paused campaign after restoring permissions",
+            "Admins receive a durable alert when a Pro or Max subscription is successfully purchased.",
+            "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper",
+            "/allowchannel <channel_id>, /disallowchannel <channel_id>",
+            "/allowdomain <domain|*.domain>, /disallowdomain <pattern>, /resetdomain <pattern>, /domains",
+        ))))
+    return sections
+
+
+def build_help_text(user_id: int | None = None) -> str:
+    return "\n\n".join(f"{title}\n{body}" for title, body in build_help_sections(user_id))
 
 
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pages = build_help_pages()
+    pages = build_help_pages(update.effective_user.id)
     await update.message.reply_text(
         help_page_text(pages, 0),
         reply_markup=help_page_keyboard(update.effective_user.id, 0, len(pages)),
@@ -8886,7 +8910,7 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if int(query.from_user.id) != owner_id:
         await query.answer("This help viewer belongs to another user.", show_alert=True)
         return
-    pages = build_help_pages()
+    pages = build_help_pages(owner_id)
     if page_raw < 0 or page_raw >= len(pages):
         await query.answer("That help page is no longer available.", show_alert=True)
         return
