@@ -1881,6 +1881,14 @@ def mark_payment_success(order_id: str, plan: str, expires_at: str | None = None
 
 
 _CONTACT_SECRET_PATTERNS = (
+    re.compile(
+        r"(?is)\b(username|user\s*name|email|e-mail)\s*(?:is|:|=)?\s*"
+        r"(?:['\"“”‘’][^'\"“”‘’\n]{1,240}['\"“”‘’]|[^\s,;]+)"
+    ),
+    re.compile(
+        r"(?is)\b(password|passcode)\s*(?:is|:|=)\s*"
+        r"(?:['\"“”‘’][^'\"“”‘’\n]{1,1000}['\"“”‘’]|.+?(?=\s+and\s+(?:remember|save|keep|then|ask|tell|show)\b|$))"
+    ),
     re.compile(r"(?i)(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*[^\s,;]+"),
     re.compile(r"\b(?:AIza|sk-|xoxb-|ghp_)[A-Za-z0-9_./-]{12,}\b"),
 )

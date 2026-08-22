@@ -975,6 +975,26 @@ def test_natural_language_schedule_plan_normalizes_to_schedule(monkeypatch):
     assert plan["schedule"]["days"] == [0, 1, 2, 3, 4]
 
 
+def test_shared_chat_schedules_are_owner_scoped():
+    import bot
+
+    config = {
+        "schedule_time": "08:00",
+        "timezone": "UTC",
+        "days": list(range(7)),
+        "urls": ["https://example.com"],
+        "delivery_mode": "combined",
+        "summary_prompt": "Summarize it",
+    }
+    next_run = datetime.now(ZoneInfo("UTC")) + timedelta(hours=1)
+    bot.save_schedule_to_db("owner_schedule", 101, -1007006, config, next_run)
+
+    assert bot.list_schedules_for_chat(-1007006, owner_user_id=101)
+    assert bot.list_schedules_for_chat(-1007006, owner_user_id=202) == []
+    assert bot.deactivate_schedule_in_db("owner_schedule", -1007006, owner_user_id=202) is False
+    assert bot.list_schedules_for_chat(-1007006, owner_user_id=101)
+
+
 def test_schedule_crud_persists_and_deactivates(monkeypatch):
     import bot
     monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
@@ -1138,6 +1158,72 @@ def test_source_fallback_tries_next_provider_after_empty_extraction(monkeypatch)
     assert result["source_url"].startswith("https://coinmarketcap.com/")
 
 
+def test_queue_worker_resolves_future_after_outer_boundary_failure(monkeypatch):
+    import bot
+
+    class FakeQueue:
+        def __init__(self, item):
+            self.item = item
+            self.calls = 0
+            self.done_calls = 0
+
+        async def get(self):
+            self.calls += 1
+            if self.calls == 1:
+                return self.item
+            raise asyncio.CancelledError()
+
+        def task_done(self):
+            self.done_calls += 1
+
+    async def exercise():
+        future = asyncio.get_running_loop().create_future()
+        queue = FakeQueue((-1, 1, "queue_outer_failure", future, lambda: None))
+        maintenance_calls = []
+
+        monkeypatch.setattr(bot, "browser_request_queue", queue)
+        monkeypatch.setattr(bot, "claim_queue_entry", lambda _operation_id: (_ for _ in ()).throw(RuntimeError("claim boundary failed")))
+        monkeypatch.setattr(bot, "update_queue_entry", lambda *args, **kwargs: None)
+
+        async def fake_maintenance(_context_bot, exc):
+            maintenance_calls.append(type(exc).__name__)
+
+        monkeypatch.setattr(bot, "enter_hard_maintenance", fake_maintenance)
+        worker = asyncio.create_task(bot._browser_queue_worker(None))
+        await asyncio.sleep(0)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        return future, queue, maintenance_calls
+
+    future, queue, maintenance_calls = asyncio.run(exercise())
+    assert future.done()
+    assert isinstance(future.exception(), RuntimeError)
+    assert maintenance_calls == ["RuntimeError"]
+    assert queue.done_calls == 1
+
+
+def test_watcher_uses_owner_identity_for_browser_execution(monkeypatch):
+    import bot
+
+    observed = []
+
+    class FakeBot:
+        async def send_message(self, **_kwargs):
+            return None
+
+    async def successful_browser(*args, **kwargs):
+        observed.append((args, kwargs))
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(bot, "run_browser_task_with_source_fallback", successful_browser)
+    monkeypatch.setattr(bot, "deactivate_watcher_in_db", lambda *_args, **_kwargs: None)
+
+    asyncio.run(bot.watcher_loop(-1007006, "https://example.com", ["condition_contains:ready"], 30, "watch_owner", FakeBot(), owner_user_id=101))
+
+    assert observed
+    assert observed[0][0][2] == 101
+
+
 def test_watcher_failure_notifies_and_persists_health(monkeypatch):
     import bot
 
@@ -1172,6 +1258,32 @@ def test_watcher_failure_notifies_and_persists_health(monkeypatch):
     assert fake_bot.messages
     assert "watch_fail" in fake_bot.messages[0]["text"]
     assert "retry automatically" in fake_bot.messages[0]["text"]
+
+
+def test_selected_sessions_are_owner_scoped_in_shared_chats():
+    import bot
+
+    bot.active_session_by_chat.clear()
+    bot.active_session_by_chat[bot._session_state_key(101, -1007006)] = "alice_session"
+
+    assert bot.active_session_by_chat.get(bot._session_state_key(101, -1007006)) == "alice_session"
+    assert bot.active_session_by_chat.get(bot._session_state_key(202, -1007006)) is None
+
+
+def test_shared_chat_watchers_are_owner_scoped():
+    import bot
+
+    bot.save_watcher_to_db(
+        "owner_watch",
+        -1007006,
+        "https://example.com",
+        ["condition_contains:ready"],
+        60,
+        owner_user_id=101,
+    )
+
+    assert bot.list_watchers_for_chat(-1007006, owner_user_id=101)
+    assert bot.list_watchers_for_chat(-1007006, owner_user_id=202) == []
 
 
 def test_browser_task_retry_recovers_transient_failure(monkeypatch):
@@ -1784,7 +1896,7 @@ def test_natural_language_handler_uses_agent_context_before_chat_model(monkeypat
     import bot
 
     chat_id = 7713
-    bot.save_watcher_to_db("watcher_handler", chat_id, "https://www.reddit.com/r/forhire/", ["condition_contains:new post"], 3600)
+    bot.save_watcher_to_db("watcher_handler", chat_id, "https://www.reddit.com/r/forhire/", ["condition_contains:new post"], 3600, owner_user_id=42)
 
     class FakeMessage:
         text = "What about the watch session we had?"
@@ -2140,12 +2252,69 @@ def test_private_chat_personality_never_swallows_agent_routing():
     assert bot.private_chat_micro_reply(request) is None
 
 
+def test_short_private_chat_turns_have_deterministic_social_replies():
+    import bot
+
+    assert bot.private_chat_micro_reply("How are you?")
+    assert bot.private_chat_micro_reply("I'm okay")
+    assert bot.private_chat_micro_reply("huh?")
+
+
+def test_short_private_chat_does_not_replay_prior_code_context(monkeypatch):
+    import bot
+
+    stale_code = "Here is the rest of that /start handler:\n```python\napplication.run_polling()\n```"
+    captured = {}
+
+    class FakeProvider:
+        async def generate_text(self, prompt, generation_config):
+            captured["prompt"] = prompt
+            return "Good to hear. What would you like to do next?"
+
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+    monkeypatch.setattr(bot, "gemini_provider", FakeProvider())
+    monkeypatch.setattr(bot, "private_chat_micro_reply", lambda _text: None)
+    monkeypatch.setattr(bot, "load_chat_history", lambda *_args, **_kwargs: [{"role": "assistant", "text": stale_code}])
+
+    reply = asyncio.run(bot.generate_chat_reply(123, "I'm okay", private_chat=True, owner_user_id=42))
+
+    assert reply == "Good to hear. What would you like to do next?"
+    assert stale_code not in captured["prompt"]
+
+
+def test_in_memory_group_history_is_scoped_to_the_requesting_user(monkeypatch):
+    import bot
+
+    bot.chat_histories.clear()
+    bot.remember_chat_turn(
+        7003,
+        "User one private context",
+        "User one private answer",
+        owner_user_id=101,
+    )
+    captured = {}
+
+    class FakeProvider:
+        async def generate_text(self, prompt, generation_config):
+            captured["prompt"] = prompt
+            return "User two answer"
+
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+    monkeypatch.setattr(bot, "gemini_provider", FakeProvider())
+    monkeypatch.setattr(bot, "load_chat_history", lambda *_args, **_kwargs: [])
+
+    asyncio.run(bot.generate_chat_reply(7003, "Hello", owner_user_id=202))
+
+    assert "User one private context" not in captured["prompt"]
+    assert "User one private answer" not in captured["prompt"]
+
+
 def test_business_connection_update_persists_only_connection_metadata(monkeypatch):
     import bot
 
     recorded = []
     monkeypatch.setattr(bot, "save_business_connection", lambda *args: recorded.append(args))
-    monkeypatch.setattr(bot, "log_audit", lambda *args: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
     rights = SimpleNamespace(can_read_messages=True, can_reply=True)
     connection = SimpleNamespace(
         id="business-connection-1",
@@ -2285,13 +2454,13 @@ def test_natural_language_chat_reply_uses_telegram_html(monkeypatch):
         effective_user=SimpleNamespace(id=6411860985),
     )
 
-    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bot, "classify_message_route", lambda request: "chat")
     async def no_interpreted_chat_reply(*args, **kwargs):
         return None
     monkeypatch.setattr(bot, "parse_natural_language_intent", no_interpreted_chat_reply)
-    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args: None)
-    monkeypatch.setattr(bot, "log_audit", lambda *args: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
 
     async def fake_chat_reply(chat_id, text, private_chat=False, **kwargs):
         return "1. **Sell this**\n* Use `cash` & stay safe."
@@ -2545,6 +2714,23 @@ def test_reply_target_context_is_available_to_prompt_and_contact_log():
     assert context["text"] == "The checklist has three steps."
     assert "The checklist has three steps." in prompt
     assert bot.list_contact_logs(6411860985, 7003, limit=10)[0]["reply_to_message_id"] == 77
+
+
+def test_login_style_contact_logs_redact_unquoted_and_multiword_secrets():
+    import bot
+
+    bot.record_contact_log(
+        6411860985,
+        7005,
+        "message",
+        "Login to https://example.com with username 'alice@example.com' and password is correct horse battery staple",
+    )
+
+    row = bot.list_contact_logs(6411860985, 7005, limit=1)[0]
+
+    assert "alice@example.com" not in row["message_text"]
+    assert "correct horse battery staple" not in row["message_text"]
+    assert "[redacted]" in row["message_text"]
 
 
 def test_contact_log_redacts_credentials_and_keeps_reply_metadata():
@@ -3095,10 +3281,10 @@ def test_natural_language_parser_skips_provider_for_unambiguous_web_request(monk
     assert plan["url"] == "https://example.com/news"
 
 
-def test_clean_grey_response_suppresses_adjacent_repetition():
+def test_clean_grey_response_preserves_adjacent_repetition():
     import bot
     cleaned = bot.clean_grey_response("The page is available.\n\nThe page is available.\n\nNext, I can extract the price.")
-    assert cleaned == "The page is available.\n\nNext, I can extract the price."
+    assert cleaned == "The page is available.\n\nThe page is available.\n\nNext, I can extract the price."
     assert bot.clean_grey_response("GreyAI: GreyAI: Ready.") == "Ready."
 
 
@@ -3975,6 +4161,66 @@ def test_resolve_direct_download_source_accepts_single_quoted_search_result_link
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_download_delivery_does_not_reclassify_success_when_final_status_edit_fails(monkeypatch):
+    import bot
+
+    artifact_path = tempfile.NamedTemporaryFile(prefix="greyai-test-", delete=False).name
+    with open(artifact_path, "wb") as handle:
+        handle.write(b"safe artifact")
+    statuses = []
+    operations = []
+    documents = []
+
+    class FakeStatus:
+        async def edit_text(self, text, **_kwargs):
+            if str(text).startswith("✅ Delivered"):
+                raise bot.TelegramError("status message was deleted")
+
+    class FakeBot:
+        async def send_document(self, **kwargs):
+            documents.append(kwargs)
+
+    class FakeContext:
+        bot = FakeBot()
+
+    monkeypatch.setattr(bot, "download_policy_for_user", lambda _user_id: {"allowed": True, "tier": "pro", "max_bytes": 1000, "daily_limit": 2})
+    monkeypatch.setattr(bot, "count_download_jobs_since", lambda *_args: 0)
+    monkeypatch.setattr(bot, "get_last_download_job_at", lambda *_args: None)
+    monkeypatch.setattr(bot, "consume_quota", lambda *_args: (True, 1, 100))
+    monkeypatch.setattr(bot, "create_download_job", lambda *_args: None)
+    monkeypatch.setattr(bot, "finish_download_job", lambda _job_id, status, *args, **kwargs: statuses.append(status) or True)
+    monkeypatch.setattr(bot, "update_operation", lambda _operation_id, status, *args: operations.append(status))
+    monkeypatch.setattr(bot, "log_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+    async def fake_resolve(*_args, **_kwargs):
+        return "https://downloads.example/file.txt"
+
+    async def fake_stream(*_args, **_kwargs):
+        return {"path": artifact_path, "filename": "file.txt", "size": 13, "source_url": "https://downloads.example/file.txt", "source_host": "downloads.example", "content_type": "text/plain"}
+
+    monkeypatch.setattr(bot, "_resolve_direct_download_source", fake_resolve)
+    monkeypatch.setattr(bot, "_stream_download_artifact", fake_stream)
+
+    async def fake_input_file(path, filename=None):
+        return (path, filename)
+
+    monkeypatch.setattr(bot, "_input_file_from_path", fake_input_file)
+    bot.active_download_jobs.clear()
+
+    asyncio.run(bot._deliver_download_artifact(
+        FakeContext(),
+        FakeStatus(),
+        {"mode": "download", "url": "https://downloads.example/results", "source_candidates": []},
+        42,
+        42,
+        "op_download_status_edit",
+    ))
+
+    assert len(documents) == 1
+    assert statuses == ["succeeded"]
+    assert operations == ["running", "succeeded"]
 
 
 def test_download_delivery_explains_missing_direct_artifact(monkeypatch):
@@ -4880,6 +5126,14 @@ def test_shared_text_viewer_rejects_foreign_and_expired_callbacks(monkeypatch):
     assert expired.message.edited == []
 
 
+def test_clean_grey_response_preserves_repeated_user_visible_paragraphs():
+    import bot
+
+    source = "First identical paragraph.\n\nFirst identical paragraph."
+
+    assert bot.clean_grey_response(source) == source
+
+
 def test_shared_text_viewer_redacts_sensitive_fields(monkeypatch):
     import bot
 
@@ -4915,15 +5169,15 @@ def test_long_chat_reply_uses_shared_viewer_instead_of_truncation(monkeypatch):
         effective_user=SimpleNamespace(id=6411860985),
     )
 
-    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bot, "classify_message_route", lambda request: "chat")
 
     async def no_interpreted_chat_reply(*args, **kwargs):
         return None
 
     monkeypatch.setattr(bot, "parse_natural_language_intent", no_interpreted_chat_reply)
-    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args: None)
-    monkeypatch.setattr(bot, "log_audit", lambda *args: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
 
     async def fake_chat_reply(*args, **kwargs):
         return "BEGIN\n" + ("complete-" * 900) + "\nEND"
@@ -5063,7 +5317,7 @@ def test_long_developer_api_example_uses_shared_viewer(monkeypatch):
         effective_user=SimpleNamespace(id=6411860985),
     )
 
-    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bot, "classify_message_route", lambda request: "task")
     async def fake_parse_intent(*args, **kwargs):
         return {"mode": "developer_api_example", "language": "python"}
@@ -5131,6 +5385,24 @@ def test_shared_viewer_keeps_copyable_safe_placeholders_intact():
     sanitized = bot._sanitize_viewer_text("Authorization: Bearer <developer_api_key>\nGREY_API_KEY=$GREY_API_KEY")
     assert "Authorization: Bearer <developer_api_key>" in sanitized
     assert "GREY_API_KEY=$GREY_API_KEY" in sanitized
+
+
+def test_viewer_redaction_preserves_quoted_safe_code_placeholders():
+    import bot
+
+    source = 'TOKEN = "YOUR_BOT_TOKEN_HERE"\nAPI_KEY = "replace_with_your_key"'
+    sanitized = bot._sanitize_viewer_text(source)
+
+    assert sanitized == source
+
+
+def test_viewer_redaction_keeps_quoted_secret_values_syntactically_valid():
+    import bot
+
+    source = 'TOKEN = "real token value with spaces"\nAPI_KEY = "gai_live.secret-value-123456"'
+    sanitized = bot._sanitize_viewer_text(source)
+
+    assert sanitized == 'TOKEN = "[redacted]"\nAPI_KEY = "[redacted]"'
 
 
 def test_extract_code_files_from_generated_answer_is_bounded_and_named():
@@ -5220,7 +5492,7 @@ def test_natural_language_code_archive_delivers_document_from_prior_reply(monkey
     )
     context = SimpleNamespace(bot=fake_bot)
 
-    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bot, "classify_message_route", lambda _request: "task")
     monkeypatch.setattr(bot, "parse_natural_language_intent", lambda *args, **kwargs: asyncio.sleep(0, result={"mode": "developer_code_archive", "language": "python", "project_name": "mcp-server"}))
     monkeypatch.setattr(bot, "is_developer", lambda _user_id: True)
@@ -5318,7 +5590,7 @@ def test_natural_language_landing_page_request_delivers_zip(monkeypatch):
     )
     context = SimpleNamespace(bot=fake_bot)
 
-    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bot, "classify_message_route", lambda _request: "task")
     monkeypatch.setattr(bot, "parse_natural_language_intent", lambda *args, **kwargs: asyncio.sleep(0, result={"mode": "developer_landing_page_archive", "language": "html", "project_name": "greyai-landing-page"}))
     monkeypatch.setattr(bot, "is_developer", lambda _user_id: True)

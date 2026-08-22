@@ -137,6 +137,17 @@ def _bounded_query_limit(request: web.Request, default: int = 25, maximum: int =
     return min(value, maximum)
 
 
+async def _json_object(request: web.Request) -> dict[str, Any]:
+    """Decode a mutation body without exposing parser errors or accepting arrays/scalars."""
+    try:
+        data = await request.json()
+    except (ValueError, TypeError, UnicodeDecodeError):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_json"}), content_type="application/json")
+    if not isinstance(data, dict):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "json_object_required"}), content_type="application/json")
+    return data
+
+
 @web.middleware
 async def security_middleware(request: web.Request, handler):
     try:
@@ -397,10 +408,7 @@ async def developer_keys_handler(request: web.Request):
 async def developer_key_create_handler(request: web.Request):
     session, user = _require_developer(request)
     _require_csrf(request, session)
-    try:
-        data = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_json"}), content_type="application/json")
+    data = await _json_object(request)
     scopes = data.get("scopes", ["check"])
     if isinstance(scopes, str):
         scopes = scopes.split(",")
@@ -466,7 +474,7 @@ async def admin_appeals_handler(request: web.Request):
 async def admin_ban_handler(request: web.Request):
     session, admin = _require_admin(request)
     _require_csrf(request, session)
-    data = await request.json()
+    data = await _json_object(request)
     try:
         target_id = int(data.get("user_id"))
     except (TypeError, ValueError):
@@ -487,7 +495,7 @@ async def admin_ban_handler(request: web.Request):
 async def admin_unban_handler(request: web.Request):
     session, admin = _require_admin(request)
     _require_csrf(request, session)
-    data = await request.json()
+    data = await _json_object(request)
     try:
         target_id = int(data.get("user_id"))
     except (TypeError, ValueError):
@@ -506,7 +514,7 @@ async def admin_review_report_handler(request: web.Request):
     session, admin = _require_admin(request)
     _require_csrf(request, session)
     report_id = request.match_info["report_id"]
-    data = await request.json()
+    data = await _json_object(request)
     status = str(data.get("status", "reviewing"))
     resolution = str(data.get("resolution", "reviewed by administrator"))[:4000]
     if not resolve_report(report_id, admin["telegram_user_id"], status, resolution):
@@ -519,7 +527,7 @@ async def admin_resolve_appeal_handler(request: web.Request):
     session, admin = _require_admin(request)
     _require_csrf(request, session)
     appeal_id = request.match_info["appeal_id"]
-    data = await request.json()
+    data = await _json_object(request)
     status = str(data.get("status", "reviewing"))
     resolution = str(data.get("resolution", "reviewed by administrator"))[:4000]
     appeal = get_appeal(appeal_id)

@@ -18,6 +18,13 @@ def platform_db(tmp_path, monkeypatch):
     return path
 
 
+def test_contact_redaction_does_not_swallow_following_prose():
+    text = cp._safe_contact_text("username is alice and password is secret and then ask Grey to summarize the page")
+
+    assert "secret" not in text
+    assert "then ask Grey to summarize the page" in text
+
+
 def test_notification_outbox_is_idempotent_and_retryable(platform_db):
     cp.ensure_user(42)
     first_id, first_created = cp.enqueue_user_notification(42, "moderation", "Account update", "Your account was reviewed.", "moderation:42:appeal_1")

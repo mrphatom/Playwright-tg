@@ -141,6 +141,34 @@ def test_admin_unban_rejects_nonexistent_target_instead_of_reporting_success(das
     assert "user_not_found" in error.value.text
 
 
+def test_admin_ban_rejects_malformed_json_safely(dashboard_db, monkeypatch):
+    async def body():
+        raise ValueError("malformed body")
+
+    request = SimpleNamespace(json=body)
+    monkeypatch.setattr(dashboard, "_require_admin", lambda _request: (SimpleNamespace(), {"telegram_user_id": 9001}))
+    monkeypatch.setattr(dashboard, "_require_csrf", lambda _request, _session: None)
+
+    with pytest.raises(web.HTTPBadRequest) as error:
+        import asyncio
+        asyncio.run(dashboard.admin_ban_handler(request))
+    assert "invalid_json" in error.value.text
+
+
+def test_developer_key_create_rejects_non_object_json_safely(dashboard_db, monkeypatch):
+    async def body():
+        return ["not", "an", "object"]
+
+    request = SimpleNamespace(json=body)
+    monkeypatch.setattr(dashboard, "_require_developer", lambda _request: (SimpleNamespace(), {"telegram_user_id": 42}))
+    monkeypatch.setattr(dashboard, "_require_csrf", lambda _request, _session: None)
+
+    with pytest.raises(web.HTTPBadRequest) as error:
+        import asyncio
+        asyncio.run(dashboard.developer_key_create_handler(request))
+    assert "json_object_required" in error.value.text
+
+
 def test_admin_ban_returns_bad_request_for_non_numeric_user_id(dashboard_db, monkeypatch):
     async def body():
         return {"user_id": "not-a-user"}
