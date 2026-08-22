@@ -3461,6 +3461,12 @@ def truncate_text(text: str, max_length: int = 4000) -> str:
     return text if len(text) <= max_length else text[:max_length - 15] + "\n...[Truncated]"
 
 
+async def _input_file_from_path(path: str, filename: str | None = None) -> InputFile:
+    """Read a local artifact off the event loop before uploading it to Telegram."""
+    payload = await asyncio.to_thread(Path(path).read_bytes)
+    return InputFile(payload, filename=filename or Path(path).name)
+
+
 async def _send_delayed_thinking_feedback(source_message, state: dict[str, Any], delay_seconds: float | None = None):
     """Show explicit progress only when interpretation takes long enough to be noticeable."""
     try:
@@ -4571,14 +4577,14 @@ async def watcher_loop(
                         1024,
                     )
                     if screenshot_path and os.path.exists(screenshot_path):
-                        with open(screenshot_path, "rb") as photo:
-                            await context_bot.send_photo(
-                                chat_id=chat_id,
-                                photo=photo,
-                                caption=caption,
-                                parse_mode="Markdown",
-                                business_connection_id=business_connection_id,
-                            )
+                        photo = await _input_file_from_path(screenshot_path)
+                        await context_bot.send_photo(
+                            chat_id=chat_id,
+                            photo=photo,
+                            caption=caption,
+                            parse_mode="Markdown",
+                            business_connection_id=business_connection_id,
+                        )
                     if res.get("extracted"):
                         await context_bot.send_message(
                             chat_id=chat_id,
@@ -4753,8 +4759,8 @@ async def check_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         caption = truncate_text(f"📄 *Title:* {res.get('title')}\n🔗 *URL:* {url}", 1024)
-        with open(res["screenshot"], 'rb') as photo:
-            await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode='Markdown')
+        photo = await _input_file_from_path(res["screenshot"])
+        await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode='Markdown')
 
         if res["extracted"]:
             await context.bot.send_message(chat_id=chat_id, text=truncate_text("\n\n".join(res["extracted"]), 4000), parse_mode='Markdown')
@@ -6861,15 +6867,15 @@ async def _deliver_download_artifact(
                 raise last_rejection or DownloadRejected("no_direct_artifact_found")
         downloaded_path = artifact["path"]
         await status_msg.edit_text(f"🔍 Validated `{artifact['filename']}` ({_human_bytes(artifact['size'])}). Sending it to you…", parse_mode="Markdown")
-        with open(downloaded_path, "rb") as stream:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(stream, filename=artifact["filename"]),
-                caption=(
-                    f"✅ File delivered\nName: {artifact['filename']}\nSize: {_human_bytes(artifact['size'])}\n"
-                    f"Source host: {artifact['source_host']}\nOperation: {operation_id}"
-                ),
-            )
+        document = await _input_file_from_path(downloaded_path, artifact["filename"])
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=document,
+            caption=(
+                f"✅ File delivered\nName: {artifact['filename']}\nSize: {_human_bytes(artifact['size'])}\n"
+                f"Source host: {artifact['source_host']}\nOperation: {operation_id}"
+            ),
+        )
         finish_download_job(job_id, "succeeded", artifact["size"], artifact["filename"])
         runtime_metrics["download_jobs_succeeded"] += 1
         update_operation(operation_id, "succeeded")
@@ -7461,8 +7467,8 @@ async def _process_natural_language(
                 f"📄 **Login flow finished**\n🔗 **URL:** {plan['url']}",
                 1024,
             )
-            with open(result["screenshot"], "rb") as photo:
-                await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
+            photo = await _input_file_from_path(result["screenshot"])
+            await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
             if result["extracted"]:
                 await source_message.reply_text(
                     telegram_safe_html("\n\n".join(result["extracted"]), 4000),
@@ -7535,8 +7541,8 @@ async def _process_natural_language(
                     parse_mode="HTML",
                 )
             if plan.get("screenshot_requested") or not result.get("extracted"):
-                with open(result["screenshot"], "rb") as photo:
-                    await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
+                photo = await _input_file_from_path(result["screenshot"])
+                await source_message.reply_photo(photo=photo, caption=telegram_safe_html(caption), parse_mode="HTML")
             screenshot_path = result.get("screenshot")
             if screenshot_path and os.path.exists(screenshot_path):
                 os.remove(screenshot_path)
