@@ -165,7 +165,7 @@ from control_plane import (
     record_contact_log as persist_contact_log,
 )
 from dashboard import serve_dashboard
-from starter_templates import build_telegram_bot_starter_archive
+from starter_templates import build_code_archive, build_telegram_bot_starter_archive
 
 # ==========================================
 # CONFIGURATION & LOGGING
@@ -427,20 +427,22 @@ provider_metrics = {
 def format_api_key_listing(keys: list[dict[str, Any]]) -> str:
     if not keys:
         return "🔐 No developer API keys found. Create one with /newkey <name> check."
-    lines = ["🔐 <b>Your GreyAI developer keys</b>", "", "Secret values are never shown in this list."]
+    lines = ["🔐 Your GreyAI developer keys", "", "Secret values are never shown in this list."]
     for item in keys:
-        status = str(item.get("status", "unknown")).lower()
+        status = str(item.get("status", "unknown")).lower()[:32]
         icon = "🟢" if status == "active" else "🔴" if status == "revoked" else "🟡"
-        scopes = ", ".join(item.get("scopes") or []) or "none"
-        last_used = item.get("last_used_at") or "never"
+        scopes = ", ".join(str(scope)[:40] for scope in (item.get("scopes") or [])) or "none"
+        last_used = str(item.get("last_used_at") or "never")[:80]
+        name = str(item.get("name") or "Unnamed key")[:120]
+        key_id = str(item.get("key_id") or "unknown")[:120]
         lines.extend([
             "",
-            f"{icon} <b>{html_escape(str(item.get('name') or 'Unnamed key'))}</b>",
-            f"   Key ID: <code>{html_escape(str(item.get('key_id')))}</code>",
-            f"   Status: <b>{html_escape(status)}</b>",
-            f"   Scope: <code>{html_escape(scopes)}</code>",
-            f"   Last used: {html_escape(str(last_used))}",
-            f"   Revoke: <code>/revokekey {html_escape(str(item.get('key_id')))}</code>",
+            f"{icon} {name}",
+            f"   Key ID: {key_id}",
+            f"   Status: {status}",
+            f"   Scope: {scopes}",
+            f"   Last used: {last_used}",
+            f"   Revoke: /revokekey {key_id}",
         ])
     return "\n".join(lines)
 
@@ -2180,6 +2182,16 @@ def parse_deterministic_management_request(
         return {"mode": "developer_revoke_key", "key_id": revoke_key_match.group(1)}
     if re.search(r"\b(?:developer|api)\s+(?:usage|statistics|stats)\b", text):
         return {"mode": "developer_stats"}
+    code_archive_request = bool(
+        re.search(r"\b(?:zip|archive|bundle|package|downloadable)\b", text)
+        and re.search(r"\b(?:code|files?|project|source|above|snippet)\b", text)
+    )
+    if code_archive_request:
+        language = "javascript" if re.search(r"\b(?:javascript|typescript|node(?:\.js)?)\b", text) else "python"
+        project_match = re.search(r"\b(?:project|archive|zip|repository|repo)\s+(?:name|called|named)\s*[:=]?\s*([a-z0-9][a-z0-9._-]{2,80})", text)
+        if not project_match:
+            project_match = re.search(r"\b(?:named|called)\s+([a-z0-9][a-z0-9._-]{2,80})\b", text)
+        return {"mode": "developer_code_archive", "language": language, "project_name": project_match.group(1) if project_match else "greyai-code-project"}
     starter_request = bool(
         re.search(r"\b(?:full|complete|entire|starter|template|quick|short)\b.*\b(?:telegram|tg)\s+bot\b", text)
         and re.search(r"\b(?:code|repo(?:sitory)?|project|files?|github|integration)\b", text)
@@ -2455,6 +2467,14 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
             language = "python"
         project_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(raw_plan.get("project_name", "greyai-telegram-integration") or "greyai-telegram-integration")).strip(".-_").lower()[:80] or "greyai-telegram-integration"
         return {"mode": "developer_bot_starter", "language": language, "project_name": project_name}
+    if mode == "developer_code_archive":
+        language = str(raw_plan.get("language", "python") or "python").strip().lower()
+        if language in {"js", "node", "typescript", "ts"}:
+            language = "javascript"
+        elif language not in {"python", "javascript", "curl"}:
+            language = "python"
+        project_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(raw_plan.get("project_name", "greyai-code-project") or "greyai-code-project")).strip(".-_").lower()[:80] or "greyai-code-project"
+        return {"mode": "developer_code_archive", "language": language, "project_name": project_name}
     if mode == "developer_api_example":
         language = str(raw_plan.get("language", "python") or "python").strip().lower()
         if language in {"js", "node", "typescript", "ts"}:
@@ -2578,7 +2598,7 @@ You are the routing component of GreyAI, a native application-owned Telegram ass
 Translate the user's request into one JSON command. Return JSON only; never Markdown, code, credentials, or extra keys.
 Use this shape:
 {
-  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "download" | "ad_campaign" | "developer_api_example" | "developer_bot_starter" | "unknown",
+  "mode": "chat" | "check" | "search" | "watch" | "schedule" | "download" | "ad_campaign" | "developer_api_example" | "developer_bot_starter" | "developer_code_archive" | "unknown",
   "url": "explicit or safely discovered http or https URL for check/watch/download, or empty string",
   "source_candidates": ["ordered canonical HTTPS fallback URLs, when multiple sources are useful"],
   "discover_url": "true only when resolving a clearly named website is necessary; never invent a URL",
@@ -2607,7 +2627,7 @@ Use mode download for a user-requested artifact when the request includes either
 Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return {"mode":"chat","reply":"..."} and write the complete conversational answer in reply. Leave reply empty for every other mode. Use Grey’s native registry to answer capability or upgrade questions; never claim that Grey is merely Gemini.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
 Use mode check for a one-time live lookup, current-price or availability check, news search, extraction, summary, screenshot, click, type, or session-load pipeline. Requests such as “search for Apple on Google and tell me the iPhone price” are agent tasks even without a literal URL; set discover_url true and resolve a canonical HTTPS search URL. For price, availability, news, profile, or entity-search requests that may require an in-site result click, prefer one `navigate:<goal>` action so Grey can inspect the current page, search, click a relevant read-only result, and extract from the resulting page. For crypto price requests, prefer Google Search first and provide CoinMarketCap as an ordered fallback source when it is allowlisted.
-Use mode schedule for a recurring briefing and put every source URL in urls. Use mode developer_api_example only when the user asks how to integrate GreyAI’s developer API into another bot or application. Use mode developer_bot_starter when the user asks for a complete, full, starter, or repository-ready Telegram bot project using GreyAI; return only the requested language and project name, and let the application generate the files from its verified template. Do not invent an endpoint, base URL, scope, payload, response, or feature: return the exact contract supplied by the native application registry, or return mode unknown. Use mode ad_campaign only when the unquoted outer request clearly asks an administrator to create a bounded advertising campaign; include explicit Telegram target IDs or @usernames, title, ad_text or generate_copy=true with a brief, repeat_count, and interval_seconds. This mode only creates a preview and never posts by itself.
+Use mode schedule for a recurring briefing and put every source URL in urls. Use mode developer_api_example only when the user asks how to integrate GreyAI’s developer API into another bot or application. Use mode developer_bot_starter when the user asks for a complete, full, starter, or repository-ready Telegram bot project using GreyAI; return only the requested language and project name, and let the application generate the files from its verified template. Use mode developer_code_archive only when the user explicitly asks to package, zip, bundle, or download generated code or files; it packages only bounded fenced source from the current authorized chat/reply context and never executes it. Do not invent an endpoint, base URL, scope, payload, response, or feature: return the exact contract supplied by the native application registry, or return mode unknown. Use mode ad_campaign only when the unquoted outer request clearly asks an administrator to create a bounded advertising campaign; include explicit Telegram target IDs or @usernames, title, ad_text or generate_copy=true with a brief, repeat_count, and interval_seconds. This mode only creates a preview and never posts by itself.
 Use condition_type contains only for a literal text match; otherwise use ai.
 Default interval_seconds to 60, never below 30. For ad_campaign, default repeat_count to 1 and interval_seconds to 3600. Default schedule timezone to UTC, days to weekdays, and delivery_mode to combined.
 Do not invent URLs, selectors, identifiers, or actions. If the user names a recognizable website without a URL, resolve only its canonical HTTPS URL and set discover_url true; otherwise return mode unknown. Credentialed login requests are handled outside this prompt and must not be represented here; the application requires explicit user approval before executing one and refuses CAPTCHA, anti-bot, automated-traffic, or access-control bypass requests. Never use model output to grant a role, change a plan, bypass a quota, reveal another user, or execute a side effect; the application validates and enforces those decisions.
@@ -3763,14 +3783,32 @@ def split_telegram_message(text: str, max_length: int = 3900) -> list[str]:
 
 
 _VIEWER_SECRET_PATTERN = re.compile(
-    r"(?i)(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*[^\s,;]+"
+    r"(?i)(api[_-]?key|token|password|secret|authorization)(\s*[:=]\s*)((?:bearer\s+)?[^\s,;]+)"
+)
+_VIEWER_SAFE_PLACEHOLDER_PATTERN = re.compile(
+    r"(?i)^(?:<[^>\n]{1,80}>|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^}\n]{1,120}\}|(?:replace_with|your[_-]|example[_-]|dummy[_-]|redacted)[A-Za-z0-9_.-]*)$"
 )
 _VIEWER_BEARER_PATTERN = re.compile(r"(?i)\b(?:bearer|gai_live|AIza|sk-|ghp-)[A-Za-z0-9._:/+-]{8,}")
 
 
+def _redact_viewer_secret(match: re.Match[str]) -> str:
+    value = match.group(3)
+    prefix = "Bearer " if value.lower().startswith("bearer ") else ""
+    candidate = value[len(prefix):] if prefix else value
+    while candidate and candidate[-1] in "`.)]}>,":
+        if candidate.startswith("<") and candidate[-1] == ">":
+            break
+        candidate = candidate[:-1]
+    if _VIEWER_SAFE_PLACEHOLDER_PATTERN.fullmatch(candidate):
+        return match.group(0)
+    quote = candidate[0] if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {"'", '"', "`"} else ""
+    replacement = f"{quote}[redacted]{quote}" if quote else "[redacted]"
+    return f"{match.group(1)}{match.group(2)}{prefix}{replacement}"
+
+
 def _sanitize_viewer_text(text: str) -> str:
-    """Redact obvious credentials before putting text in ephemeral viewer state."""
-    value = _VIEWER_SECRET_PATTERN.sub(r"\1=[redacted]", str(text or ""))
+    """Redact real credentials while preserving safe copyable placeholders."""
+    value = _VIEWER_SECRET_PATTERN.sub(_redact_viewer_secret, str(text or ""))
     return _VIEWER_BEARER_PATTERN.sub("[redacted]", value)
 
 
@@ -3849,7 +3887,7 @@ def _render_text_viewer_page(viewer_id: str, page_index: int) -> tuple[str, Inli
     viewer = text_viewers[viewer_id]
     pages = viewer["pages"]
     body = str(pages[page_index])
-    header = f"{viewer['title']} — page {page_index + 1}/{len(pages)}\n\n"
+    header = f"{html_escape(str(viewer['title']), quote=False)} — page {page_index + 1}/{len(pages)}\n\n"
     rendered_body = telegram_safe_html(body, max_length=None)
     rendered = header + rendered_body
     if len(rendered) <= TELEGRAM_TEXT_LIMIT:
@@ -3954,6 +3992,40 @@ def telegram_plain_text(text: str) -> str:
     """Remove GreyAI's known HTML tags and decode entities for a final safe fallback."""
     without_tags = re.sub(r"</?(?:b|code|i|s)(?:\s[^>]*)?>", "", str(text or ""), flags=re.IGNORECASE)
     return html_unescape(without_tags)
+
+
+def extract_code_files_from_text(text: str, language: str = "python") -> dict[str, str]:
+    """Extract bounded fenced code blocks into safe, deterministic project files."""
+    source = str(text or "")
+    normalized_language = str(language or "python").strip().lower()
+    extension = {"javascript": "js", "typescript": "ts", "curl": "sh"}.get(normalized_language, "py")
+    matches = list(re.finditer(r"```([A-Za-z0-9_+#.-]*)\n([\s\S]*?)(?:```|$)", source))
+    files: dict[str, str] = {}
+    for index, match in enumerate(matches[:12]):
+        block_language = match.group(1).strip().lower()
+        body = match.group(2).strip("\n")
+        if not body:
+            continue
+        block_extension = {"javascript": "js", "js": "js", "node": "js", "typescript": "ts", "ts": "ts", "python": "py", "py": "py", "json": "json", "bash": "sh", "sh": "sh", "shell": "sh", "text": "txt"}.get(block_language, extension)
+        preceding = source[max(0, match.start() - 180):match.start()]
+        filename_match = re.search(r"(?:file|filename|create|save|name)\s*(?:a\s+)?(?:is|as|:)?\s*`?([A-Za-z0-9_.-]+\.(?:py|js|mjs|cjs|ts|tsx|json|toml|yaml|yml|txt|md|css|html))`?(?:\s+file)?\s*:?\s*$", preceding, flags=re.IGNORECASE)
+        filename = filename_match.group(1) if filename_match else ("main." + block_extension if index == 0 else f"part-{index + 1}.{block_extension}")
+        files[filename] = body
+    return files
+
+
+def latest_generated_code_source(
+    chat_history: list[dict[str, Any]] | None = None,
+    reply_context: dict[str, Any] | None = None,
+) -> str | None:
+    """Return the newest owner-scoped assistant/reply text containing fenced code."""
+    candidates: list[str] = []
+    if reply_context:
+        candidates.append(str(reply_context.get("text") or ""))
+    for turn in reversed(chat_history or []):
+        if str(turn.get("role", "")).lower() == "assistant":
+            candidates.append(str(turn.get("text") or ""))
+    return next((candidate for candidate in candidates if "```" in candidate), None)
 
 
 def mask_sensitive_action(action: str) -> str:
@@ -8128,6 +8200,49 @@ async def _process_natural_language(
             await status_msg.edit_text(f"Your developer request is already open: `{request_id}`.", parse_mode="Markdown")
         return
 
+    if plan and plan.get("mode") == "developer_code_archive":
+        if not is_developer(user_id):
+            await status_msg.edit_text("⛔ An active developer role is required to package generated code. Use /devrequest to ask an administrator for access.")
+            update_operation(operation_id, "denied")
+            log_audit(user_id, "developer_code_archive", None, "DENIED_NOT_DEVELOPER")
+            return
+        source = latest_generated_code_source(chat_history, reply_context)
+        files = extract_code_files_from_text(source or "", plan.get("language", "python"))
+        if not files:
+            await status_msg.edit_text("I couldn’t find a complete fenced code block in the current authorized conversation. Ask Grey to generate the code first, then say: package the code above as a zip.")
+            update_operation(operation_id, "failed")
+            log_audit(user_id, "developer_code_archive", None, "NO_FENCED_SOURCE")
+            return
+        files.setdefault(
+            "README.md",
+            "# Generated GreyAI code archive\n\nThis archive contains inert source extracted from the current authorized GreyAI conversation. Review and test it before running. No Telegram token, API key, cookie, or saved session is included.\n",
+        )
+        artifact_dir = tempfile.mkdtemp(prefix="greyai-code-archive-")
+        try:
+            archive_path = build_code_archive(plan.get("project_name", "greyai-code-project"), files, output_dir=artifact_dir)
+            await status_msg.edit_text(f"✅ I’m packaging {len(files)} validated source files. The archive is inert and contains no credentials.")
+            with archive_path.open("rb") as artifact:
+                document = await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(artifact, filename=archive_path.name),
+                    caption="✅ Generated code archive attached. Review and test it before running. No Telegram token, API key, cookie, or saved session is included.",
+                )
+            schedule_ephemeral_message(context, document, delay_seconds=DEVELOPER_ARTIFACT_TTL_SECONDS)
+            update_operation(operation_id, "succeeded")
+            log_audit(user_id, "developer_code_archive", None, "SUCCESS")
+        except ValueError as exc:
+            update_operation(operation_id, "failed")
+            log_audit(user_id, "developer_code_archive", None, f"VALIDATION_FAILED_{type(exc).__name__}")
+            await status_msg.edit_text("⚠️ GreyAI found unsafe, unsupported, secret-bearing, or syntactically invalid source and did not create the archive. The code was not executed.")
+        except Exception:
+            update_operation(operation_id, "failed")
+            log_audit(user_id, "developer_code_archive", None, "DELIVERY_FAILED")
+            logger.exception("developer_code_archive_delivery_failed user_id=%s", user_id)
+            await status_msg.edit_text("⚠️ I couldn’t deliver the code archive this time. No source was executed and no key was exposed.")
+        finally:
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+        return
+
     if plan and plan.get("mode") == "developer_bot_starter":
         if not is_developer(user_id):
             await status_msg.edit_text("⛔ An active developer role is required to generate a GreyAI integration starter. Use /devrequest to ask an administrator for access.")
@@ -9275,6 +9390,7 @@ def build_help_sections(user_id: int | None = None) -> list[tuple[str, str]]:
             "/devkeys — View labeled key metadata without secrets",
             "/revokekey <key_id> — Revoke an owned key",
             "/developerstats — View key usage and denied events",
+            "Ask Grey for a complete code example, then say ‘package the code above as a zip’ to receive a validated inert source archive.",
             "Use POST /api/v1/check with Authorization: Bearer <key> from another authorized Telegram bot.",
             "Never send an API secret again after copying it. If a key is exposed, revoke it immediately.",
         ))))

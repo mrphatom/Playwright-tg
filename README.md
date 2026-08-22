@@ -71,9 +71,13 @@ GreyAI is a fast Telegram assistant for ordinary conversation and authorized web
 
 ### Information and permissions
 
-Free accounts receive the configured base quota. Pro and Max plans are purchased with Telegram Stars and provide 1,000 and 5,000 monthly execution units respectively. Active administrators can use administrator and developer capabilities. Ordinary users can request developer access with `/devrequest`; only an administrator can approve it. Developer API keys are scoped, rate-limited, owner-bound, hashed at rest, revocable, and never shown in listings.
+Free accounts receive the configured base quota. Pro and Max plans are purchased with Telegram Stars and provide 1,000 and 5,000 monthly execution units respectively. Active administrators can use administrator and developer capabilities. Ordinary users can request developer access with `/devrequest`; only an administrator can approve it. Developer API keys are scoped, rate-limited, owner-bound, hashed at rest, revocable, and never shown in listings. Developer API examples are delivered as Telegram-compatible Markdown, so headings, inline code, and fenced code remain copyable rather than appearing as literal HTML tags.
 
 When a new key is created, GreyAI sends a separate, clearly labeled message containing the key ID, label, scope, rate limit, and secret. That one-time message self-deletes after the configured copy window, which defaults to 90 seconds and is bounded between 30 and 300 seconds. The secret is not stored in plaintext and is never displayed again. If the message is exposed, revoke the key immediately with `/revokekey <key_id>` and create a replacement.
+
+### Generated code archives
+
+Developers can ask GreyAI for a complete code example and then say “package the code above as a zip.” Grey extracts only bounded fenced source from the current authorized conversation, validates safe relative paths, rejects recognized credentials, rejects invalid Python syntax, creates an inert ZIP, and sends it as a Telegram document. The archive is never executed and does not include Telegram tokens, GreyAI keys, cookies, or saved sessions. The dedicated GreyAI Telegram integration starter remains available separately and continues to use its verified fixed template.
 
 ### User commands
 

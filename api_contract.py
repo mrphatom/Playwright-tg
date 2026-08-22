@@ -1,4 +1,3 @@
-"""Authoritative public developer API contract used by the dashboard and GreyAI explanations."""
 from __future__ import annotations
 
 import json
@@ -82,16 +81,17 @@ def developer_api_contract(base_url: str | None = None) -> dict[str, Any]:
 
 
 def format_developer_api_example(language: str = "python", base_url: str | None = None) -> str:
-    """Return a short, exact integration example for the currently shipped check API."""
+    """Return a short, Telegram-compatible Markdown integration example."""
     language = str(language or "python").strip().lower()
     base = _base_url(base_url)
     endpoint = f"{base}/api/v1/check"
     if language in {"javascript", "js", "node", "typescript", "ts"}:
         return (
-            "<b>GreyAI Developer API — JavaScript</b>\n\n"
-            "The shipped API currently exposes one bearer-key operation: <code>POST /api/v1/check</code>. "
-            "Your key needs the <code>check</code> scope.\n\n"
-            "<pre><code>const response = await fetch("
+            "**GreyAI Developer API — JavaScript**\n\n"
+            "The shipped API currently exposes one bearer-key operation: `POST /api/v1/check`. "
+            "Your key needs the `check` scope.\n\n"
+            "```javascript\n"
+            "const response = await fetch("
             f"{json.dumps(endpoint)}, {{\n"
             "  method: \"POST\",\n"
             "  headers: {\n"
@@ -105,24 +105,29 @@ def format_developer_api_example(language: str = "python", base_url: str | None 
             "});\n\n"
             "if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);\n"
             "const result = await response.json();\n"
-            "console.log(result.extracted);</code></pre>\n\n"
-            "Only the <code>check</code> scope is enabled currently. Watchers, sessions, login, form filling, and arbitrary Telegram actions are not bearer-key API endpoints."
+            "console.log(result.extracted);\n"
+            "```\n\n"
+            "Only the `check` scope is enabled currently. Watchers, sessions, login, form filling, and arbitrary Telegram actions are not bearer-key API endpoints."
         )
     if language == "curl":
         return (
-            "<b>GreyAI Developer API — curl</b>\n\n"
-            "<pre><code>curl -X POST "
+            "**GreyAI Developer API — curl**\n\n"
+            "```bash\n"
+            "curl -X POST "
             f"{endpoint} "
             "\\\n  -H \"Authorization: Bearer $GREY_API_KEY\" "
             "\\\n  -H \"Content-Type: application/json\" "
-            "\\\n  -d '{\"url\":\"https://example.com\",\"extract\":\"Summarize the important facts on this page.\"}'</code></pre>\n\n"
-            "The response contains <code>ok</code>, <code>operation_id</code>, <code>title</code>, <code>url</code>, and bounded <code>extracted</code> text."
+            "\\\n  -d '{\"url\":\"https://example.com\",\"extract\":\"Summarize the important facts on this page.\"}'\n"
+            "```\n\n"
+            "The response contains `ok`, `operation_id`, `title`, `url`, and bounded `extracted` text."
         )
     return (
-        "<b>GreyAI Developer API — Python</b>\n\n"
-        "The shipped API currently exposes one bearer-key operation: <code>POST /api/v1/check</code>. "
-        "Use the exact header <code>Authorization: Bearer &lt;developer_api_key&gt;</code>. Generate a developer key with the <code>check</code> scope, store it in your bot’s secret manager, and never hard-code it.\n\n"
-        "<pre><code>import os\nimport requests\n\n"
+        "**GreyAI Developer API — Python**\n\n"
+        "The shipped API currently exposes one bearer-key operation: `POST /api/v1/check`. "
+        "Use the exact header `Authorization: Bearer <developer_api_key>`. Generate a developer key with the `check` scope, store it in your bot’s secret manager, and never hard-code it.\n\n"
+        "```python\n"
+        "import os\n"
+        "import requests\n\n"
         f"endpoint = {endpoint!r}\n"
         "headers = {\n"
         "    \"Authorization\": f\"Bearer {os.environ['GREY_API_KEY']}\",\n"
@@ -135,6 +140,7 @@ def format_developer_api_example(language: str = "python", base_url: str | None 
         "response = requests.post(endpoint, json=payload, headers=headers, timeout=100)\n"
         "response.raise_for_status()\n"
         "result = response.json()\n"
-        "print(result[\"extracted\"])</code></pre>\n\n"
+        "print(result[\"extracted\"])\n"
+        "```\n\n"
         "Grey applies the developer account quota, per-key rate limit, HTTPS/domain allowlist, SSRF, queue, timeout, and maintenance controls. The current API does not expose watchers, sessions, login, form filling, screenshots, or arbitrary Telegram actions through bearer keys."
     )

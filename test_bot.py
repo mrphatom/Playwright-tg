@@ -5112,3 +5112,141 @@ def test_native_next_step_decision_is_bounded_and_context_aware():
     )
     assert continuation["next_step"] == "continue_prior_operation_after_revalidation"
     assert "https://example.com" not in json.dumps(continuation)
+
+
+def test_developer_api_example_is_markdown_safe_for_shared_delivery():
+    import bot
+
+    example = bot.format_developer_api_example("python")
+    rendered = bot.telegram_safe_html(bot._sanitize_viewer_text(example), max_length=None)
+    assert "&lt;b&gt;" not in rendered
+    assert "<b>GreyAI Developer API" in rendered
+    assert "Authorization: Bearer" in bot.telegram_plain_text(bot._sanitize_viewer_text(example))
+    assert "<developer_api_key>" in bot.telegram_plain_text(bot._sanitize_viewer_text(example))
+
+
+def test_shared_viewer_keeps_copyable_safe_placeholders_intact():
+    import bot
+
+    sanitized = bot._sanitize_viewer_text("Authorization: Bearer <developer_api_key>\nGREY_API_KEY=$GREY_API_KEY")
+    assert "Authorization: Bearer <developer_api_key>" in sanitized
+    assert "GREY_API_KEY=$GREY_API_KEY" in sanitized
+
+
+def test_extract_code_files_from_generated_answer_is_bounded_and_named():
+    import bot
+
+    answer = (
+        "Create a main.py file:\n\n"
+        "```python\nprint('hello')\n```\n\n"
+        "Create a package.json file:\n\n"
+        "```json\n{\"name\": \"demo\"}\n```"
+    )
+    files = bot.extract_code_files_from_text(answer, "python")
+    assert files == {"main.py": "print('hello')", "package.json": "{\"name\": \"demo\"}"}
+
+
+def test_generic_code_archive_is_secret_free_and_path_safe(tmp_path):
+    from starter_templates import build_code_archive
+
+    archive_path = build_code_archive(
+        "generated-project",
+        {"main.py": "print('ok')", "README.md": "Generated source only."},
+        output_dir=tmp_path,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        assert set(archive.namelist()) == {"generated-project/main.py", "generated-project/README.md"}
+
+    with pytest.raises(ValueError, match="unsafe_code_archive_path"):
+        build_code_archive("generated-project", {"../escape.py": "bad"}, output_dir=tmp_path)
+    with pytest.raises(ValueError, match="code_archive_secret_detected"):
+        build_code_archive("generated-project", {"main.py": "TOKEN = 'gai_live.secret-value-123456'"}, output_dir=tmp_path)
+
+
+def test_management_parser_recognizes_explicit_code_archive_request():
+    import bot
+
+    plan = bot.parse_deterministic_management_request(
+        "Package the code above as a zip named mcp-server"
+    )
+    assert plan == {
+        "mode": "developer_code_archive",
+        "language": "python",
+        "project_name": "mcp-server",
+    }
+
+
+def test_natural_language_code_archive_delivers_document_from_prior_reply(monkeypatch):
+    import bot
+
+    class FakeStatus:
+        message_id = 900
+
+        def __init__(self):
+            self.edits = []
+
+        async def edit_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+
+    class FakeSource:
+        text = "Package the code above as a zip named mcp-server"
+        caption = None
+        chat_id = 123
+        message_id = 899
+
+        def __init__(self):
+            self.status = FakeStatus()
+
+        async def reply_text(self, text, **kwargs):
+            self.status.edits.append((text, kwargs))
+            return self.status
+
+    class FakeBot:
+        def __init__(self):
+            self.documents = []
+
+        async def send_document(self, **kwargs):
+            self.documents.append(kwargs)
+            return SimpleNamespace(message_id=901)
+
+    source = FakeSource()
+    fake_bot = FakeBot()
+    update = SimpleNamespace(
+        business_message=None,
+        message=source,
+        channel_post=None,
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_user=SimpleNamespace(id=6411860985),
+    )
+    context = SimpleNamespace(bot=fake_bot)
+
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "classify_message_route", lambda _request: "task")
+    monkeypatch.setattr(bot, "parse_natural_language_intent", lambda *args, **kwargs: asyncio.sleep(0, result={"mode": "developer_code_archive", "language": "python", "project_name": "mcp-server"}))
+    monkeypatch.setattr(bot, "is_developer", lambda _user_id: True)
+    monkeypatch.setattr(bot, "load_chat_history", lambda *_args, **_kwargs: [{"role": "assistant", "text": "Here is the code:\n\n```python\nprint('ok')\n```"}])
+    monkeypatch.setattr(bot, "build_native_grey_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bot, "create_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "update_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "record_contact_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "schedule_ephemeral_message", lambda *args, **kwargs: None)
+
+    asyncio.run(bot._process_natural_language(update, context))
+
+    assert len(fake_bot.documents) == 1
+    assert fake_bot.documents[0]["chat_id"] == 123
+    assert fake_bot.documents[0]["document"].filename == "mcp-server.zip"
+    assert "No Telegram token" in fake_bot.documents[0]["caption"]
+
+
+def test_shared_viewer_escapes_title_markup_without_breaking_page():
+    import bot
+
+    viewer_id = bot.create_text_viewer(42, "safe content", title="<script>bad</script>")
+    rendered, markup, parse_mode = bot._render_text_viewer_page(viewer_id, 0)
+    assert "&lt;script&gt;bad&lt;/script&gt;" in rendered
+    assert "<script>" not in rendered
+    assert parse_mode == "HTML"
+    assert not markup.inline_keyboard

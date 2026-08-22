@@ -1,6 +1,7 @@
 """Verified starter repositories for integrating GreyAI into another Telegram bot."""
 from __future__ import annotations
 
+import ast
 import re
 import zipfile
 from pathlib import Path
@@ -142,5 +143,77 @@ def build_telegram_bot_starter_archive(
     files = _python_files(safe_name, public_base)
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for relative_path, content in files.items():
+            archive.writestr(f"{safe_name}/{relative_path}", content)
+    return target
+
+
+_ALLOWED_CODE_ARCHIVE_SUFFIXES = {
+    ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".json", ".toml", ".yaml", ".yml",
+    ".txt", ".md", ".css", ".html", ".sh", ".env.example", ".gitignore",
+}
+_MAX_CODE_ARCHIVE_FILES = 24
+_MAX_CODE_ARCHIVE_FILE_BYTES = 120_000
+_MAX_CODE_ARCHIVE_TOTAL_BYTES = 500_000
+_REAL_SECRET_PATTERNS = (
+    re.compile(r"\b\d{9,10}:[A-Za-z0-9_-]{30,}\b"),
+    re.compile(r"\b(?:gai_live|AIza|sk-|ghp-)[A-Za-z0-9._:/+-]{12,}\b"),
+)
+
+
+def _safe_code_archive_path(raw_path: str) -> str:
+    value = str(raw_path or "").replace("\\", "/").strip().lstrip("/")
+    parts = [part for part in value.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("unsafe_code_archive_path")
+    relative = "/".join(parts)
+    suffix = Path(relative).suffix.lower()
+    if suffix not in _ALLOWED_CODE_ARCHIVE_SUFFIXES and not relative.endswith(".env.example"):
+        raise ValueError("unsupported_code_archive_file")
+    return relative[:160]
+
+
+def validate_code_archive_files(files: dict[str, str]) -> dict[str, str]:
+    """Validate generated source as inert text before it is placed in a ZIP."""
+    if not isinstance(files, dict) or not files:
+        raise ValueError("code_archive_empty")
+    if len(files) > _MAX_CODE_ARCHIVE_FILES:
+        raise ValueError("code_archive_too_many_files")
+    safe_files: dict[str, str] = {}
+    total_bytes = 0
+    for raw_path, raw_content in files.items():
+        path = _safe_code_archive_path(raw_path)
+        content = str(raw_content or "")
+        encoded_size = len(content.encode("utf-8"))
+        if encoded_size > _MAX_CODE_ARCHIVE_FILE_BYTES:
+            raise ValueError("code_archive_file_too_large")
+        if any(pattern.search(content) for pattern in _REAL_SECRET_PATTERNS):
+            raise ValueError("code_archive_secret_detected")
+        if path.endswith(".py"):
+            try:
+                ast.parse(content, filename=path)
+            except SyntaxError as exc:
+                raise ValueError("code_archive_python_syntax") from exc
+        total_bytes += encoded_size
+        if total_bytes > _MAX_CODE_ARCHIVE_TOTAL_BYTES:
+            raise ValueError("code_archive_total_too_large")
+        if path in safe_files:
+            raise ValueError("code_archive_duplicate_path")
+        safe_files[path] = content
+    return safe_files
+
+
+def build_code_archive(
+    project_name: str | None,
+    files: dict[str, str],
+    output_dir: str | Path | None = None,
+) -> Path:
+    """Build a validated inert source archive; never executes generated files."""
+    safe_name = _safe_project_name(project_name or "greyai-code-project")
+    safe_files = validate_code_archive_files(files)
+    target_dir = Path(output_dir) if output_dir is not None else Path.cwd()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{safe_name}.zip"
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for relative_path, content in safe_files.items():
             archive.writestr(f"{safe_name}/{relative_path}", content)
     return target
