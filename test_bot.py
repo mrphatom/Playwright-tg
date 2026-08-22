@@ -2230,6 +2230,59 @@ def test_unified_chat_reply_avoids_second_model_round_trip(monkeypatch):
     assert "next useful thing" in message.sent[0][0]
 
 
+def test_plain_private_chat_skips_agent_interpreter_and_thinking_message(monkeypatch):
+    import bot
+
+    class FakeOutgoing:
+        message_id = 1204
+
+    class FakeMessage:
+        text = "Cool"
+        caption = None
+        chat_id = 7801
+        message_id = 1205
+        business_connection_id = None
+
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kwargs):
+            outgoing = FakeOutgoing()
+            self.sent.append((text, kwargs, outgoing))
+            return outgoing
+
+    source = FakeMessage()
+    update = SimpleNamespace(
+        message=source,
+        business_message=None,
+        channel_post=None,
+        effective_message=source,
+        effective_chat=SimpleNamespace(id=source.chat_id, type="private"),
+        effective_user=SimpleNamespace(id=42),
+        update_id=1205,
+    )
+
+    async def fail_interpreter(*args, **kwargs):
+        raise AssertionError("plain private chat should not enter the agent interpreter")
+
+    async def fast_reply(*args, **kwargs):
+        return "A direct chat reply."
+
+    monkeypatch.setattr(bot, "private_chat_micro_reply", lambda _text: None)
+    monkeypatch.setattr(bot, "classify_message_route", lambda _text: "chat")
+    monkeypatch.setattr(bot, "parse_natural_language_intent", fail_interpreter)
+    monkeypatch.setattr(bot, "generate_chat_reply", fast_reply)
+    monkeypatch.setattr(bot, "record_contact_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "load_chat_history", lambda *args, **kwargs: [])
+
+    asyncio.run(bot._process_natural_language(update, SimpleNamespace()))
+
+    assert len(source.sent) == 1
+    assert source.sent[0][0] == "A direct chat reply."
+
+
 def test_slow_unified_interpreter_shows_thinking_feedback_and_reuses_message(monkeypatch):
     import bot
 
@@ -2311,6 +2364,9 @@ def test_private_chat_micro_replies_handle_short_social_turns_without_provider()
     assert bot.private_chat_micro_reply("Fuck you")
     assert bot.private_chat_micro_reply("cry")
     assert bot.private_chat_micro_reply("Thanks") == "Anytime."
+    assert bot.private_chat_micro_reply("Cool") == "Nice."
+    assert bot.private_chat_micro_reply("Talk?") == "I’m listening."
+    assert bot.private_chat_micro_reply("Good to know") == "Glad it helps."
     assert bot.private_chat_micro_reply("Search for Apple on Google and tell me the current price") is None
 
 
@@ -4942,6 +4998,74 @@ def test_manual_challenge_actions_are_bounded_and_script_free():
     finally:
         bot.manual_challenges.pop(token, None)
 
+
+
+def test_manual_challenge_action_activates_live_page_and_reports_unavailable_page():
+    import bot
+
+    class FakeMouse:
+        async def click(self, _x, _y):
+            return None
+
+    class FakeKeyboard:
+        async def press(self, _key):
+            return None
+
+        async def type(self, _text, delay=0):
+            return None
+
+    class FakePage:
+        def __init__(self):
+            self.mouse = FakeMouse()
+            self.keyboard = FakeKeyboard()
+            self.front_count = 0
+
+        async def bring_to_front(self):
+            self.front_count += 1
+
+    token = "active-page-token"
+    page = FakePage()
+    bot.manual_challenges[token] = {
+        "user_id": 42,
+        "operation_id": "op_active_page",
+        "page": page,
+        "challenge_kind": "captcha",
+        "created_at": bot.time.monotonic(),
+        "expires_at": bot.time.monotonic() + 60,
+        "status": "waiting",
+        "event": asyncio.Event(),
+        "lock": asyncio.Lock(),
+        "actions": [],
+        "action_window_started": bot.time.monotonic(),
+    }
+    try:
+        assert asyncio.run(bot.manual_challenge_action(token, {"type": "click", "x": 12, "y": 34})) == (True, "ok")
+        assert page.front_count == 1
+    finally:
+        bot.manual_challenges.pop(token, None)
+
+    class BrokenPage(FakePage):
+        async def bring_to_front(self):
+            raise RuntimeError("closed page")
+
+    broken_token = "broken-page-token"
+    bot.manual_challenges[broken_token] = {
+        "user_id": 42,
+        "operation_id": "op_broken_page",
+        "page": BrokenPage(),
+        "challenge_kind": "captcha",
+        "created_at": bot.time.monotonic(),
+        "expires_at": bot.time.monotonic() + 60,
+        "status": "waiting",
+        "event": asyncio.Event(),
+        "lock": asyncio.Lock(),
+        "actions": [],
+        "action_window_started": bot.time.monotonic(),
+    }
+    try:
+        assert asyncio.run(bot.manual_challenge_action(broken_token, {"type": "click", "x": 12, "y": 34})) == (False, "live_page_unavailable")
+    finally:
+        bot.manual_challenges.pop(broken_token, None)
 
 
 def test_manual_challenge_handoff_pauses_and_resumes_after_user_completion(monkeypatch):

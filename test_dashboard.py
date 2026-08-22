@@ -242,6 +242,18 @@ def test_dashboard_inline_script_receives_a_request_scoped_csp_nonce(monkeypatch
     assert "nonce=\"" in response.text
 
 
+def test_manual_handoff_ui_supports_zoomable_live_view_and_safe_input_focus():
+    html = dashboard.MANUAL_CHALLENGE_HTML
+
+    assert 'id="screen-wrap"' in html
+    assert 'id="zoom-in"' in html
+    assert 'id="zoom-out"' in html
+    assert 'id="zoom-reset"' in html
+    assert "screen.style.width" in html
+    assert "e.target===input" in html
+    assert "Click sent; refreshing live page" in html
+
+
 def test_dashboard_registers_manual_challenge_handoff_routes(dashboard_db):
     paths = {resource.canonical for resource in dashboard.create_dashboard_app().router.resources()}
     assert "/challenge/{token}" in paths

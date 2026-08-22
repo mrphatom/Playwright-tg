@@ -2975,7 +2975,8 @@ def is_standalone_private_social_turn(user_text: str) -> bool:
         return False
     return bool(re.fullmatch(
         r"(?:how(?:'s| is| are) you|how do you feel|i(?:'m| am|m) (?:okay|ok|fine|good|alright|great|doing well)|"
-        r"huh|huh\?|what\?|come again|sorry\?|wait\??)[!.? ]*",
+        r"huh|huh\?|what\?|come again|sorry\?|wait\??|cool|nice|alright then|okay then|talk|you there\?|"
+        r"good to know|that's good|that is good)[!.? ]*",
         text,
     ))
 
@@ -3236,6 +3237,12 @@ def private_chat_micro_reply(user_text: str) -> str | None:
         return "I’m here. What should I clarify?"
     if re.fullmatch(r"(?:thanks|thank you|thx|cheers)[!. ]*", text):
         return "Anytime."
+    if re.fullmatch(r"(?:cool|nice|alright then|okay then)[!. ]*", text):
+        return "Nice."
+    if re.fullmatch(r"(?:talk|talk\?|you there\?)[!. ]*", text):
+        return "I’m listening."
+    if re.fullmatch(r"(?:good to know|that's good|that is good)[!. ]*", text):
+        return "Glad it helps."
     if re.fullmatch(r"(?:good night|gn|night)[!. ]*", text):
         return "Night. Try not to start another browser mission at 2 a.m."
     if re.fullmatch(r"(?:cry|i am crying|i'm crying|im crying)[!. ]*", text):
@@ -5189,7 +5196,7 @@ async def manual_challenge_action(token: str, action: dict[str, Any]) -> tuple[b
                 return False, "invalid_coordinates"
             if not (0 <= x <= 1280 and 0 <= y <= 900):
                 return False, "coordinates_out_of_bounds"
-            await page.mouse.click(x, y)
+            browser_action = lambda: page.mouse.click(x, y)
         elif kind == "scroll":
             try:
                 delta = float(action.get("delta", 0))
@@ -5197,19 +5204,28 @@ async def manual_challenge_action(token: str, action: dict[str, Any]) -> tuple[b
                 return False, "invalid_scroll"
             if not (-1200 <= delta <= 1200):
                 return False, "scroll_out_of_bounds"
-            await page.mouse.wheel(0, delta)
+            browser_action = lambda: page.mouse.wheel(0, delta)
         elif kind == "key":
             key = str(action.get("key", ""))
             if key not in {"Enter", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Backspace"}:
                 return False, "key_not_allowed"
-            await page.keyboard.press(key)
+            browser_action = lambda: page.keyboard.press(key)
         elif kind == "type":
             value = str(action.get("text", ""))
             if not value or len(value) > 128:
                 return False, "text_length_invalid"
-            await page.keyboard.type(value, delay=20)
+            browser_action = lambda: page.keyboard.type(value, delay=20)
         else:
             return False, "action_not_allowed"
+        try:
+            bring_to_front = getattr(page, "bring_to_front", None)
+            if bring_to_front is not None:
+                await bring_to_front()
+            await browser_action()
+        except Exception:
+            runtime_metrics["manual_challenge_failures"] += 1
+            logger.warning("manual_challenge_action_failed", exc_info=True)
+            return False, "live_page_unavailable"
         record["actions"].append(kind)
     return True, "ok"
 
@@ -8216,9 +8232,31 @@ async def _process_natural_language(
             log_audit(user_id, "chat", None, "SUCCESS_MICRO_REPLY")
             return
 
+    route_hint = classify_message_route(request_text)
+    if private_chat and is_standalone_private_social_turn(request_text):
+        reply = await generate_chat_reply(
+            chat_id,
+            request_text,
+            private_chat=True,
+            owner_user_id=user_id,
+            reply_context=reply_context,
+        )
+        sent_reply = await deliver_text_response(source_message, reply, user_id, title="GreyAI chat")
+        remember_chat_turn(
+            chat_id,
+            request_text,
+            reply,
+            user_id,
+            getattr(source_message, "message_id", None),
+            reply_to_message_id,
+            business_connection_id,
+            getattr(sent_reply, "message_id", None),
+        )
+        log_audit(user_id, "chat", None, "SUCCESS_FAST_ROUTE")
+        return
+
     progress_state: dict[str, Any] = {}
     progress_task = asyncio.create_task(_send_delayed_thinking_feedback(source_message, progress_state))
-    route_hint = classify_message_route(request_text)
     durable_history = load_chat_history(user_id, chat_id, CHAT_CONTEXT_TURNS)
     chat_history: list[dict[str, str]] = durable_history or chat_histories.get(_chat_history_key(user_id, chat_id), [])
     native_context = build_native_grey_context(
