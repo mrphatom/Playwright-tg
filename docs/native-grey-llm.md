@@ -88,7 +88,12 @@ Every text, media, inline, group, channel, business, command, and Agentic model 
     "text": "untrusted user input",
     "media_interpretation": null,
     "untrusted_blocks": [],
-    "correlation_id": "operation or request identifier"
+    "operation_id": "operation or request identifier",
+    "next_step": {
+      "next_step": "respond_conversationally_or_clarify | prepare_agent_plan | continue_prior_operation_after_revalidation | execute_only_after_application_validation",
+      "reason_codes": [],
+      "requires_fresh_policy_check": true
+    }
   }
 }
 ```
@@ -108,7 +113,7 @@ The user-facing abstraction is one Grey conversation. The native router may inte
 7. Feed the receipt back into the next native Grey context so failover keys, restarts, and follow-up messages preserve continuity.
 8. Use chat generation only for conversation, explanation, clarification, or a post-execution summary.
 
-The model may suggest a route or plan, but it cannot grant itself capabilities, bypass a gate, or claim a side effect that the executor did not record.
+The application may include a bounded `request.next_step` hint such as `prepare_agent_plan` or `continue_prior_operation_after_revalidation`. This is an explainable planning signal only; it never authorizes an action, replaces structured intent validation, or skips a fresh policy check. The model may suggest a route or plan, but it cannot grant itself capabilities, bypass a gate, or claim a side effect that the executor did not record.
 
 ## User and Owner Awareness
 

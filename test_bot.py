@@ -5030,3 +5030,85 @@ def test_long_search_result_reaches_shared_viewer_without_upstream_cutoff():
     callback = message.sent[0][1]["reply_markup"].inline_keyboard[0][0].callback_data
     viewer_id = callback.split(":")[1]
     assert "detail-" * 900 in "".join(bot.text_viewers[viewer_id]["pages"])
+
+
+def test_long_developer_api_example_uses_shared_viewer(monkeypatch):
+    import bot
+
+    class FakeStatus:
+        def __init__(self):
+            self.edits = []
+            self.message_id = 900
+
+        async def edit_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+
+    class FakeSource:
+        text = "How do I connect my MCP server?"
+        caption = None
+        message_id = 899
+
+        def __init__(self):
+            self.status = FakeStatus()
+
+        async def reply_text(self, text, **kwargs):
+            return self.status
+
+    source = FakeSource()
+    update = SimpleNamespace(
+        business_message=None,
+        message=source,
+        channel_post=None,
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_user=SimpleNamespace(id=6411860985),
+    )
+
+    monkeypatch.setattr(bot, "resolve_contextual_watcher_followup", lambda *args: None)
+    monkeypatch.setattr(bot, "classify_message_route", lambda request: "task")
+    async def fake_parse_intent(*args, **kwargs):
+        return {"mode": "developer_api_example", "language": "python"}
+
+    monkeypatch.setattr(bot, "parse_natural_language_intent", fake_parse_intent)
+    monkeypatch.setattr(bot, "is_developer", lambda _user_id: True)
+    monkeypatch.setattr(bot, "format_developer_api_example", lambda *args, **kwargs: "```python\n" + ("<code>" * 1200) + "\n```" )
+    monkeypatch.setattr(bot, "create_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "update_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *args, **kwargs: None)
+
+    asyncio.run(bot._process_natural_language(update, SimpleNamespace()))
+
+    assert source.status.edits
+    rendered, options = source.status.edits[-1]
+    assert options["reply_markup"].inline_keyboard
+    assert "page 1/" in rendered
+
+
+def test_code_heavy_viewer_pages_remain_renderable_without_loss():
+    import bot
+
+    source = ("<tag attr='value'>" * 700) + "\nEND"
+    viewer_id = bot.create_text_viewer(42, source, title="MCP code example")
+    assert "".join(bot.text_viewers[viewer_id]["pages"]) == source
+    for index in range(len(bot.text_viewers[viewer_id]["pages"])):
+        rendered, _markup, parse_mode = bot._render_text_viewer_page(viewer_id, index)
+        assert len(rendered) <= bot.TELEGRAM_TEXT_LIMIT
+        assert parse_mode == "HTML"
+
+
+def test_native_next_step_decision_is_bounded_and_context_aware():
+    import bot
+
+    chat_decision = bot.derive_native_next_step("Explain how HTTP works", "interpreter")
+    assert chat_decision["next_step"] == "respond_conversationally_or_clarify"
+
+    web_decision = bot.derive_native_next_step("What is Bitcoin worth right now?", "interpreter")
+    assert web_decision["next_step"] == "prepare_agent_plan"
+
+    continuation = bot.derive_native_next_step(
+        "continue with that",
+        "interpreter",
+        {"text": "GreyAI completed a browser extraction from https://example.com."},
+    )
+    assert continuation["next_step"] == "continue_prior_operation_after_revalidation"
+    assert "https://example.com" not in json.dumps(continuation)

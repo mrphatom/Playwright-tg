@@ -325,6 +325,7 @@ PROGRESS_FEEDBACK_DELAY_SECONDS = max(0.5, min(3.0, float(os.getenv("PROGRESS_FE
 TEXT_VIEWER_TTL_SECONDS = max(60, min(3600, int(os.getenv("TEXT_VIEWER_TTL_SECONDS", "900"))))
 TEXT_VIEWER_MAX_ACTIVE = max(16, min(2000, int(os.getenv("TEXT_VIEWER_MAX_ACTIVE", "256"))))
 TEXT_VIEWER_BODY_LENGTH = max(1200, min(3600, int(os.getenv("TEXT_VIEWER_BODY_LENGTH", "3300"))))
+TEXT_VIEWER_HEADER_RESERVE = 160
 TELEGRAM_TEXT_LIMIT = 3900
 CRYPTO_CHECKOUT_URL = os.getenv("CRYPTO_CHECKOUT_URL")
 DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "")
@@ -1086,6 +1087,41 @@ def _native_context_contact_summary(user_id: int, chat_id: int) -> dict[str, Any
     return {"recent_count": min(len(rows), 12), "interaction_types": kinds}
 
 
+def derive_native_next_step(
+    request_text: str,
+    mode: str,
+    reply_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return bounded, explainable next-step guidance; never execute or authorize work."""
+    lowered = str(request_text or "").lower()
+    replied_text = str((reply_context or {}).get("text") or "").lower()
+    continuation = bool(re.search(r"\b(?:continue|proceed|go\s+ahead|try\s+again|do\s+it|open\s+that|check\s+that|use\s+that|next)\b", lowered))
+    prior_operation = bool(re.search(r"https?://|\b(?:browser|webpage|website|operation|watcher|extraction|screenshot|source)\b", replied_text))
+    if continuation and prior_operation:
+        return {
+            "next_step": "continue_prior_operation_after_revalidation",
+            "reason_codes": ["continuation_request", "prior_operation_reply"],
+            "requires_fresh_policy_check": True,
+        }
+    if str(mode or "").lower() in {"command", "agent", "api"}:
+        return {
+            "next_step": "execute_only_after_application_validation",
+            "reason_codes": ["explicit_application_surface"],
+            "requires_fresh_policy_check": True,
+        }
+    if classify_message_route(request_text) == "task":
+        return {
+            "next_step": "prepare_agent_plan",
+            "reason_codes": ["supported_operational_signal"],
+            "requires_fresh_policy_check": True,
+        }
+    return {
+        "next_step": "respond_conversationally_or_clarify",
+        "reason_codes": ["no_supported_operational_signal"],
+        "requires_fresh_policy_check": False,
+    }
+
+
 def build_native_grey_context(
     user_id: int,
     chat_id: int,
@@ -1138,6 +1174,7 @@ def build_native_grey_context(
     }
     if is_developer_user:
         grey_view["developer_api_contract"] = developer_api_contract(DASHBOARD_BASE_URL)
+    next_step = derive_native_next_step(request_text, mode, reply_context)
     return {
         "schema": GREY_NATIVE_CONTEXT_SCHEMA,
         "grey": grey_view,
@@ -1190,6 +1227,7 @@ def build_native_grey_context(
             "character_count": min(len(str(request_text or "")), 12000),
             "media_kind": str(media_kind or "")[:20] or None,
             "operation_id": str(operation_id or "")[:40] or None,
+            "next_step": next_step,
             "untrusted_blocks": ["user_request", "reply_context", "conversation_history", "webpage_data", "media_interpretation"],
         },
     }
@@ -3744,6 +3782,40 @@ def _cleanup_text_viewers() -> None:
             runtime_metrics["text_viewer_expired"] += 1
 
 
+def _split_renderable_viewer_pages(text: str) -> list[str]:
+    """Split redacted source text so every rendered page fits without loss."""
+    source = str(text or "")
+    if not source:
+        return [""]
+    render_limit = max(512, TELEGRAM_TEXT_LIMIT - TEXT_VIEWER_HEADER_RESERVE)
+    pages: list[str] = []
+    start = 0
+
+    def fits(end: int) -> bool:
+        return len(telegram_safe_html(source[start:end], max_length=None)) <= render_limit
+
+    while start < len(source):
+        upper = min(len(source), start + TEXT_VIEWER_BODY_LENGTH)
+        if fits(upper):
+            end = upper
+        else:
+            low, high = start + 1, upper
+            while low < high:
+                midpoint = (low + high + 1) // 2
+                if fits(midpoint):
+                    low = midpoint
+                else:
+                    high = midpoint - 1
+            end = low
+        if end < len(source):
+            boundary = source.rfind("\n", start, end)
+            if boundary > start and fits(boundary + 1):
+                end = boundary + 1
+        pages.append(source[start:end])
+        start = end
+    return pages
+
+
 def create_text_viewer(owner_user_id: int, text: str, title: str = "GreyAI response") -> str:
     """Create a short-lived, owner-scoped viewer for a complete redacted response."""
     _cleanup_text_viewers()
@@ -3751,7 +3823,7 @@ def create_text_viewer(owner_user_id: int, text: str, title: str = "GreyAI respo
         text_viewers.popitem(last=False)
     viewer_id = secrets.token_urlsafe(7).replace("=", "")
     safe_text = _sanitize_viewer_text(str(text or ""))
-    pages = split_telegram_message(safe_text, TEXT_VIEWER_BODY_LENGTH)
+    pages = _split_renderable_viewer_pages(safe_text)
     text_viewers[viewer_id] = {
         "owner_user_id": int(owner_user_id),
         "pages": pages,
@@ -3782,12 +3854,11 @@ def _render_text_viewer_page(viewer_id: str, page_index: int) -> tuple[str, Inli
     rendered = header + rendered_body
     if len(rendered) <= TELEGRAM_TEXT_LIMIT:
         return rendered, _text_viewer_keyboard(viewer_id, int(viewer["owner_user_id"]), page_index, len(pages)), "HTML"
-    # Escaping can expand pathological text. Fall back to plain text, never truncate.
+    # The page splitter is render-aware, but retain a bounded plain fallback for
+    # future formatter changes. It must never silently discard source text.
     plain = header + telegram_plain_text(body)
     if len(plain) > TELEGRAM_TEXT_LIMIT:
-        # The page splitter normally makes this impossible; retain a hard safety net
-        # while preserving the page registry for deterministic recovery.
-        plain = plain[:TELEGRAM_TEXT_LIMIT]
+        raise ValueError("renderable viewer page exceeded Telegram limit")
     return plain, _text_viewer_keyboard(viewer_id, int(viewer["owner_user_id"]), page_index, len(pages)), ""
 
 
@@ -7077,7 +7148,7 @@ async def resolve_appeal_command(update: Update, context: ContextTypes.DEFAULT_T
 @developer_only
 async def devkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keys = list_api_keys(update.effective_user.id)
-    await update.message.reply_text(format_api_key_listing(keys), parse_mode="HTML")
+    await deliver_text_response(update.message, format_api_key_listing(keys), update.effective_user.id, title="Developer API keys")
 
 
 @developer_only
@@ -8096,9 +8167,23 @@ async def _process_natural_language(
             update_operation(operation_id, "denied")
             log_audit(user_id, "developer_api_example", None, "DENIED_NOT_DEVELOPER")
             return
-        await status_msg.edit_text(
-            format_developer_api_example(plan.get("language", "python"), DASHBOARD_BASE_URL),
-            parse_mode="HTML",
+        example_text = format_developer_api_example(plan.get("language", "python"), DASHBOARD_BASE_URL)
+        example_message = await deliver_text_response(
+            status_msg,
+            example_text,
+            user_id,
+            edit=True,
+            title="GreyAI developer API example",
+        )
+        remember_assistant_turn(
+            chat_id,
+            example_text,
+            user_id,
+            assistant_message_id=getattr(example_message, "message_id", None),
+            reply_to_message_id=reply_to_message_id,
+            business_connection_id=business_connection_id,
+            operation_id=operation_id,
+            response_kind="developer_api_example",
         )
         update_operation(operation_id, "succeeded")
         log_audit(user_id, "developer_api_example", None, "SUCCESS")
@@ -8110,7 +8195,18 @@ async def _process_natural_language(
             return
         if plan["mode"] == "developer_keys":
             keys = list_api_keys(user_id)
-            await status_msg.edit_text(format_api_key_listing(keys), parse_mode="HTML")
+            keys_text = format_api_key_listing(keys)
+            keys_message = await deliver_text_response(status_msg, keys_text, user_id, edit=True, title="Developer API keys")
+            remember_assistant_turn(
+                chat_id,
+                keys_text,
+                user_id,
+                assistant_message_id=getattr(keys_message, "message_id", None),
+                reply_to_message_id=reply_to_message_id,
+                business_connection_id=business_connection_id,
+                operation_id=operation_id,
+                response_kind="developer_keys",
+            )
             return
         if plan["mode"] == "developer_stats":
             stats = get_developer_stats(user_id)
