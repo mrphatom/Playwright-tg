@@ -69,6 +69,20 @@ def test_dashboard_client_has_bounded_bootstrap_and_recovery_states():
     assert "setInterval(()=>refresh().catch(()=>{}),3000)" in dashboard.HTML
 
 
+def test_dashboard_uses_structured_responsive_surfaces_instead_of_raw_json():
+    assert "GreyAI Control Room" in dashboard.HTML
+    assert "Operational overview" in dashboard.HTML
+    assert "Recent execution" in dashboard.HTML
+    assert "Developer workspace" in dashboard.HTML
+    assert "Administration" in dashboard.HTML
+    assert "<table>" in dashboard.HTML
+    assert "aria-live=\"polite\"" in dashboard.HTML
+    assert "nav-toggle" in dashboard.HTML
+    assert "JSON.stringify(d.operations" not in dashboard.HTML
+    assert "JSON.stringify(ar.referrals" not in dashboard.HTML
+    assert "JSON.stringify(k.keys" not in dashboard.HTML
+
+
 def test_public_developer_api_contract_is_machine_readable(dashboard_db):
     response = dashboard.developer_api_docs()
     assert response["base_url"].endswith("playwright-tg-mrphatom.fly.dev")
