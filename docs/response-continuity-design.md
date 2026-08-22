@@ -33,3 +33,13 @@ The rollback unit is the single commit containing the viewer registry, shared se
 ## Metrics to monitor
 
 Viewer creations, page navigation successes/failures, expired/foreign callbacks, long-output fallback sends, context retrieval successes, replies without recovered continuity, provider failover events, and Telegram handler errors.
+
+## Postflight evidence — 2026-08-22
+
+The implementation was released as commit `41f5ae5` (`Harden long responses and continuity`) on `main`. The local release gate passed with **277 tests**, compilation of the runtime modules, Ruff checks for the configured error and async rules, whitespace validation, and a repository diff secret scan. GitHub CI/CD run `32586970707` completed successfully, and Fly.io deployment run `32586970694` completed successfully.
+
+The live health endpoint returned `status: operational` after deployment. It also reported that the service had automatically recovered after stability checks, with no active maintenance window. No Telegram Web login, user impersonation, or test message was used for verification.
+
+The primary regression evidence covers complete page reconstruction, short-message compatibility, owner and expiry isolation, credential redaction, inline delivery, long chat replies, long search/extraction content, continuation-aware routing, durable assistant-result receipts, reply-context continuity, help entitlement filtering, and existing authorization and safety behavior. The rollback unit is commit `41f5ae5`; reverting it restores the previous runtime behavior without a database schema migration.
+
+Production metrics to monitor are `text_viewers_created`, `text_viewer_navigation_success`, `text_viewer_navigation_rejected`, `text_viewer_expired`, `long_output_fallbacks`, context retrieval success/failure, assistant results recorded without a recovered continuity link, provider failover successes, Telegram handler errors, and any increase in viewer creation without corresponding navigation completion. The viewer registry remains bounded by count and TTL; durable conversation storage remains owner-and-chat scoped and redacted.
