@@ -195,6 +195,10 @@ INTELLIGENT_NAVIGATION_PAGE_TEXT_CHARS = max(2000, min(12000, int(os.getenv("INT
 MANUAL_CHALLENGE_HANDOFF_ENABLED = os.getenv("MANUAL_CHALLENGE_HANDOFF_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 MANUAL_CHALLENGE_TIMEOUT_SECONDS = max(60, min(900, int(os.getenv("MANUAL_CHALLENGE_TIMEOUT_SECONDS", "600"))))
 MANUAL_CHALLENGE_MAX_ACTIVE = max(1, min(16, int(os.getenv("MANUAL_CHALLENGE_MAX_ACTIVE", "4"))))
+BROWSER_INITIAL_SETTLE_MS = max(100, min(3000, int(os.getenv("BROWSER_INITIAL_SETTLE_MS", "750"))))
+BROWSER_ACTION_SETTLE_MS = max(50, min(1500, int(os.getenv("BROWSER_ACTION_SETTLE_MS", "250"))))
+BROWSER_READY_TIMEOUT_MS = max(500, min(10000, int(os.getenv("BROWSER_READY_TIMEOUT_MS", "4000"))))
+BROWSER_RETRY_BACKOFF_SECONDS = max(0.5, min(8.0, float(os.getenv("BROWSER_RETRY_BACKOFF_SECONDS", "2"))))
 DOWNLOADS_ENABLED = os.getenv("DOWNLOADS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 DOWNLOAD_FREE_ENABLED = os.getenv("DOWNLOAD_FREE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 DOWNLOAD_PRO_MAX_BYTES = max(1_000_000, min(100_000_000, int(os.getenv("DOWNLOAD_PRO_MAX_BYTES", "25000000"))))
@@ -3806,7 +3810,7 @@ async def run_browser_task_with_retry(url: str, actions: list[str], user_id: int
             )
             if attempt < attempts:
                 update_operation(operation_id, "retrying", attempt)
-                await asyncio.sleep(min(2 ** (attempt - 1), 4))
+                await asyncio.sleep(min(BROWSER_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)), 8.0))
     update_operation(operation_id, "failed", max(1, attempts))
     asyncio.create_task(review_recent_activity_with_ai(user_id, operation_id))
     raise last_error or RuntimeError("browser task failed")
@@ -4251,6 +4255,22 @@ async def evaluate_ai_condition(prompt: str, page_text: str, native_context: dic
 # ==========================================
 # CORE PIPELINE ENGINE
 # ==========================================
+async def wait_for_page_ready(page, settle_ms: int = BROWSER_ACTION_SETTLE_MS) -> None:
+    """Wait for normal page readiness; never waits indefinitely or imitates human behavior."""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=BROWSER_READY_TIMEOUT_MS)
+    except (PlaywrightTimeoutError, AttributeError):
+        pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=min(BROWSER_READY_TIMEOUT_MS, 2500))
+    except (PlaywrightTimeoutError, AttributeError):
+        pass
+    try:
+        await page.wait_for_timeout(max(0, int(settle_ms)))
+    except AttributeError:
+        await asyncio.sleep(max(0, int(settle_ms)) / 1000)
+
+
 async def _page_navigation_snapshot(page) -> dict[str, Any]:
     """Collect a small, untrusted page map for navigation decisions."""
     body_text = await page.evaluate("document.body ? document.body.innerText : ''")
@@ -4392,11 +4412,7 @@ async def _click_navigation_target(page, target: str, user_id: int) -> None:
         raise ValueError(f"no safe interactive target matched: {target[:80]}")
     _, element = max(ranked, key=lambda item: item[0])
     await element.click(timeout=10000)
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=10000)
-    except PlaywrightTimeoutError:
-        pass
-    await page.wait_for_timeout(250)
+    await wait_for_page_ready(page, BROWSER_ACTION_SETTLE_MS)
     if page.url and not route_url_allowed(page.url, user_id):
         raise PermissionError("clicked navigation left the authorized domain policy")
 
@@ -4432,11 +4448,19 @@ async def detect_manual_challenge(page) -> str | None:
     except Exception:
         body = ""
     text = f"{title}\n{body}".lower()[:30000]
-    if any(marker in text for marker in ("captcha", "recaptcha", "hcaptcha", "turnstile", "i'm not a robot", "verify you are human")):
+    try:
+        challenge_nodes = await page.locator(
+            "iframe[src*='captcha'], iframe[src*='challenge'], "
+            "[id*='captcha'], [class*='captcha'], [name*='captcha'], "
+            "[id*='turnstile'], [class*='turnstile']"
+        ).count()
+    except Exception:
+        challenge_nodes = 0
+    if challenge_nodes or any(marker in text for marker in ("captcha", "recaptcha", "hcaptcha", "turnstile", "i'm not a robot", "are you human", "verify you are human")):
         return "captcha"
     if any(marker in text for marker in ("two-factor", "two factor", "2fa", "mfa", "one-time code", "one time code", "authenticator app", "verification code")):
         return "mfa"
-    if any(marker in text for marker in ("automated traffic", "unusual traffic", "checking your browser", "security verification", "security check")) and any(marker in text for marker in ("verify", "complete", "human", "robot", "browser")):
+    if any(marker in text for marker in ("automated traffic", "unusual traffic", "checking your browser", "security verification", "security check", "cloudflare", "cf-chl-")) and any(marker in text for marker in ("verify", "complete", "human", "robot", "browser", "challenge")):
         return "security-check"
     return None
 
@@ -4446,6 +4470,14 @@ def _manual_challenge_cleanup() -> None:
     for token, record in list(manual_challenges.items()):
         if float(record.get("expires_at", 0)) <= now:
             record["status"] = "expired"
+            record["event"].set()
+            manual_challenges.pop(token, None)
+
+
+def cleanup_manual_challenges_for_operation(operation_id: str) -> None:
+    for token, record in list(manual_challenges.items()):
+        if str(record.get("operation_id")) == str(operation_id):
+            record["status"] = "cancelled"
             record["event"].set()
             manual_challenges.pop(token, None)
 
@@ -4476,7 +4508,7 @@ async def manual_challenge_screenshot(token: str) -> bytes | None:
             return None
 
 
-async def create_manual_challenge_handoff(page, user_id: int, operation_id: str, status_msg=None) -> str:
+async def create_manual_challenge_handoff(page, user_id: int, operation_id: str, status_msg=None, challenge_kind: str = "security-check") -> str:
     """Register a short-lived page capability and tell the user how to open it."""
     if not MANUAL_CHALLENGE_HANDOFF_ENABLED or not DASHBOARD_BASE_URL:
         raise ManualChallengeRequired("manual challenge handoff is unavailable")
@@ -4491,7 +4523,7 @@ async def create_manual_challenge_handoff(page, user_id: int, operation_id: str,
             "user_id": int(user_id),
             "operation_id": str(operation_id)[:80],
             "page": page,
-            "challenge_kind": "security-check",
+            "challenge_kind": challenge_kind if challenge_kind in {"captcha", "mfa", "security-check"} else "security-check",
             "created_at": time.monotonic(),
             "expires_at": time.monotonic() + MANUAL_CHALLENGE_TIMEOUT_SECONDS,
             "status": "waiting",
@@ -4518,10 +4550,7 @@ async def wait_for_manual_challenge(page, user_id: int, operation_id: str, statu
     challenge_kind = await detect_manual_challenge(page)
     if not challenge_kind:
         return
-    token = await create_manual_challenge_handoff(page, user_id, operation_id, status_msg)
-    record = manual_challenges.get(token)
-    if record:
-        record["challenge_kind"] = challenge_kind
+    token = await create_manual_challenge_handoff(page, user_id, operation_id, status_msg, challenge_kind=challenge_kind)
     while True:
         record = manual_challenges.get(token)
         if not record:
@@ -4666,6 +4695,7 @@ async def _execute_intelligent_navigation(page, goal: str, user_id: int, native_
                 break
             if action == "click":
                 seen_urls.add(current_url)
+            await wait_for_page_ready(page, BROWSER_ACTION_SETTLE_MS)
             await wait_for_manual_challenge(page, user_id, operation_id, status_msg)
         except ManualChallengeRequired:
             raise
@@ -4830,7 +4860,7 @@ async def run_browser_task(url: str, actions: list[str], user_id: int, status_ms
         
         if status_msg: await status_msg.edit_text("🌐 Navigating...")
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(2000)
+        await wait_for_page_ready(page, BROWSER_INITIAL_SETTLE_MS)
         await wait_for_manual_challenge(page, user_id, operation_id, status_msg)
 
         pipeline_res = await execute_pipeline(
@@ -4855,11 +4885,7 @@ async def run_browser_task(url: str, actions: list[str], user_id: int, status_ms
         
         return pipeline_res
     finally:
-        for token, record in list(manual_challenges.items()):
-            if str(record.get("operation_id")) == operation_id:
-                record["status"] = "cancelled"
-                record["event"].set()
-                manual_challenges.pop(token, None)
+        cleanup_manual_challenges_for_operation(operation_id)
         if page: await page.close()
         if browser_context: await browser_context.close()
 
@@ -7075,6 +7101,8 @@ async def _resolve_dynamic_download_source(
     user_id: int,
     goal: str = "",
     native_context: dict[str, Any] | None = None,
+    status_msg=None,
+    operation_id: str = "download_discovery",
 ) -> str | None:
     """Resolve approved pages by bounded search/click/inspect navigation, without evasion or policy bypass."""
     if not pool.browser or not pool.browser.is_connected():
@@ -7085,7 +7113,8 @@ async def _resolve_dynamic_download_source(
         browser_context = await pool.browser.new_context(viewport={"width": 1280, "height": 800})
         page = await browser_context.new_page()
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(1200)
+        await wait_for_page_ready(page, BROWSER_INITIAL_SETTLE_MS)
+        await wait_for_manual_challenge(page, user_id, operation_id, status_msg)
         seen_pages = {str(page.url)}
         for step in range(INTELLIGENT_NAVIGATION_MAX_STEPS):
             candidates = await _dynamic_artifact_candidates(page, goal, user_id)
@@ -7104,19 +7133,23 @@ async def _resolve_dynamic_download_source(
                 await page.wait_for_timeout(int(decision["seconds"] * 1000))
             if not route_url_allowed(str(page.url), user_id):
                 return None
-            await page.wait_for_timeout(250)
+            await wait_for_page_ready(page, BROWSER_ACTION_SETTLE_MS)
+            await wait_for_manual_challenge(page, user_id, operation_id, status_msg)
             current_url = str(page.url)
             if action == "click" and current_url in seen_pages:
                 break
             seen_pages.add(current_url)
         candidates = await _dynamic_artifact_candidates(page, goal, user_id)
         return candidates[0][1] if candidates else None
+    except ManualChallengeRequired:
+        raise
     except (PlaywrightTimeoutError, OSError):
         return None
     except Exception:
         logger.info("dynamic_download_navigation_failed", exc_info=True)
         return None
     finally:
+        cleanup_manual_challenges_for_operation(operation_id)
         if page:
             try:
                 await page.close()
@@ -7134,6 +7167,8 @@ async def _resolve_direct_download_source(
     user_id: int,
     goal: str = "",
     native_context: dict[str, Any] | None = None,
+    status_msg=None,
+    operation_id: str = "download_discovery",
 ) -> str:
     """Resolve approved search/detail pages to a direct, allowlisted artifact link."""
     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
@@ -7219,7 +7254,14 @@ async def _resolve_direct_download_source(
             raise DownloadRejected("discovery_hop_limit")
     except DownloadRejected as exc:
         if str(exc) == "no_direct_artifact_found":
-            dynamic_url = await _resolve_dynamic_download_source(url, user_id, goal, native_context)
+            dynamic_url = await _resolve_dynamic_download_source(
+                url,
+                user_id,
+                goal,
+                native_context,
+                status_msg=status_msg,
+                operation_id=operation_id,
+            )
             if dynamic_url:
                 return dynamic_url
         raise
@@ -7393,6 +7435,8 @@ async def _deliver_download_artifact(
                         user_id,
                         str(plan.get("request") or ""),
                         native_context,
+                        status_msg=status_msg,
+                        operation_id=operation_id,
                     )
                     artifact = await _stream_download_artifact(direct_url, user_id, policy, status_msg=status_msg)
                     break

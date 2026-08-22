@@ -35,6 +35,7 @@ Gemini is an interchangeable inference provider, not Grey’s identity, memory s
 - **🧠 AI-Powered Extraction:** Query webpages using conversational prompts instead of fragile CSS selectors. Grey returns extracted text first and only sends a screenshot when explicitly requested or when extraction is unusable.
 - **🛡️ Standards-Compliant Browsing:** Grey uses transparent browser behavior with bounded waits, retries, caching, and rate-aware backoff. It does not mask webdriver identity, remove advertisements, bypass CAPTCHAs, defeat anti-bot systems, or evade platform security controls. If a site requires login, consent, CAPTCHA, or manual review, Grey reports that limitation instead of attempting to circumvent it.
 - **🧑‍💻 Manual Challenge Handoff:** When an approved browser task reaches a CAPTCHA, MFA, or security check, Grey pauses the live page and sends a private, short-lived Telegram handoff link with an inline button. The user can click, scroll, type an approved one-time code, complete the challenge on the site, and press “I’m done” to resume. Grey never solves or bypasses the challenge.
+- **⏱️ Transparent Interaction Pacing:** Browser navigation waits for normal DOM readiness, allows a short deterministic client-render settle window, and uses bounded exponential retry backoff for transient failures. These waits are for page correctness and provider load, not behavioral camouflage; no cursor jitter, randomized human simulation, or anti-bot evasion is used.
 - **⚙️ Button-Driven Settings:** `/settings` opens a personal settings panel. Persistent login and automatic encrypted session saving are paired and can be toggled together; manual challenge handoff can be enabled or disabled; saved sessions can be deleted and active handoffs cancelled from buttons without command arguments.
 - **🔒 AES-Encrypted Sessions:** Login to sites once and save your session. Your cookies and tokens are encrypted at rest inside a local SQLite database.
 - **⚡ Persistent Browser Pooling:** Maintains a warm background Chromium instance. Commands launch isolated tabs in milliseconds.
@@ -244,6 +245,11 @@ They can block a host or family of subdomains immediately:
    CHAT_TIMEOUT_SECONDS=20
    # Show a persistent “still thinking” message only when work exceeds this delay.
    PROGRESS_FEEDBACK_DELAY_SECONDS=1.2
+   # Transparent page-readiness timing; these are bounded usability waits, not camouflage.
+   BROWSER_INITIAL_SETTLE_MS=750
+   BROWSER_ACTION_SETTLE_MS=250
+   BROWSER_READY_TIMEOUT_MS=4000
+   BROWSER_RETRY_BACKOFF_SECONDS=2
    CHAT_CONTEXT_TURNS=32
    MEDIA_TIMEOUT_SECONDS=45
    MEDIA_MAX_BYTES=12000000

@@ -3828,7 +3828,7 @@ def test_resolve_direct_download_source_uses_dynamic_fallback_for_empty_html(mon
 
     monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
 
-    async def dynamic_fallback(url, user_id, goal, *_args):
+    async def dynamic_fallback(url, user_id, goal, *_args, **_kwargs):
         assert url.endswith("/search")
         assert user_id == 42
         assert "Believer" in goal
@@ -4632,3 +4632,43 @@ def test_manual_challenge_handoff_pauses_and_resumes_after_user_completion(monke
         assert bot.manual_challenge_status(token) is None
 
     asyncio.run(scenario())
+
+
+def test_wait_for_page_ready_uses_bounded_readiness_states():
+    import bot
+
+    class FakePage:
+        def __init__(self):
+            self.states = []
+            self.settles = []
+
+        async def wait_for_load_state(self, state, timeout):
+            self.states.append((state, timeout))
+
+        async def wait_for_timeout(self, milliseconds):
+            self.settles.append(milliseconds)
+
+    page = FakePage()
+    asyncio.run(bot.wait_for_page_ready(page, settle_ms=125))
+    assert [state for state, _timeout in page.states] == ["domcontentloaded", "networkidle"]
+    assert page.settles == [125]
+
+
+def test_manual_challenge_detector_uses_visible_dom_challenge_markers():
+    import bot
+
+    class FakeLocator:
+        async def count(self):
+            return 1
+
+    class FakePage:
+        async def title(self):
+            return ""
+
+        async def evaluate(self, _script):
+            return ""
+
+        def locator(self, _selector):
+            return FakeLocator()
+
+    assert asyncio.run(bot.detect_manual_challenge(FakePage())) == "captcha"
