@@ -4,7 +4,6 @@ from __future__ import annotations
 import re
 import zipfile
 from pathlib import Path
-from typing import Dict
 
 from api_contract import DEFAULT_GREY_PUBLIC_BASE_URL
 
@@ -14,7 +13,7 @@ def _safe_project_name(raw: str | None) -> str:
     return (value.lower() or "greyai-telegram-integration")[:80]
 
 
-def _python_files(project_name: str, base_url: str) -> Dict[str, str]:
+def _python_files(project_name: str, base_url: str) -> dict[str, str]:
     return {
         "README.md": f'''# {project_name}
 

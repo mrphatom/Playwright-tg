@@ -1,147 +1,167 @@
 import asyncio
-import os
-import logging
-import re
-import time
-import uuid
-import json
-import hashlib
-import sqlite3
 import base64
-import secrets
+import hashlib
 import ipaddress
-import tempfile
-import shutil
-import zipfile
-import tarfile
-import mimetypes
+import json
+import logging
 import math
-import urllib.request
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import sqlite3
+import tarfile
+import tempfile
+import time
 import urllib.error
-import aiohttp
+import urllib.request
+import uuid
+import zipfile
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as datetime_time
+from html import escape as html_escape
+from html import unescape as html_unescape
 from pathlib import Path
 from types import SimpleNamespace
-from html import escape as html_escape, unescape as html_unescape
-from datetime import datetime, timedelta, timezone, time as datetime_time
-from typing import List, Dict, Optional, Any
-from urllib.parse import urlparse, quote_plus, parse_qs, urljoin
+from typing import Any
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from telegram import Update, BotCommand, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, InlineQueryHandler, ChosenInlineResultHandler, BusinessConnectionHandler, ChatMemberHandler, CallbackQueryHandler, filters
-from telegram.error import TelegramError, Forbidden
-
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Browser, Playwright, BrowserContext
+import aiohttp
 import google.generativeai as genai
-from cryptography.fernet import Fernet
 import psutil
-from telegram import LabeledPrice
-from telegram.ext import PreCheckoutQueryHandler
+from cryptography.fernet import Fernet
+from playwright.async_api import Browser, Playwright, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputFile,
+    InputTextMessageContent,
+    LabeledPrice,
+    Update,
+)
+from telegram.error import Forbidden, TelegramError
+from telegram.ext import (
+    Application,
+    BusinessConnectionHandler,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    ChosenInlineResultHandler,
+    CommandHandler,
+    ContextTypes,
+    InlineQueryHandler,
+    MessageHandler,
+    PreCheckoutQueryHandler,
+    filters,
+)
 
-from dashboard import serve_dashboard
 from api_contract import developer_api_contract, format_developer_api_example
-from starter_templates import build_telegram_bot_starter_archive
-
 from control_plane import (
-    init_platform_db,
-    public_mode,
-    admin_ids,
     ROLE_DEVELOPER,
-    create_dashboard_login_token,
-    ensure_user,
-    get_user,
-    is_allowed_user,
-    is_admin,
-    is_developer,
-    consume_quota,
-    set_user_status,
-    set_user_role,
-    search_users,
-    list_users_by_status,
-    list_users_by_role,
-    list_reports,
-    list_appeals,
-    get_report,
-    get_appeal,
-    create_report,
-    create_appeal,
-    resolve_report,
-    resolve_appeal,
-    record_admin_action,
-    record_payment_order,
-    get_payment_order_by_external_id,
+    admin_ids,
     attach_payment_charge,
-    mark_payment_success,
-    calibrate_risk_decision,
-    record_risk_event,
-    list_operations,
-    create_operation,
-    update_operation,
-    get_or_create_referral_code,
     attribute_referral,
-    get_referral_stats,
-    qualify_referral,
-    list_referrals,
-    create_developer_access_request,
-    list_developer_access_requests,
-    resolve_developer_access_request,
-    create_api_key,
-    list_api_keys,
-    revoke_api_key,
-    revoke_all_api_keys_for_user,
-    get_developer_stats,
-    enqueue_user_notification,
-    list_pending_notifications,
-    mark_notification_sending,
-    mark_notification_delivered,
-    mark_notification_failed,
-    create_bulk_job,
-    confirm_bulk_job,
-    update_bulk_job_counts,
-    create_ad_campaign,
+    calibrate_risk_decision,
+    claim_queue_entry,
     confirm_ad_campaign,
-    get_ad_campaign,
-    list_ad_campaigns_for_admin,
-    list_active_ad_campaigns,
-    update_ad_campaign_next_run,
-    ensure_ad_delivery_rows,
-    reclaim_stale_ad_deliveries,
-    list_pending_ad_deliveries,
-    mark_ad_delivery_sending,
-    mark_ad_delivery_sent,
-    mark_ad_delivery_failed,
-    mark_ad_delivery_dead_letter,
+    confirm_bulk_job,
+    consume_quota,
     count_ad_delivery_status,
-    pause_ad_campaign_for_permission_loss,
-    resume_ad_campaign,
-    get_ad_delivery,
+    count_download_jobs_since,
+    create_ad_campaign,
+    create_api_key,
+    create_appeal,
+    create_bulk_job,
+    create_dashboard_login_token,
+    create_developer_access_request,
+    create_download_job,
+    create_operation,
+    create_queue_entry,
+    create_report,
+    enqueue_user_notification,
+    ensure_ad_delivery_rows,
+    ensure_user,
+    finish_download_job,
+    get_ad_campaign,
     get_ad_chat_last_sent_at,
     get_admin_analytics,
-    record_developer_event,
-    list_developer_events,
-    get_maintenance_state,
-    set_maintenance_state,
-    update_maintenance_recovery_progress,
-    recover_automatic_maintenance,
-    list_maintenance_events,
-    save_runtime_snapshot,
-    create_queue_entry,
-    claim_queue_entry,
-    update_queue_entry,
-    update_queue_eta,
-    list_queue_entries,
-    get_queue_stats,
-    get_platform_activity_summary,
-    create_download_job,
-    finish_download_job,
-    count_download_jobs_since,
-    get_last_download_job_at,
-    record_conversation_turn,
-    list_conversation_turns,
+    get_appeal,
     get_conversation_turn_by_telegram_message_id,
-    record_contact_log as persist_contact_log,
+    get_developer_stats,
+    get_last_download_job_at,
+    get_maintenance_state,
+    get_or_create_referral_code,
+    get_payment_order_by_external_id,
+    get_platform_activity_summary,
+    get_queue_stats,
+    get_referral_stats,
+    get_user,
+    init_platform_db,
+    is_admin,
+    is_allowed_user,
+    is_developer,
+    list_active_ad_campaigns,
+    list_ad_campaigns_for_admin,
+    list_api_keys,
+    list_appeals,
+    list_conversation_turns,
+    list_developer_access_requests,
+    list_developer_events,
+    list_maintenance_events,
+    list_operations,
+    list_pending_ad_deliveries,
+    list_pending_notifications,
+    list_queue_entries,
+    list_referrals,
+    list_reports,
+    list_users_by_role,
+    list_users_by_status,
+    mark_ad_delivery_dead_letter,
+    mark_ad_delivery_failed,
+    mark_ad_delivery_sending,
+    mark_ad_delivery_sent,
+    mark_notification_delivered,
+    mark_notification_failed,
+    mark_notification_sending,
+    mark_payment_success,
+    pause_ad_campaign_for_permission_loss,
+    public_mode,
+    qualify_referral,
+    reclaim_stale_ad_deliveries,
+    record_admin_action,
+    record_conversation_turn,
+    record_payment_order,
+    record_risk_event,
+    recover_automatic_maintenance,
+    resolve_appeal,
+    resolve_developer_access_request,
+    resolve_report,
+    resume_ad_campaign,
+    revoke_all_api_keys_for_user,
+    revoke_api_key,
+    save_runtime_snapshot,
+    search_users,
+    set_maintenance_state,
+    set_user_role,
+    set_user_status,
+    update_ad_campaign_next_run,
+    update_bulk_job_counts,
+    update_maintenance_recovery_progress,
+    update_operation,
+    update_queue_entry,
+)
+from control_plane import (
     list_contact_logs as load_contact_logs,
 )
+from control_plane import (
+    record_contact_log as persist_contact_log,
+)
+from dashboard import serve_dashboard
+from starter_templates import build_telegram_bot_starter_archive
 
 # ==========================================
 # CONFIGURATION & LOGGING
@@ -360,7 +380,7 @@ ALLOWED_CHANNEL_IDS = {
 }
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 download_semaphore = asyncio.Semaphore(DOWNLOAD_MAX_CONCURRENT)
-active_download_jobs: Dict[int, str] = {}
+active_download_jobs: dict[int, str] = {}
 notification_worker_task = None
 maintenance_scheduler_task = None
 recovery_monitor_task = None
@@ -381,7 +401,7 @@ provider_metrics = {
 }
 
 
-def format_api_key_listing(keys: List[Dict[str, Any]]) -> str:
+def format_api_key_listing(keys: list[dict[str, Any]]) -> str:
     if not keys:
         return "🔐 No developer API keys found. Create one with /newkey <name> check."
     lines = ["🔐 <b>Your GreyAI developer keys</b>", "", "Secret values are never shown in this list."]
@@ -457,7 +477,7 @@ async def notification_worker(bot) -> None:
         raise
 
 
-async def send_one_time_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE, created: Dict[str, Any], status_message=None) -> None:
+async def send_one_time_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE, created: dict[str, Any], status_message=None) -> None:
     if status_message is not None:
         await status_message.edit_text("✅ Key created. I’m sending the one-time secret in a separate message now.")
     message = await context.bot.send_message(
@@ -613,7 +633,7 @@ class GoogleCustomSearchProvider:
     def configured(self) -> bool:
         return bool(self.api_key and self.cx)
 
-    async def _request_json(self, query: str) -> Dict[str, Any]:
+    async def _request_json(self, query: str) -> dict[str, Any]:
         params = {
             "key": self.api_key,
             "cx": self.cx,
@@ -640,7 +660,7 @@ class GoogleCustomSearchProvider:
         except aiohttp.ClientError as exc:
             raise SearchProviderUnavailable("Google Custom Search is unreachable") from exc
 
-    async def search(self, query: str) -> List[Dict[str, str]]:
+    async def search(self, query: str) -> list[dict[str, str]]:
         if not self.configured:
             raise SearchProviderUnavailable("Google Custom Search is not configured")
         normalized_query = re.sub(r"\s+", " ", str(query or "")).strip()
@@ -675,7 +695,7 @@ google_custom_search_provider = GoogleCustomSearchProvider(
 )
 
 
-def format_google_search_results(query: str, results: List[Dict[str, str]]) -> str:
+def format_google_search_results(query: str, results: list[dict[str, str]]) -> str:
     """Format API results as bounded Markdown for the shared Telegram HTML renderer."""
     if not results:
         return f"No search results found for: {query}"
@@ -697,7 +717,7 @@ class ProviderAlertManager:
     def __init__(self, cooldown_seconds: int = PROVIDER_ALERT_COOLDOWN_SECONDS):
         self.cooldown_seconds = cooldown_seconds
         self._bot = None
-        self._last_sent_at: Dict[str, float] = {}
+        self._last_sent_at: dict[str, float] = {}
         self._active_incidents: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
         self._lock = asyncio.Lock()
@@ -787,7 +807,7 @@ provider_alerts = ProviderAlertManager()
 class GeminiFailoverProvider:
     """Use an ordered pool of up to four Gemini keys per request without restarting caller workflows."""
 
-    def __init__(self, primary_key: Optional[str], secondary_key: Optional[str], model: str, cooldown_seconds: int = 20, media_model: Optional[str] = None, text_fallback_model: Optional[str] = None, tertiary_key: Optional[str] = None, quaternary_key: Optional[str] = None):
+    def __init__(self, primary_key: str | None, secondary_key: str | None, model: str, cooldown_seconds: int = 20, media_model: str | None = None, text_fallback_model: str | None = None, tertiary_key: str | None = None, quaternary_key: str | None = None):
         self.primary_key = primary_key
         self.secondary_key = secondary_key
         self.tertiary_key = tertiary_key
@@ -796,10 +816,10 @@ class GeminiFailoverProvider:
         self.text_fallback_model = text_fallback_model or model
         self.media_model = media_model or model
         self.cooldown_seconds = max(1, cooldown_seconds)
-        self._cooldowns: Dict[str, float] = {}
-        self.last_successful_key_slot: Optional[int] = None
+        self._cooldowns: dict[str, float] = {}
+        self.last_successful_key_slot: int | None = None
 
-    def _candidate_keys(self) -> List[str]:
+    def _candidate_keys(self) -> list[str]:
         return [key for key in (self.primary_key, self.secondary_key, self.tertiary_key, self.quaternary_key) if key]
 
     def _is_retryable(self, error: Exception) -> bool:
@@ -819,7 +839,7 @@ class GeminiFailoverProvider:
     def _is_cooling_down(self, key: str) -> bool:
         return time.monotonic() < self._cooldowns.get(key, 0.0)
 
-    def _request_text(self, key: str, prompt: str, generation_config: Dict[str, Any], model: Optional[str] = None) -> str:
+    def _request_text(self, key: str, prompt: str, generation_config: dict[str, Any], model: str | None = None) -> str:
         request_model = model or self.model
         if request_model == self.model and key == GEMINI_API_KEY and key == self.primary_key and ai_model is not None:
             response = ai_model.generate_content(prompt, generation_config=generation_config)
@@ -870,7 +890,7 @@ class GeminiFailoverProvider:
     def _schedule_recovery_alert(self, model: str) -> None:
         provider_alerts.schedule(provider_alerts.notify_recovery(model))
 
-    async def generate_text(self, prompt: str, generation_config: Optional[Dict[str, Any]] = None) -> str:
+    async def generate_text(self, prompt: str, generation_config: dict[str, Any] | None = None) -> str:
         keys = self._candidate_keys()
         if not keys and ai_model is not None:
             provider_metrics["text_attempts"] += 1
@@ -1014,7 +1034,7 @@ def _native_row_value(row: Any, key: str, default: Any = None) -> Any:
         return default
 
 
-def _native_context_operations(user_id: int, chat_id: int, limit: int = 8) -> List[Dict[str, Any]]:
+def _native_context_operations(user_id: int, chat_id: int, limit: int = 8) -> list[dict[str, Any]]:
     try:
         rows = list_operations(int(user_id), max(1, min(int(limit), 12)))
     except Exception:
@@ -1030,12 +1050,12 @@ def _native_context_operations(user_id: int, chat_id: int, limit: int = 8) -> Li
     ]
 
 
-def _native_context_contact_summary(user_id: int, chat_id: int) -> Dict[str, Any]:
+def _native_context_contact_summary(user_id: int, chat_id: int) -> dict[str, Any]:
     try:
         rows = list_contact_logs(int(user_id), int(chat_id), 12)
     except Exception:
         rows = []
-    kinds: Dict[str, int] = {}
+    kinds: dict[str, int] = {}
     for row in rows[:12]:
         kind = str(_native_row_value(row, "interaction_type", "message"))[:60]
         kinds[kind] = kinds.get(kind, 0) + 1
@@ -1047,13 +1067,13 @@ def build_native_grey_context(
     chat_id: int,
     mode: str,
     request_text: str = "",
-    chat_history: Optional[List[Dict[str, str]]] = None,
-    reply_context: Optional[Dict[str, Any]] = None,
-    operation_id: Optional[str] = None,
-    chat_type: Optional[str] = None,
-    business_connection_id: Optional[str] = None,
-    media_kind: Optional[str] = None,
-) -> Dict[str, Any]:
+    chat_history: list[dict[str, str]] | None = None,
+    reply_context: dict[str, Any] | None = None,
+    operation_id: str | None = None,
+    chat_type: str | None = None,
+    business_connection_id: str | None = None,
+    media_kind: str | None = None,
+) -> dict[str, Any]:
     """Build Grey-owned, requester-scoped context before any model provider call."""
     requester = get_user(int(user_id)) or {}
     role = str(_native_row_value(requester, "role", "user"))[:40]
@@ -1151,14 +1171,14 @@ def build_native_grey_context(
     }
 
 
-def render_native_grey_context(context: Dict[str, Any]) -> str:
+def render_native_grey_context(context: dict[str, Any]) -> str:
     """Serialize only application-owned context; raw user/request content is attached separately."""
     safe = json.loads(json.dumps(context, default=str))
     safe.setdefault("request", {}).pop("text", None)
     return json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))[:18000]
 
 
-def native_context_block(context: Optional[Dict[str, Any]]) -> str:
+def native_context_block(context: dict[str, Any] | None) -> str:
     if not context:
         return ""
     return (
@@ -1177,24 +1197,24 @@ def get_db_path() -> str:
 
 # State Management
 class BrowserPool:
-    playwright: Optional[Playwright] = None
-    browser: Optional[Browser] = None
+    playwright: Playwright | None = None
+    browser: Browser | None = None
 
 pool = BrowserPool()
-active_watchers: Dict[int, Dict[str, asyncio.Task]] = {}
-active_schedules: Dict[str, asyncio.Task] = {}
-active_ad_campaigns: Dict[str, asyncio.Task] = {}
-chat_histories: Dict[int, List[Dict[str, str]]] = {}
-active_session_by_chat: Dict[int, str] = {}
-user_cooldowns: Dict[int, float] = {}
-business_user_cooldowns: Dict[tuple, float] = {}
+active_watchers: dict[int, dict[str, asyncio.Task]] = {}
+active_schedules: dict[str, asyncio.Task] = {}
+active_ad_campaigns: dict[str, asyncio.Task] = {}
+chat_histories: dict[int, list[dict[str, str]]] = {}
+active_session_by_chat: dict[int, str] = {}
+user_cooldowns: dict[int, float] = {}
+business_user_cooldowns: dict[tuple, float] = {}
 queue_dispatch_task = None
-queue_worker_tasks: List[asyncio.Task] = []
+queue_worker_tasks: list[asyncio.Task] = []
 browser_request_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
 queue_sequence = 0
 crash_failsafe_lock = asyncio.Lock()
-queue_duration_samples: List[float] = []
-latency_samples_ms: Dict[str, List[float]] = {"intent": [], "chat": []}
+queue_duration_samples: list[float] = []
+latency_samples_ms: dict[str, list[float]] = {"intent": [], "chat": []}
 
 
 def record_latency_sample(kind: str, started_at: float) -> None:
@@ -1357,7 +1377,7 @@ def init_db():
     init_platform_db()
     logger.info("Database initialized successfully.")
 
-def get_chat_setting(chat_id: int) -> Optional[Dict[str, Any]]:
+def get_chat_setting(chat_id: int) -> dict[str, Any] | None:
     with sqlite3.connect(get_db_path()) as conn:
         row = conn.execute(
             "SELECT chat_id, chat_type, enabled, enabled_by_user_id FROM chat_settings WHERE chat_id = ?",
@@ -1373,7 +1393,7 @@ def get_chat_setting(chat_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
-def set_chat_setting(chat_id: int, chat_type: str, enabled: bool, enabled_by_user_id: Optional[int]) -> None:
+def set_chat_setting(chat_id: int, chat_type: str, enabled: bool, enabled_by_user_id: int | None) -> None:
     with sqlite3.connect(get_db_path()) as conn:
         conn.execute(
             """INSERT INTO chat_settings (chat_id, chat_type, enabled, enabled_by_user_id, updated_at)
@@ -1393,7 +1413,7 @@ def chat_scope_enabled(chat_id: int, chat_type: str) -> bool:
     return setting["chat_type"] == chat_type and setting["enabled"]
 
 
-def normalize_invocation_text(text: str, bot_username: Optional[str] = None) -> str:
+def normalize_invocation_text(text: str, bot_username: str | None = None) -> str:
     normalized = str(text or "").strip()
     if bot_username:
         normalized = re.sub(rf"@{re.escape(bot_username)}\b", "", normalized, flags=re.IGNORECASE)
@@ -1402,7 +1422,7 @@ def normalize_invocation_text(text: str, bot_username: Optional[str] = None) -> 
     return normalized.strip()
 
 
-def is_bot_mention_or_reply(message, bot_username: Optional[str]) -> bool:
+def is_bot_mention_or_reply(message, bot_username: str | None) -> bool:
     text = str(message.text or message.caption or "")
     if bot_username and re.search(rf"@{re.escape(bot_username)}\b", text, flags=re.IGNORECASE):
         return True
@@ -1425,7 +1445,7 @@ def normalize_domain_pattern(raw_pattern: str) -> str:
     if not base or "/" in base or ":" in base or "@" in base or "*" in base:
         raise ValueError("use a hostname such as example.com or a wildcard such as *.example.com")
     try:
-        address = ipaddress.ip_address(base)
+        ipaddress.ip_address(base)
         raise ValueError("IP addresses are not valid allowlist patterns; use a public DNS hostname")
     except ValueError as exc:
         if str(exc).startswith("IP addresses"):
@@ -1448,7 +1468,7 @@ def domain_pattern_matches(hostname: str, pattern: str) -> bool:
     return host == base or host.endswith("." + base)
 
 
-def list_domain_policies() -> List[Dict[str, Any]]:
+def list_domain_policies() -> list[dict[str, Any]]:
     with sqlite3.connect(get_db_path()) as conn:
         rows = conn.execute(
             "SELECT pattern, effect, created_by_user_id, created_at, updated_at FROM domain_policies ORDER BY pattern"
@@ -1489,7 +1509,7 @@ def remove_domain_policy(pattern: str) -> str:
     return normalized
 
 
-def log_audit(user_id: int, command: str, target_url: Optional[str], status: str):
+def log_audit(user_id: int, command: str, target_url: str | None, status: str):
     """Inserts a command log entry into SQLite."""
     try:
         with sqlite3.connect(get_db_path()) as conn:
@@ -1517,7 +1537,7 @@ def save_encrypted_session(user_id: int, name: str, session_data: dict):
         """, (user_id, name, encrypted_str))
         conn.commit()
 
-def load_encrypted_session(user_id: int, name: str) -> Optional[dict]:
+def load_encrypted_session(user_id: int, name: str) -> dict | None:
     """Retrieves and decrypts a browser session from SQLite."""
     with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
@@ -1532,7 +1552,7 @@ def load_encrypted_session(user_id: int, name: str) -> Optional[dict]:
             logger.error(f"Failed to decrypt session '{name}': {e}")
             return None
 
-def list_user_sessions(user_id: int) -> List[str]:
+def list_user_sessions(user_id: int) -> list[str]:
     """Lists all active session names for a user."""
     with sqlite3.connect(get_db_path()) as conn:
         cursor = conn.cursor()
@@ -1566,7 +1586,7 @@ def save_business_connection(connection_id: str, owner_user_id: int, owner_chat_
         conn.commit()
 
 
-def get_business_connection(connection_id: str) -> Optional[Dict[str, Any]]:
+def get_business_connection(connection_id: str) -> dict[str, Any] | None:
     with sqlite3.connect(get_db_path()) as conn:
         row = conn.execute(
             """SELECT connection_id, owner_user_id, owner_chat_id, is_enabled, can_read_messages, can_reply
@@ -1589,10 +1609,10 @@ def save_watcher_to_db(
     watcher_id: str,
     chat_id: int,
     url: str,
-    actions: List[str],
+    actions: list[str],
     interval: int,
-    business_connection_id: Optional[str] = None,
-    source_urls: Optional[List[str]] = None,
+    business_connection_id: str | None = None,
+    source_urls: list[str] | None = None,
 ):
     """Persist a watcher configuration and its ordered, already-validated sources."""
     safe_sources = list(dict.fromkeys(str(item).strip() for item in (source_urls or [url]) if str(item).strip()))
@@ -1612,12 +1632,12 @@ def update_watcher_health(
     watcher_id: str,
     *,
     success: bool,
-    error: Optional[str] = None,
-    result_hash: Optional[str] = None,
+    error: str | None = None,
+    result_hash: str | None = None,
     condition_met: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Record bounded watcher health and return the current state for notification decisions."""
-    now = datetime.utcnow().isoformat() + "Z"
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     safe_error = str(error or "")[:500] or None
     with sqlite3.connect(get_db_path()) as conn:
         conn.row_factory = sqlite3.Row
@@ -1649,7 +1669,7 @@ def deactivate_watcher_in_db(watcher_id: str):
         conn.commit()
 
 
-def list_watchers_for_chat(chat_id: int, active_only: bool = True) -> List[Dict[str, Any]]:
+def list_watchers_for_chat(chat_id: int, active_only: bool = True) -> list[dict[str, Any]]:
     """Return bounded, non-secret watcher metadata for this chat only."""
     predicate = "AND is_active = 1" if active_only else ""
     with sqlite3.connect(get_db_path()) as conn:
@@ -1693,7 +1713,7 @@ def list_watchers_for_chat(chat_id: int, active_only: bool = True) -> List[Dict[
     return result
 
 
-def save_schedule_to_db(schedule_id: str, user_id: int, chat_id: int, config: Dict[str, Any], next_run: datetime):
+def save_schedule_to_db(schedule_id: str, user_id: int, chat_id: int, config: dict[str, Any], next_run: datetime):
     with sqlite3.connect(get_db_path()) as conn:
         conn.execute(
             """INSERT OR REPLACE INTO schedules
@@ -1704,7 +1724,7 @@ def save_schedule_to_db(schedule_id: str, user_id: int, chat_id: int, config: Di
         conn.commit()
 
 
-def list_schedules_for_chat(chat_id: int) -> List[Dict[str, Any]]:
+def list_schedules_for_chat(chat_id: int) -> list[dict[str, Any]]:
     with sqlite3.connect(get_db_path()) as conn:
         rows = conn.execute(
             """SELECT schedule_id, user_id, chat_id, config_json, next_run_at
@@ -1724,7 +1744,7 @@ def list_schedules_for_chat(chat_id: int) -> List[Dict[str, Any]]:
     ]
 
 
-def list_active_schedules() -> List[Dict[str, Any]]:
+def list_active_schedules() -> list[dict[str, Any]]:
     with sqlite3.connect(get_db_path()) as conn:
         rows = conn.execute(
             """SELECT schedule_id, user_id, chat_id, config_json, next_run_at
@@ -1801,7 +1821,7 @@ def is_domain_allowed(url: str) -> bool:
         return False
 
 
-def _normalize_schedule_days(raw_days: Any) -> Optional[List[int]]:
+def _normalize_schedule_days(raw_days: Any) -> list[int] | None:
     if isinstance(raw_days, list):
         try:
             days = sorted({int(day) for day in raw_days})
@@ -1828,13 +1848,18 @@ def _normalize_schedule_days(raw_days: Any) -> Optional[List[int]]:
     return sorted({names[token] for token in tokens})
 
 
-def normalize_schedule_config(raw_config: Any) -> Optional[Dict[str, Any]]:
+def normalize_schedule_config(raw_config: Any) -> dict[str, Any] | None:
     """Validate a schedule before it is persisted or executed."""
     if not isinstance(raw_config, dict):
         return None
 
     try:
-        schedule_time = datetime.strptime(str(raw_config.get("schedule_time", "")), "%H:%M").strftime("%H:%M")
+        raw_time = str(raw_config.get("schedule_time", "")).strip()
+        hour_text, minute_text = raw_time.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        schedule_time = f"{hour:02d}:{minute:02d}"
     except (TypeError, ValueError):
         return None
 
@@ -1887,7 +1912,7 @@ def normalize_schedule_config(raw_config: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def calculate_next_schedule_run(config: Dict[str, Any], now: Optional[datetime] = None) -> datetime:
+def calculate_next_schedule_run(config: dict[str, Any], now: datetime | None = None) -> datetime:
     """Return the next timezone-aware run strictly after `now`."""
     timezone = ZoneInfo(config["timezone"])
     current = now or datetime.now(timezone)
@@ -1930,19 +1955,19 @@ def _looks_like_legacy_selector(target: str) -> bool:
     )
 
 
-def _normalize_pipeline_actions(raw_actions: Any, mode: str) -> Optional[List[str]]:
+def _normalize_pipeline_actions(raw_actions: Any, mode: str) -> list[str] | None:
     """Validate model-produced actions against the existing browser action grammar."""
     if raw_actions is None:
         return []
     if not isinstance(raw_actions, list) or len(raw_actions) > 30:
         return None
 
-    actions: List[str] = []
+    actions: list[str] = []
     for raw_action in raw_actions:
         action = str(raw_action or "").strip()
         if not action or len(action) > 1000:
             return None
-        if action.startswith("type_password:") or action.startswith("type_username:"):
+        if action.startswith(("type_password:", "type_username:")):
             return None
         if action.startswith("type:"):
             payload = action[5:]
@@ -1978,13 +2003,13 @@ def _normalize_pipeline_actions(raw_actions: Any, mode: str) -> Optional[List[st
                 return None
             if seconds < 0 or seconds > 30:
                 return None
-        elif action.startswith("ai_extract:") or action.startswith("condition_ai:"):
+        elif action.startswith(("ai_extract:", "condition_ai:")):
             if not action.split(":", 1)[1].strip():
                 return None
         elif action.startswith("condition_contains:"):
             if not action.split(":", 1)[1].strip():
                 return None
-        elif action.startswith("save_session:") or action.startswith("load_session:"):
+        elif action.startswith(("save_session:", "load_session:")):
             name = sanitize_session_name(action.split(":", 1)[1].strip())
             if not name:
                 return None
@@ -2004,9 +2029,9 @@ def _normalize_pipeline_actions(raw_actions: Any, mode: str) -> Optional[List[st
     return actions
 
 
-def _parse_ad_target_tokens(raw_text: str) -> List[str]:
+def _parse_ad_target_tokens(raw_text: str) -> list[str]:
     text = str(raw_text or "")
-    targets: List[str] = []
+    targets: list[str] = []
     for match in re.finditer(r"(?:chat|group|channel)\s*(?:id|ids)?\s*[:=]?\s*(-?\d{3,20}(?:\s*,\s*-?\d{3,20})*)", text, flags=re.IGNORECASE):
         targets.extend(part.strip() for part in match.group(1).split(","))
     target_section = re.split(r"\b(?:to|into|in|target|targets)\b", text, maxsplit=1, flags=re.IGNORECASE)[-1]
@@ -2014,7 +2039,7 @@ def _parse_ad_target_tokens(raw_text: str) -> List[str]:
     return list(dict.fromkeys(targets))[:MAX_AD_CAMPAIGN_TARGETS]
 
 
-def parse_deterministic_ad_campaign_request(user_text: str) -> Optional[Dict[str, Any]]:
+def parse_deterministic_ad_campaign_request(user_text: str) -> dict[str, Any] | None:
     original = str(user_text or "").strip()
     lowered = original.lower()
     if not re.search(r"\b(?:advertis(?:e|ing|ement)|ad\s+campaign|promot(?:e|ion)|sponsor(?:ed)?\s+message)\b", lowered):
@@ -2053,9 +2078,9 @@ def parse_deterministic_ad_campaign_request(user_text: str) -> Optional[Dict[str
 
 def parse_deterministic_management_request(
     user_text: str,
-    chat_history: Optional[List[Dict[str, Any]]] = None,
-    reply_context: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+    chat_history: list[dict[str, Any]] | None = None,
+    reply_context: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Interpret management requests without asking an LLM to invent identifiers."""
     text = str(user_text or "").strip().lower()
     contextual_text = "\n".join(
@@ -2187,12 +2212,12 @@ def tor_route_allowed(url: str, user_id: int) -> bool:
     return TOR_PUBLIC_FALLBACK_ENABLED
 
 
-def public_search_source_candidates(user_text: str) -> List[str]:
+def public_search_source_candidates(user_text: str) -> list[str]:
     query = re.sub(r"\s+", " ", str(user_text or "").strip())[:240]
     if not query:
         return []
     encoded = quote_plus(query)
-    candidates: List[str] = []
+    candidates: list[str] = []
     if DUCKDUCKGO_ENABLED:
         candidates.append(f"https://duckduckgo.com/?q={encoded}")
     if BING_SEARCH_ENABLED:
@@ -2228,7 +2253,7 @@ def artifact_discovery_query(user_text: str) -> str:
     return re.sub(r"\s+", " ", text).strip(" .,!?:;-")[:240] or str(user_text or "").strip()[:240]
 
 
-def artifact_discovery_source_candidates(user_text: str, user_id: Optional[int] = None) -> List[str]:
+def artifact_discovery_source_candidates(user_text: str, user_id: int | None = None) -> list[str]:
     query = artifact_discovery_query(user_text)
     candidates = public_search_source_candidates(query)
     lowered = str(user_text or "").lower()
@@ -2242,7 +2267,7 @@ def is_crypto_price_request(user_text: str) -> bool:
     return bool(any(term in text for term in CRYPTO_ASSET_TERMS) and any(term in text for term in CRYPTO_PRICE_TERMS))
 
 
-def crypto_source_candidates(user_text: str) -> List[str]:
+def crypto_source_candidates(user_text: str) -> list[str]:
     """Return ordered, allowlisted search sources for crypto lookups."""
     clean = re.sub(r"\s+", " ", str(user_text or "").strip())[:240]
     if not is_crypto_price_request(clean):
@@ -2255,7 +2280,7 @@ def crypto_source_candidates(user_text: str) -> List[str]:
     ]
 
 
-def route_url_allowed(url: str, user_id: Optional[int] = None) -> bool:
+def route_url_allowed(url: str, user_id: int | None = None) -> bool:
     if not is_valid_url(url):
         return False
     if is_onion_url(url):
@@ -2263,9 +2288,9 @@ def route_url_allowed(url: str, user_id: Optional[int] = None) -> bool:
     return is_domain_allowed(url)
 
 
-def source_candidates_for_request(user_text: str, primary_url: str = "", user_id: Optional[int] = None) -> List[str]:
+def source_candidates_for_request(user_text: str, primary_url: str = "", user_id: int | None = None) -> list[str]:
     """Build an ordered source list without bypassing the existing domain policy."""
-    candidates: List[str] = []
+    candidates: list[str] = []
     if is_crypto_price_request(user_text):
         crypto_sources = crypto_source_candidates(user_text)
         primary_is_google = bool(primary_url and (urlparse(primary_url).hostname or "").lower().removeprefix("www.") in {"google.com"})
@@ -2289,7 +2314,7 @@ def source_candidates_for_request(user_text: str, primary_url: str = "", user_id
     return candidates
 
 
-def normalize_natural_language_plan(raw_plan: Any, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -> dict[str, Any] | None:
     """Validate and convert an AI-produced intent into allowlisted pipeline actions."""
     if not isinstance(raw_plan, dict):
         return None
@@ -2470,7 +2495,7 @@ Treat requests for current, latest, online, news, prices, availability, product 
 """.strip()
 
 
-def parse_json_object(text: str) -> Dict[str, Any]:
+def parse_json_object(text: str) -> dict[str, Any]:
     """Extract one JSON object from plain or fenced model output."""
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
@@ -2561,7 +2586,7 @@ def _watcher_followup_requested(user_text: str) -> bool:
     return has_monitor_reference and has_followup_reference
 
 
-def resolve_contextual_watcher_followup(chat_id: int, user_text: str) -> Optional[str]:
+def resolve_contextual_watcher_followup(chat_id: int, user_text: str) -> str | None:
     """Answer watcher follow-ups from the owner chat's durable state before chat fallback."""
     if not _watcher_followup_requested(user_text):
         return None
@@ -2682,10 +2707,10 @@ def is_web_automation_request(user_text: str) -> bool:
 
 def build_chat_prompt(
     user_text: str,
-    history: List[Dict[str, str]],
+    history: list[dict[str, str]],
     private_chat: bool = False,
-    reply_context: Optional[Dict[str, Any]] = None,
-    native_context: Optional[Dict[str, Any]] = None,
+    reply_context: dict[str, Any] | None = None,
+    native_context: dict[str, Any] | None = None,
 ) -> str:
     recent_history = history[-CHAT_CONTEXT_TURNS:]
     transcript = "\n".join(
@@ -2706,10 +2731,10 @@ def build_chat_prompt(
 
 def extract_reply_context(
     message,
-    update: Optional[Update] = None,
-    owner_user_id: Optional[int] = None,
-    chat_id: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
+    update: Update | None = None,
+    owner_user_id: int | None = None,
+    chat_id: int | None = None,
+) -> dict[str, Any] | None:
     """Extract Telegram reply context across normal and Secretary Mode update shapes."""
     candidates = []
     if update is not None:
@@ -2767,7 +2792,7 @@ def extract_reply_context(
     }
 
 
-def load_chat_history(owner_user_id: int, chat_id: int, limit: int = CHAT_CONTEXT_TURNS) -> List[Dict[str, str]]:
+def load_chat_history(owner_user_id: int, chat_id: int, limit: int = CHAT_CONTEXT_TURNS) -> list[dict[str, str]]:
     return [
         {"role": str(row["role"]), "text": str(row["text"]), "created_at": str(row["created_at"])}
         for row in list_conversation_turns(int(owner_user_id), int(chat_id), limit)
@@ -2779,10 +2804,10 @@ def record_contact_log(
     chat_id: int,
     interaction_type: str,
     message_text: str = "",
-    message_id: Optional[int] = None,
-    reply_to_message_id: Optional[int] = None,
-    business_connection_id: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
+    message_id: int | None = None,
+    reply_to_message_id: int | None = None,
+    business_connection_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     return persist_contact_log(
         owner_user_id,
@@ -2796,7 +2821,7 @@ def record_contact_log(
     )
 
 
-def list_contact_logs(owner_user_id: int, chat_id: Optional[int] = None, limit: int = 50):
+def list_contact_logs(owner_user_id: int, chat_id: int | None = None, limit: int = 50):
     return load_contact_logs(owner_user_id, chat_id, limit)
 
 
@@ -2804,11 +2829,11 @@ def remember_chat_turn(
     chat_id: int,
     user_text: str,
     reply_text: str,
-    owner_user_id: Optional[int] = None,
-    source_message_id: Optional[int] = None,
-    reply_to_message_id: Optional[int] = None,
-    business_connection_id: Optional[str] = None,
-    assistant_message_id: Optional[int] = None,
+    owner_user_id: int | None = None,
+    source_message_id: int | None = None,
+    reply_to_message_id: int | None = None,
+    business_connection_id: str | None = None,
+    assistant_message_id: int | None = None,
 ):
     owner_id = int(owner_user_id if owner_user_id is not None else chat_id)
     history = chat_histories.setdefault(chat_id, [])
@@ -2846,8 +2871,8 @@ async def generate_chat_reply(
     chat_id: int,
     user_text: str,
     private_chat: bool = False,
-    owner_user_id: Optional[int] = None,
-    reply_context: Optional[Dict[str, Any]] = None,
+    owner_user_id: int | None = None,
+    reply_context: dict[str, Any] | None = None,
 ) -> str:
     if private_chat:
         micro_reply = private_chat_micro_reply(user_text)
@@ -2896,7 +2921,7 @@ async def generate_chat_reply(
         record_latency_sample("chat", started_at)
 
 
-def private_chat_micro_reply(user_text: str) -> Optional[str]:
+def private_chat_micro_reply(user_text: str) -> str | None:
     """Handle obvious low-latency private-chat social turns without a provider round-trip."""
     text = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
     if not text or len(text) > 180 or is_live_web_lookup_request(text) or classify_message_route(text) == "task":
@@ -2954,7 +2979,7 @@ async def review_recent_activity_with_ai(user_id: int, operation_id: str) -> Non
         logger.exception("advisory_activity_review_failed operation_id=%s", operation_id)
 
 
-def parse_deterministic_login_request(user_text: str) -> Optional[Dict[str, Any]]:
+def parse_deterministic_login_request(user_text: str) -> dict[str, Any] | None:
     """Build a login pipeline without sending credentials to an LLM."""
     text = str(user_text or "").strip()
     lowered = text.lower()
@@ -3011,7 +3036,7 @@ def parse_deterministic_login_request(user_text: str) -> Optional[Dict[str, Any]
     return {"mode": "login", "url": url, "actions": actions, "session_name": session_name}
 
 
-def parse_deterministic_schedule_request(user_text: str) -> Optional[Dict[str, Any]]:
+def parse_deterministic_schedule_request(user_text: str) -> dict[str, Any] | None:
     """Recover strongly structured recurring requests when model output is incomplete."""
     text = str(user_text or "").strip()
     lowered = text.lower()
@@ -3085,7 +3110,7 @@ def is_factual_web_verification_request(user_text: str) -> bool:
     return any(term in text for term in currentness) and (question_start or verification_phrase)
 
 
-def custom_search_query_for_request(user_text: str) -> Optional[str]:
+def custom_search_query_for_request(user_text: str) -> str | None:
     """Return a generic search query only when the request is not a direct-site task."""
     raw_text = re.sub(r"\s+", " ", str(user_text or "").strip())
     text = raw_text.strip(" ?!.")
@@ -3100,7 +3125,7 @@ def custom_search_query_for_request(user_text: str) -> Optional[str]:
     return None
 
 
-def discover_factual_web_reference(user_text: str) -> Optional[str]:
+def discover_factual_web_reference(user_text: str) -> str | None:
     if not is_factual_web_verification_request(user_text):
         return None
     query = re.sub(r"\s+", " ", str(user_text or "").strip()).strip(" ?!.")[:240]
@@ -3109,7 +3134,7 @@ def discover_factual_web_reference(user_text: str) -> Optional[str]:
     return "https://news.google.com/search?q=" + quote_plus(query)
 
 
-def discover_named_web_reference(user_text: str) -> Optional[str]:
+def discover_named_web_reference(user_text: str) -> str | None:
     """Resolve a small set of canonical named sites; domain policy still decides access."""
     text = str(user_text or "")
     lowered = text.lower()
@@ -3147,7 +3172,7 @@ def should_use_intelligent_navigation(request: str) -> bool:
     ))
 
 
-def parse_deterministic_web_request(user_text: str, default_session_name: Optional[str] = None, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+def parse_deterministic_web_request(user_text: str, default_session_name: str | None = None, user_id: int | None = None) -> dict[str, Any] | None:
     """Recover common check/watch requests when structured interpretation is unavailable."""
     text = str(user_text or "").strip()
     lowered = text.lower()
@@ -3275,7 +3300,7 @@ def parse_deterministic_web_request(user_text: str, default_session_name: Option
     if discovered_url:
         result["discovered_url"] = True
     return result
-def _is_unambiguous_deterministic_plan(user_text: str, plan: Dict[str, Any]) -> bool:
+def _is_unambiguous_deterministic_plan(user_text: str, plan: dict[str, Any]) -> bool:
     """Return true only for plans whose fields are safely recoverable without a model round-trip."""
     mode = str(plan.get("mode", "")).lower()
     if mode in {"search", "schedule"}:
@@ -3304,13 +3329,13 @@ def _is_unambiguous_deterministic_plan(user_text: str, plan: Dict[str, Any]) -> 
 
 async def parse_natural_language_intent(
     user_text: str,
-    default_session_name: Optional[str] = None,
-    reply_context: Optional[Dict[str, Any]] = None,
-    chat_history: Optional[List[Dict[str, str]]] = None,
+    default_session_name: str | None = None,
+    reply_context: dict[str, Any] | None = None,
+    chat_history: list[dict[str, str]] | None = None,
     private_chat: bool = False,
-    user_id: Optional[int] = None,
-    native_context: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+    user_id: int | None = None,
+    native_context: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Interpret every authorized message before falling back to conversational chat."""
     management_plan = parse_deterministic_management_request(
         user_text,
@@ -3436,7 +3461,7 @@ def truncate_text(text: str, max_length: int = 4000) -> str:
     return text if len(text) <= max_length else text[:max_length - 15] + "\n...[Truncated]"
 
 
-async def _send_delayed_thinking_feedback(source_message, state: Dict[str, Any], delay_seconds: Optional[float] = None):
+async def _send_delayed_thinking_feedback(source_message, state: dict[str, Any], delay_seconds: float | None = None):
     """Show explicit progress only when interpretation takes long enough to be noticeable."""
     try:
         delay = PROGRESS_FEEDBACK_DELAY_SECONDS if delay_seconds is None else delay_seconds
@@ -3455,7 +3480,7 @@ async def _send_delayed_thinking_feedback(source_message, state: Dict[str, Any],
 def telegram_safe_html(text: str, max_length: int = 4000) -> str:
     """Convert common AI Markdown into Telegram-supported HTML without leaking markup."""
     source = truncate_text(str(text or ""), max_length)
-    tokens: List[str] = []
+    tokens: list[str] = []
 
     def stash(value: str) -> str:
         token = f"\x00GREYAI_{len(tokens)}\x00"
@@ -3576,7 +3601,7 @@ async def restore_watchers_from_db(context_bot):
     except Exception as e:
         logger.error(f"Failed to restore watchers from DB: {e}")
 
-def extraction_result_is_usable(result: Dict[str, Any]) -> bool:
+def extraction_result_is_usable(result: dict[str, Any]) -> bool:
     extracted = "\n".join(str(item or "") for item in (result or {}).get("extracted", []))
     if not extracted.strip() or (result or {}).get("action_errors"):
         return False
@@ -3585,15 +3610,15 @@ def extraction_result_is_usable(result: Dict[str, Any]) -> bool:
 
 
 async def run_browser_task_with_source_fallback(
-    source_urls: List[str],
-    actions: List[str],
+    source_urls: list[str],
+    actions: list[str],
     user_id: int,
     operation_id: str,
     status_msg=None,
     attempts: int = 2,
-    native_context: Optional[Dict[str, Any]] = None,
+    native_context: dict[str, Any] | None = None,
     screenshot_requested: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Try ordered, already-allowlisted sources and return the first useful extraction."""
     candidates = list(dict.fromkeys(
         str(url).strip()
@@ -3602,8 +3627,8 @@ async def run_browser_task_with_source_fallback(
     ))
     if not candidates:
         raise ValueError("no safe source candidates")
-    last_result: Optional[Dict[str, Any]] = None
-    last_error: Optional[BaseException] = None
+    last_result: dict[str, Any] | None = None
+    last_error: BaseException | None = None
     for index, candidate in enumerate(candidates):
         if index and status_msg:
             await status_msg.edit_text(
@@ -3651,7 +3676,7 @@ async def run_browser_task_with_source_fallback(
     raise last_error or RuntimeError("all source candidates failed")
 
 
-async def run_browser_task_with_retry(url: str, actions: List[str], user_id: int, operation_id: str, status_msg=None, attempts: int = 2, native_context: Optional[Dict[str, Any]] = None, screenshot_requested: bool = False) -> Dict[str, Any]:
+async def run_browser_task_with_retry(url: str, actions: list[str], user_id: int, operation_id: str, status_msg=None, attempts: int = 2, native_context: dict[str, Any] | None = None, screenshot_requested: bool = False) -> dict[str, Any]:
     """Retry transient browser work with a bounded attempt count and correlation ID."""
     last_error = None
     for attempt in range(1, max(1, attempts) + 1):
@@ -3731,7 +3756,7 @@ def estimate_browser_wait_seconds(user_id: int) -> int:
         return QUEUE_ETA_FLOOR_SECONDS
 
 
-async def run_browser_request(operation_id: str, user_id: int, chat_id: Optional[int], kind: str, work_factory, status_msg=None) -> Dict[str, Any]:
+async def run_browser_request(operation_id: str, user_id: int, chat_id: int | None, kind: str, work_factory, status_msg=None) -> dict[str, Any]:
     if maintenance_blocks_browser_work():
         raise QueueUnavailable("browser work is paused while GreyAI is in hard maintenance")
     if not QUEUE_ENABLED or not queue_worker_tasks:
@@ -3835,7 +3860,7 @@ async def stop_queue_dispatcher() -> None:
     queue_dispatch_task = None
 
 
-async def run_scheduled_briefing(schedule: Dict[str, Any], context_bot):
+async def run_scheduled_briefing(schedule: dict[str, Any], context_bot):
     config = schedule["config"]
     operation_id = uuid.uuid4().hex[:12]
     create_operation(operation_id, schedule["user_id"], schedule["chat_id"], "scheduled_briefing")
@@ -3886,7 +3911,7 @@ async def run_scheduled_briefing(schedule: Dict[str, Any], context_bot):
         )
 
 
-async def scheduled_schedule_worker(schedule: Dict[str, Any], context_bot):
+async def scheduled_schedule_worker(schedule: dict[str, Any], context_bot):
     schedule_id = schedule["schedule_id"]
     config = schedule["config"]
     timezone = ZoneInfo(config["timezone"])
@@ -3911,7 +3936,7 @@ async def scheduled_schedule_worker(schedule: Dict[str, Any], context_bot):
         active_schedules.pop(schedule_id, None)
 
 
-def start_schedule_task(schedule: Dict[str, Any], context_bot):
+def start_schedule_task(schedule: dict[str, Any], context_bot):
     schedule_id = schedule["schedule_id"]
     current_task = active_schedules.get(schedule_id)
     if current_task and not current_task.done():
@@ -3930,7 +3955,7 @@ async def restore_schedules_from_db(context_bot):
         logger.info("Restored %s scheduled briefing(s) from SQLite.", restored_count)
 
 
-def _is_automatic_failsafe_state(state: Dict[str, Any]) -> bool:
+def _is_automatic_failsafe_state(state: dict[str, Any]) -> bool:
     if state.get("mode") != "hard_maintenance":
         return False
     metadata = state.get("metadata") or {}
@@ -4055,29 +4080,35 @@ async def stop_browser_pool(application: Application):
     global notification_worker_task, maintenance_scheduler_task, recovery_monitor_task
     provider_alerts.shutdown()
     await stop_queue_dispatcher()
-    if notification_worker_task and not notification_worker_task.done():
-        notification_worker_task.cancel()
-    if maintenance_scheduler_task and not maintenance_scheduler_task.done():
-        maintenance_scheduler_task.cancel()
-    if recovery_monitor_task and not recovery_monitor_task.done():
-        recovery_monitor_task.cancel()
-    for task in application.bot_data.get("ephemeral_message_tasks", set()):
-        task.cancel()
-    dashboard_task = application.bot_data.get("dashboard_task")
-    if dashboard_task:
-        dashboard_task.cancel()
-    logger.info("Shutting down Browser Pool...")
-    for user_watchers in active_watchers.values():
-        for task in user_watchers.values():
-            task.cancel()
-    for task in list(active_schedules.values()):
-        task.cancel()
-    for task in list(active_ad_campaigns.values()):
-        task.cancel()
-    if pool.browser: await pool.browser.close()
-    if pool.playwright: await pool.playwright.stop()
 
-async def evaluate_ai_condition(prompt: str, page_text: str, native_context: Optional[Dict[str, Any]] = None) -> Optional[bool]:
+    current_task = asyncio.current_task()
+    tasks_to_cancel = []
+    for task in (
+        notification_worker_task,
+        maintenance_scheduler_task,
+        recovery_monitor_task,
+        application.bot_data.get("dashboard_task"),
+        *application.bot_data.get("ephemeral_message_tasks", set()),
+        *(task for user_watchers in active_watchers.values() for task in user_watchers.values()),
+        *active_schedules.values(),
+        *active_ad_campaigns.values(),
+    ):
+        if task and task is not current_task and not task.done():
+            task.cancel()
+            tasks_to_cancel.append(task)
+    if tasks_to_cancel:
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+    notification_worker_task = None
+    maintenance_scheduler_task = None
+    recovery_monitor_task = None
+    logger.info("Shutting down Browser Pool...")
+    if pool.browser:
+        await pool.browser.close()
+    if pool.playwright:
+        await pool.playwright.stop()
+
+async def evaluate_ai_condition(prompt: str, page_text: str, native_context: dict[str, Any] | None = None) -> bool | None:
     if not gemini_configured():
         return None
     try:
@@ -4096,7 +4127,7 @@ async def evaluate_ai_condition(prompt: str, page_text: str, native_context: Opt
 # ==========================================
 # CORE PIPELINE ENGINE
 # ==========================================
-async def _page_navigation_snapshot(page) -> Dict[str, Any]:
+async def _page_navigation_snapshot(page) -> dict[str, Any]:
     """Collect a small, untrusted page map for navigation decisions."""
     body_text = await page.evaluate("document.body ? document.body.innerText : ''")
     controls = []
@@ -4124,7 +4155,7 @@ async def _page_navigation_snapshot(page) -> Dict[str, Any]:
     }
 
 
-def _navigation_model_prompt(goal: str, snapshot: Dict[str, Any], native_context: Optional[Dict[str, Any]]) -> str:
+def _navigation_model_prompt(goal: str, snapshot: dict[str, Any], native_context: dict[str, Any] | None) -> str:
     return (
         f"{native_context_block(native_context)}\n\n"
         "You are GreyAI's bounded browser navigation planner. Choose exactly one next read-only action from the observed page. "
@@ -4138,7 +4169,7 @@ def _navigation_model_prompt(goal: str, snapshot: Dict[str, Any], native_context
     )
 
 
-async def _choose_navigation_action(goal: str, snapshot: Dict[str, Any], native_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+async def _choose_navigation_action(goal: str, snapshot: dict[str, Any], native_context: dict[str, Any] | None) -> dict[str, Any]:
     if not gemini_configured():
         return {"action": "extract"}
     raw = parse_json_object(await gemini_provider.generate_text(
@@ -4246,7 +4277,7 @@ async def _click_navigation_target(page, target: str, user_id: int) -> None:
         raise PermissionError("clicked navigation left the authorized domain policy")
 
 
-async def _ai_extract_current_page(page, prompt: str, native_context: Optional[Dict[str, Any]]) -> str:
+async def _ai_extract_current_page(page, prompt: str, native_context: dict[str, Any] | None) -> str:
     if not gemini_configured():
         return "⚠️ Gemini is not configured for AI extraction."
     page_text = await page.evaluate("document.body ? document.body.innerText : ''")
@@ -4262,7 +4293,7 @@ async def _ai_extract_current_page(page, prompt: str, native_context: Optional[D
     return extracted.strip()[:3500]
 
 
-async def _execute_intelligent_navigation(page, goal: str, user_id: int, native_context: Optional[Dict[str, Any]], status_msg=None) -> Dict[str, Any]:
+async def _execute_intelligent_navigation(page, goal: str, user_id: int, native_context: dict[str, Any] | None, status_msg=None) -> dict[str, Any]:
     runtime_metrics["intelligent_navigation_runs"] += 1
     result = {"extracted": [], "condition_met": False, "screenshot_needed": True, "action_errors": [], "navigation_steps": []}
     if not INTELLIGENT_NAVIGATION_ENABLED:
@@ -4305,7 +4336,7 @@ async def _execute_intelligent_navigation(page, goal: str, user_id: int, native_
     return result
 
 
-async def execute_pipeline(page, browser_context, actions: List[str], user_id: int, status_msg=None, native_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def execute_pipeline(page, browser_context, actions: list[str], user_id: int, status_msg=None, native_context: dict[str, Any] | None = None) -> dict[str, Any]:
     native_context = native_context or build_native_grey_context(user_id, user_id, "agent")
     result = {"extracted": [], "condition_met": False, "screenshot_needed": True, "action_errors": []}
     
@@ -4409,7 +4440,7 @@ async def execute_pipeline(page, browser_context, actions: List[str], user_id: i
             
     return result
 
-async def run_browser_task(url: str, actions: List[str], user_id: int, status_msg=None, native_context: Optional[Dict[str, Any]] = None, screenshot_requested: bool = False) -> Dict[str, Any]:
+async def run_browser_task(url: str, actions: list[str], user_id: int, status_msg=None, native_context: dict[str, Any] | None = None, screenshot_requested: bool = False) -> dict[str, Any]:
     native_context = native_context or build_native_grey_context(user_id, user_id, "agent", request_text=url)
     context_opts = {
         "viewport": {'width': 1280, 'height': 800}
@@ -4464,12 +4495,12 @@ async def run_browser_task(url: str, actions: List[str], user_id: int, status_ms
 async def watcher_loop(
     chat_id: int,
     url: str,
-    actions: List[str],
+    actions: list[str],
     interval: int,
     watcher_id: str,
     context_bot,
-    business_connection_id: Optional[str] = None,
-    source_urls: Optional[List[str]] = None,
+    business_connection_id: str | None = None,
+    source_urls: list[str] | None = None,
 ):
     candidates = list(dict.fromkeys(str(item).strip() for item in (source_urls or [url]) if str(item).strip())) or [url]
     logger.info("Started watcher %s for %s on %s (Interval: %ss, sources=%s)", watcher_id, chat_id, url, interval, len(candidates))
@@ -4568,7 +4599,7 @@ async def watcher_loop(
 # ==========================================
 # TELEGRAM HANDLERS
 # ==========================================
-def create_schedule(user_id: int, chat_id: int, config: Dict[str, Any], context_bot) -> tuple[str, datetime]:
+def create_schedule(user_id: int, chat_id: int, config: dict[str, Any], context_bot) -> tuple[str, datetime]:
     schedule_id = uuid.uuid4().hex[:6]
     next_run = calculate_next_schedule_run(config)
     save_schedule_to_db(schedule_id, user_id, chat_id, config, next_run)
@@ -4583,7 +4614,7 @@ def create_schedule(user_id: int, chat_id: int, config: Dict[str, Any], context_
     return schedule_id, next_run
 
 
-def format_schedule(schedule: Dict[str, Any]) -> str:
+def format_schedule(schedule: dict[str, Any]) -> str:
     config = schedule["config"]
     next_run = schedule["next_run_at"].astimezone(ZoneInfo(config["timezone"]))
     return (
@@ -4932,7 +4963,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
     if payment_plan not in {"pro", "max"}:
         log_audit(user_id, "successful_payment", None, "REJECTED_UNKNOWN_PLAN")
         return await update.message.reply_text("⚠️ Payment plan could not be validated. Support has been notified.")
-    if mark_payment_success(order["order_id"], payment_plan, (datetime.utcnow() + timedelta(days=30)).isoformat()):
+    if mark_payment_success(order["order_id"], payment_plan, (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()):
         referral_id = qualify_referral(user_id, f"telegram_stars_{payment_plan}")
         if referral_id:
             log_audit(user_id, "referral", None, f"QUALIFIED_{referral_id}")
@@ -4982,7 +5013,7 @@ def _star_partner_label(partner: Any) -> str:
     return re.sub(r"[^A-Za-z0-9 _-]", "", name or "unknown") or "unknown"
 
 
-def format_stars_report(balance: Any, transactions: List[Any], inspected_limit: int = 100) -> str:
+def format_stars_report(balance: Any, transactions: list[Any], inspected_limit: int = 100) -> str:
     balance_stars = _star_amount_value(balance)
     received = 0
     outgoing = 0
@@ -5055,7 +5086,7 @@ def _sanitize_failure_reason(error: Any) -> str:
     return re.sub(r"(?i)(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", text)
 
 
-def _runtime_snapshot_payload(operation_id: Optional[str] = None) -> Dict[str, Any]:
+def _runtime_snapshot_payload(operation_id: str | None = None) -> dict[str, Any]:
     try:
         queue = get_queue_stats()
     except Exception:
@@ -5072,7 +5103,7 @@ def _runtime_snapshot_payload(operation_id: Optional[str] = None) -> Dict[str, A
     }
 
 
-def _maintenance_message(state: Optional[Dict[str, Any]] = None) -> str:
+def _maintenance_message(state: dict[str, Any] | None = None) -> str:
     current = state or get_maintenance_state()
     mode = current.get("mode", "operational")
     if mode == "operational":
@@ -5086,7 +5117,7 @@ def _maintenance_message(state: Optional[Dict[str, Any]] = None) -> str:
     return f"⚠️ GreyAI status: {label}\n{message}{scheduled_line}\nLast updated: {updated}\nUse /maintenance_log to view recent status events."
 
 
-async def enter_hard_maintenance(bot, error: Any, operation_id: Optional[str] = None) -> Dict[str, Any]:
+async def enter_hard_maintenance(bot, error: Any, operation_id: str | None = None) -> dict[str, Any]:
     """Fail closed after an unhandled runtime failure and preserve a sanitized snapshot."""
     if not CRASH_FAILSAFE_ENABLED:
         return get_maintenance_state()
@@ -5120,7 +5151,7 @@ async def enter_hard_maintenance(bot, error: Any, operation_id: Optional[str] = 
         return state
 
 
-def parse_maintenance_schedule_time(value: str, now: Optional[datetime] = None) -> Optional[Dict[str, str]]:
+def parse_maintenance_schedule_time(value: str, now: datetime | None = None) -> dict[str, str] | None:
     """Parse a future `YYYY-MM-DD HH:MM IANA/Timezone` maintenance start."""
     match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})\s+([A-Za-z]+/[A-Za-z0-9_+.-]+)", str(value or "").strip())
     if not match:
@@ -5128,7 +5159,7 @@ def parse_maintenance_schedule_time(value: str, now: Optional[datetime] = None) 
     date_text, time_text, timezone_name = match.groups()
     try:
         timezone = ZoneInfo(timezone_name)
-        scheduled = datetime.strptime(f"{date_text} {time_text}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone)
+        scheduled = datetime.combine(date.fromisoformat(date_text), datetime_time.fromisoformat(time_text), timezone)
     except (ValueError, ZoneInfoNotFoundError):
         return None
     current = now or datetime.now(ZoneInfo("UTC"))
@@ -5147,7 +5178,7 @@ def maintenance_blocks_browser_work() -> bool:
     return MAINTENANCE_FEATURE_ENABLED and get_maintenance_state().get("mode") == "hard_maintenance"
 
 
-async def activate_scheduled_maintenance_if_due(bot, now: Optional[datetime] = None) -> bool:
+async def activate_scheduled_maintenance_if_due(bot, now: datetime | None = None) -> bool:
     """Atomically transition one due scheduled state into hard maintenance."""
     if not MAINTENANCE_FEATURE_ENABLED:
         return False
@@ -5454,7 +5485,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def generate_ad_copy(title: str, brief: str, native_context: Optional[Dict[str, Any]] = None) -> str:
+async def generate_ad_copy(title: str, brief: str, native_context: dict[str, Any] | None = None) -> str:
     if not gemini_configured():
         raise TextProviderUnavailable("Gemini is not configured for ad copy generation")
     prompt = (
@@ -5474,10 +5505,10 @@ async def generate_ad_copy(title: str, brief: str, native_context: Optional[Dict
     return cleaned[:AD_CAMPAIGN_MAX_BODY]
 
 
-async def resolve_ad_targets(context_bot, raw_targets: List[str]) -> tuple[List[int], List[str], List[str]]:
-    resolved_ids: List[int] = []
-    labels: List[str] = []
-    rejected: List[str] = []
+async def resolve_ad_targets(context_bot, raw_targets: list[str]) -> tuple[list[int], list[str], list[str]]:
+    resolved_ids: list[int] = []
+    labels: list[str] = []
+    rejected: list[str] = []
     me = await context_bot.get_me()
     for raw_target in list(dict.fromkeys(str(value).strip() for value in raw_targets if str(value).strip()))[:MAX_AD_CAMPAIGN_TARGETS]:
         try:
@@ -5578,7 +5609,7 @@ def maybe_pause_ad_campaign_for_permission_loss(campaign_id: str) -> bool:
     return True
 
 
-def _ad_campaign_preview_text(job: Dict[str, Any], labels: Optional[List[str]] = None) -> str:
+def _ad_campaign_preview_text(job: dict[str, Any], labels: list[str] | None = None) -> str:
     target_ids = job.get("target_chat_ids", [])
     target_line = ", ".join(labels or [str(value) for value in target_ids])[:800]
     interval = int(job.get("interval_seconds", MIN_AD_INTERVAL_SECONDS))
@@ -5595,7 +5626,7 @@ def _ad_campaign_preview_text(job: Dict[str, Any], labels: Optional[List[str]] =
     )
 
 
-async def create_ad_campaign_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, plan: Dict[str, Any]) -> None:
+async def create_ad_campaign_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, plan: dict[str, Any]) -> None:
     reply_target = getattr(update, "effective_message", None) or getattr(update, "message", None)
     if not reply_target:
         return
@@ -5719,7 +5750,7 @@ async def cancel_ad_campaign_command(update: Update, context: ContextTypes.DEFAU
     await update.message.reply_text(f"🛑 Advertising campaign {campaign['campaign_id']} cancelled.")
 
 
-async def dispatch_ad_campaign_occurrence(campaign: Dict[str, Any], context_bot) -> Dict[str, int]:
+async def dispatch_ad_campaign_occurrence(campaign: dict[str, Any], context_bot) -> dict[str, int]:
     campaign_id = str(campaign["campaign_id"])
     reclaim_stale_ad_deliveries()
     occurrence = int(campaign.get("next_occurrence", 1))
@@ -5807,7 +5838,7 @@ async def dispatch_ad_campaign_occurrence(campaign: Dict[str, Any], context_bot)
     return {"processed": processed, "succeeded": succeeded, "failed": failed}
 
 
-async def ad_campaign_worker(campaign: Dict[str, Any], context_bot):
+async def ad_campaign_worker(campaign: dict[str, Any], context_bot):
     campaign_id = str(campaign["campaign_id"])
     try:
         while True:
@@ -5834,7 +5865,7 @@ async def ad_campaign_worker(campaign: Dict[str, Any], context_bot):
         active_ad_campaigns.pop(campaign_id, None)
 
 
-def start_ad_campaign_task(campaign: Dict[str, Any], context_bot):
+def start_ad_campaign_task(campaign: dict[str, Any], context_bot):
     campaign_id = str(campaign["campaign_id"])
     current_task = active_ad_campaigns.get(campaign_id)
     if current_task and not current_task.done():
@@ -5851,14 +5882,14 @@ async def restore_ad_campaigns_from_db(context_bot):
         logger.info("Restored %s advertising campaign(s) from SQLite", restored)
 
 
-def _parse_bulk_ids(raw_values: List[str]) -> List[str]:
+def _parse_bulk_ids(raw_values: list[str]) -> list[str]:
     values = []
     for token in raw_values:
         values.extend(part.strip() for part in token.split(","))
     return sorted({value[:100] for value in values if value})
 
 
-def _bulk_preview_text(job: Dict[str, Any]) -> str:
+def _bulk_preview_text(job: dict[str, Any]) -> str:
     payload = json.loads(job.get("payload_json") or "{}") if isinstance(job.get("payload_json"), str) else job.get("payload_json", {})
     audience_line = f"\nAudience: {payload.get('audience')}" if payload.get("audience") else ""
     return (
@@ -5986,7 +6017,7 @@ async def mass_appeal_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(_bulk_preview_text(job))
 
 
-async def _execute_confirmed_bulk_job(job: Dict[str, Any], admin_id: int) -> Dict[str, int]:
+async def _execute_confirmed_bulk_job(job: dict[str, Any], admin_id: int) -> dict[str, int]:
     update_bulk_job_counts(job["job_id"], 0, 0, 0, "running")
     action = job["action"]
     payload = json.loads(job.get("payload_json") or "{}")
@@ -6366,7 +6397,7 @@ async def developer_stats_command(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-async def generate_multimodal_interpretation(path: str, mime_type: str, instruction: str, native_context: Optional[Dict[str, Any]] = None) -> str:
+async def generate_multimodal_interpretation(path: str, mime_type: str, instruction: str, native_context: dict[str, Any] | None = None) -> str:
     """Interpret bounded media through the provider using Grey’s native context."""
     if not gemini_configured():
         return "Multimodal Gemini support is not configured."
@@ -6385,7 +6416,7 @@ def update_source_message(update: Update):
     )
 
 
-def update_business_connection_id(update: Update) -> Optional[str]:
+def update_business_connection_id(update: Update) -> str | None:
     message = update_source_message(update)
     return getattr(message, "business_connection_id", None) if message else None
 
@@ -6415,7 +6446,7 @@ class DownloadRejected(Exception):
     """Expected, user-safe rejection for an artifact retrieval request."""
 
 
-def download_policy_for_user(user_id: int) -> Dict[str, Any]:
+def download_policy_for_user(user_id: int) -> dict[str, Any]:
     user = get_user(user_id)
     if not DOWNLOADS_ENABLED:
         return {"allowed": False, "reason": "disabled"}
@@ -6434,7 +6465,7 @@ def download_policy_for_user(user_id: int) -> Dict[str, Any]:
     return {"allowed": False, "reason": "free_plan"}
 
 
-def _download_policy_message(policy: Dict[str, Any]) -> str:
+def _download_policy_message(policy: dict[str, Any]) -> str:
     reason = policy.get("reason")
     if reason == "free_plan":
         return "⛔ File retrieval is unavailable on the Free plan. Use /upgrade to view Pro and Max benefits."
@@ -6459,7 +6490,7 @@ def _human_bytes(value: int) -> str:
     return f"{int(value)} B"
 
 
-def _download_eta(downloaded: int, total: Optional[int], started_at: float) -> str:
+def _download_eta(downloaded: int, total: int | None, started_at: float) -> str:
     if not total or downloaded <= 0:
         return "unknown"
     elapsed = max(0.1, time.monotonic() - started_at)
@@ -6544,7 +6575,7 @@ def _validate_download_artifact(path: str, filename: str, content_type: str, max
         raise DownloadRejected("blocked_content_type")
     with open(path, "rb") as stream:
         header = stream.read(8)
-    if header.startswith(b"MZ") or header.startswith(b"\x7fELF") or header.startswith(b"#!"):
+    if header.startswith((b"MZ", b"\x7fELF", b"#!")):
         raise DownloadRejected("executable_signature_blocked")
     _validate_archive_safety(path, filename)
     return size
@@ -6587,8 +6618,8 @@ async def _resolve_direct_download_source(url: str, user_id: int) -> str:
                         return current_url
                     body = await response.content.read(2_000_000)
                     html = body.decode("utf-8", errors="replace")
-                    direct_candidates: List[tuple[int, str]] = []
-                    page_candidates: List[tuple[int, str]] = []
+                    direct_candidates: list[tuple[int, str]] = []
+                    page_candidates: list[tuple[int, str]] = []
                     for quote, href, label in re.findall(r'<a\b[^>]*?\bhref\s*=\s*(["\'])(.*?)\1[^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL):
                         candidate = urljoin(str(response.url), html_unescape(href).strip())
                         if not route_url_allowed(candidate, user_id):
@@ -6640,7 +6671,7 @@ async def _resolve_direct_download_source(url: str, user_id: int) -> str:
         raise DownloadRejected("download_discovery_network_error")
 
 
-async def _stream_download_artifact(url: str, user_id: int, policy: Dict[str, Any], status_msg=None) -> Dict[str, Any]:
+async def _stream_download_artifact(url: str, user_id: int, policy: dict[str, Any], status_msg=None) -> dict[str, Any]:
     timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT_SECONDS, connect=20, sock_read=45)
     headers = {"User-Agent": "GreyAI/1.0 authorized-file-retrieval", "Accept": "*/*"}
     current_url = url
@@ -6728,11 +6759,11 @@ async def _stream_download_artifact(url: str, user_id: int, policy: Dict[str, An
 async def _deliver_download_artifact(
     context: ContextTypes.DEFAULT_TYPE,
     status_msg,
-    plan: Dict[str, Any],
+    plan: dict[str, Any],
     user_id: int,
     chat_id: int,
     operation_id: str,
-    native_context: Optional[Dict[str, Any]] = None,
+    native_context: dict[str, Any] | None = None,
 ) -> None:
     policy = download_policy_for_user(user_id)
     if not policy.get("allowed"):
@@ -6872,8 +6903,8 @@ async def _deliver_download_artifact(
 async def _process_natural_language(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    request_text_override: Optional[str] = None,
-    user_id_override: Optional[int] = None,
+    request_text_override: str | None = None,
+    user_id_override: int | None = None,
     public_context: bool = False,
     shared_context: bool = False,
 ):
@@ -6942,10 +6973,10 @@ async def _process_natural_language(
             log_audit(user_id, "chat", None, "SUCCESS_MICRO_REPLY")
             return
 
-    progress_state: Dict[str, Any] = {}
+    progress_state: dict[str, Any] = {}
     progress_task = asyncio.create_task(_send_delayed_thinking_feedback(source_message, progress_state))
     route_hint = classify_message_route(request_text)
-    chat_history: List[Dict[str, str]] = []
+    chat_history: list[dict[str, str]] = []
     if route_hint == "chat":
         durable_history = load_chat_history(user_id, chat_id, CHAT_CONTEXT_TURNS)
         chat_history = durable_history or chat_histories.get(chat_id, [])
@@ -7784,7 +7815,7 @@ async def business_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not connection or not connection["is_enabled"] or not connection["can_read_messages"] or not connection["can_reply"]:
         return
     return await multimodal_message_handler(update, context, "image", user_id_override=connection["owner_user_id"])
-async def multimodal_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, media_kind: str, user_id_override: Optional[int] = None):
+async def multimodal_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, media_kind: str, user_id_override: int | None = None):
     message = update_source_message(update)
     if not message:
         return

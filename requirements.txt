@@ -1,7 +1,7 @@
 python-telegram-bot==22.8
 playwright==1.41.2
-aiohttp==3.9.3
+aiohttp==3.14.3
 google-generativeai==0.4.1
 psutil==5.9.8
-cryptography==42.0.5
-pytest==8.0.2
+cryptography==50.0.0
+pytest==9.0.3

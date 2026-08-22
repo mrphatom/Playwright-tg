@@ -1,4 +1,4 @@
-import os
+import base64
 import sqlite3
 
 import pytest
@@ -13,6 +13,7 @@ def platform_db(tmp_path, monkeypatch):
     monkeypatch.setenv("PUBLIC_MODE", "true")
     monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "9001")
     monkeypatch.setenv("API_KEY_HASH_SECRET", "platform-test-secret")
+    monkeypatch.setenv("SESSION_ENCRYPTION_KEY", base64.urlsafe_b64encode(b"platform-test-session-secret-32bytes"[:32]).decode())
     cp.init_platform_db()
     return path
 
@@ -469,3 +470,47 @@ def test_download_job_receipts_are_durable_and_countable(platform_db):
             (job_id,),
         ).fetchone()
     assert row == ("succeeded", 1234, "sample.txt", "archive.org")
+
+
+def test_queue_stats_averages_only_bounded_recent_completions(platform_db):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    with cp._connect() as connection:
+        for index in range(101):
+            completed = now - timedelta(seconds=index + 1)
+            started = completed - timedelta(seconds=10)
+            if index == 100:
+                started = completed - timedelta(seconds=1000)
+            connection.execute(
+                "INSERT INTO request_queue (queue_id, operation_id, user_id, chat_id, kind, priority, status, estimated_wait_seconds, enqueued_at, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"queue_{index}", f"operation_{index}", 42, 42, "check", 10, "succeeded", 0,
+                    (now - timedelta(seconds=index + 1)).isoformat(), started.isoformat(), (now - timedelta(seconds=index + 1)).isoformat(),
+                ),
+            )
+        connection.commit()
+
+    assert cp.get_queue_stats()["average_completed_seconds"] == 10.0
+
+
+def test_consume_quota_is_atomic_under_concurrent_requests(platform_db):
+    from concurrent.futures import ThreadPoolExecutor
+
+    cp.ensure_user(42)
+    with cp._connect() as connection:
+        connection.execute("UPDATE users SET quota_limit = 1, quota_used = 0 WHERE telegram_user_id = 42")
+        connection.commit()
+
+    def consume_once():
+        try:
+            return cp.consume_quota(42, 1)[0]
+        except Exception:
+            return False
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        outcomes = list(executor.map(lambda _item: consume_once(), range(8)))
+
+    assert sum(outcomes) == 1
+    user = cp.get_user(42)
+    assert user["quota_used"] == 1

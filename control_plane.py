@@ -10,13 +10,14 @@ import hashlib
 import hmac
 import json
 import os
-import sqlite3
-import secrets
 import re
-from cryptography.fernet import Fernet, InvalidToken
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Iterable, List, Optional
+import secrets
+import sqlite3
+from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
+from cryptography.fernet import Fernet, InvalidToken
 
 ROLE_USER = "user"
 ROLE_DEVELOPER = "developer"
@@ -527,7 +528,10 @@ def _migrate_users_role_constraint(connection: sqlite3.Connection) -> None:
 
 
 def _dashboard_cipher() -> Fernet:
-    seed = (os.getenv("SESSION_ENCRYPTION_KEY") or os.getenv("TELEGRAM_BOT_TOKEN") or "dashboard-development-seed").encode("utf-8")
+    configured = os.getenv("SESSION_ENCRYPTION_KEY")
+    if public_mode() and not configured:
+        raise RuntimeError("SESSION_ENCRYPTION_KEY is required when PUBLIC_MODE is enabled")
+    seed = (configured or os.getenv("TELEGRAM_BOT_TOKEN") or "dashboard-development-seed").encode("utf-8")
     key = base64.urlsafe_b64encode(seed.ljust(32, b"0")[:32])
     return Fernet(key)
 
@@ -536,7 +540,7 @@ def _protect_dashboard_session(value: str) -> str:
     return _dashboard_cipher().encrypt(value.encode("utf-8")).decode("utf-8")
 
 
-def _unprotect_dashboard_session(value: str) -> Optional[str]:
+def _unprotect_dashboard_session(value: str) -> str | None:
     try:
         return _dashboard_cipher().decrypt(value.encode("utf-8"), ttl=259200).decode("utf-8")
     except (InvalidToken, ValueError, TypeError):
@@ -547,7 +551,7 @@ def developer_quota_limit() -> int:
     return max(1, int(os.getenv("DEVELOPER_QUOTA_LIMIT", str(DEFAULT_DEVELOPER_QUOTA))))
 
 
-def ensure_user(user_id: int, username: Optional[str] = None, display_name: Optional[str] = None) -> sqlite3.Row:
+def ensure_user(user_id: int, username: str | None = None, display_name: str | None = None) -> sqlite3.Row:
     now = utc_now()
     role = ROLE_ADMIN if user_id in admin_ids() else ROLE_USER
     quota_limit = developer_quota_limit() if role == ROLE_DEVELOPER else 20
@@ -572,7 +576,7 @@ def ensure_user(user_id: int, username: Optional[str] = None, display_name: Opti
         return row
 
 
-def get_user(user_id: int) -> Optional[sqlite3.Row]:
+def get_user(user_id: int) -> sqlite3.Row | None:
     with _connect() as connection:
         return connection.execute("SELECT * FROM users WHERE telegram_user_id = ?", (user_id,)).fetchone()
 
@@ -608,7 +612,7 @@ def is_allowed_user(user_id: int) -> bool:
     return user["status"] in {STATUS_ACTIVE, STATUS_LIMITED}
 
 
-def set_user_status(user_id: int, status: str, reason: str = "", until: Optional[str] = None) -> bool:
+def set_user_status(user_id: int, status: str, reason: str = "", until: str | None = None) -> bool:
     if status not in ALLOWED_STATUSES:
         raise ValueError("invalid user status")
     now = utc_now()
@@ -651,7 +655,7 @@ def create_developer_access_request(user_id: int, message: str) -> tuple[str, bo
     return request_id, True
 
 
-def list_developer_access_requests(status: str = "open", limit: int = 100) -> List[sqlite3.Row]:
+def list_developer_access_requests(status: str = "open", limit: int = 100) -> list[sqlite3.Row]:
     if status not in {"open", "approved", "denied", "all"}:
         raise ValueError("invalid developer request status")
     with _connect() as connection:
@@ -684,7 +688,7 @@ def _api_key_hash(raw_key: str) -> str:
     return hmac.new(_api_key_hash_secret(), raw_key.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _api_key_scopes(row: sqlite3.Row) -> List[str]:
+def _api_key_scopes(row: sqlite3.Row) -> list[str]:
     try:
         scopes = json.loads(row["scopes_json"] or "[]")
     except (TypeError, json.JSONDecodeError):
@@ -692,7 +696,7 @@ def _api_key_scopes(row: sqlite3.Row) -> List[str]:
     return sorted({str(scope) for scope in scopes if str(scope) in API_KEY_SCOPES})
 
 
-def record_developer_audit(actor_user_id: Optional[int], owner_user_id: Optional[int], key_id: Optional[str], action: str, outcome: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+def record_developer_audit(actor_user_id: int | None, owner_user_id: int | None, key_id: str | None, action: str, outcome: str, metadata: dict[str, Any] | None = None) -> str:
     event_id = "dev_audit_" + secrets.token_urlsafe(8)
     with _connect() as connection:
         connection.execute("INSERT INTO developer_audit_events (event_id, actor_user_id, owner_user_id, key_id, action, outcome, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (event_id, actor_user_id, owner_user_id, key_id, str(action)[:80], str(outcome)[:80], json.dumps(metadata or {}, separators=(",", ":")), utc_now()))
@@ -700,7 +704,7 @@ def record_developer_audit(actor_user_id: Optional[int], owner_user_id: Optional
     return event_id
 
 
-def create_api_key(user_id: int, name: str, scopes: Iterable[str], rate_limit_per_minute: int = DEFAULT_API_KEY_RATE_LIMIT) -> Dict[str, Any]:
+def create_api_key(user_id: int, name: str, scopes: Iterable[str], rate_limit_per_minute: int = DEFAULT_API_KEY_RATE_LIMIT) -> dict[str, Any]:
     user = get_user(user_id)
     if not user or user["role"] not in {ROLE_DEVELOPER, ROLE_ADMIN} or user["status"] != STATUS_ACTIVE:
         raise PermissionError("active developer capability required")
@@ -721,7 +725,7 @@ def create_api_key(user_id: int, name: str, scopes: Iterable[str], rate_limit_pe
     return {"key_id": key_id, "key": raw_key, "name": clean_name, "scopes": clean_scopes, "rate_limit_per_minute": limit, "created_at": now}
 
 
-def list_api_keys(user_id: int) -> List[Dict[str, Any]]:
+def list_api_keys(user_id: int) -> list[dict[str, Any]]:
     with _connect() as connection:
         rows = connection.execute("SELECT key_id, user_id, name, scopes_json, status, rate_limit_per_minute, last_used_at, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC LIMIT 100", (user_id,)).fetchall()
     return [{"key_id": row["key_id"], "user_id": row["user_id"], "name": row["name"], "scopes": _api_key_scopes(row), "status": row["status"], "rate_limit_per_minute": row["rate_limit_per_minute"], "last_used_at": row["last_used_at"], "created_at": row["created_at"], "revoked_at": row["revoked_at"]} for row in rows]
@@ -754,7 +758,7 @@ def revoke_api_key(key_id: str, requester_user_id: int, is_requester_admin: bool
     return True
 
 
-def authenticate_api_key(raw_key: str, required_scope: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def authenticate_api_key(raw_key: str, required_scope: str | None = None) -> dict[str, Any] | None:
     raw_key = str(raw_key or "")
     parts = raw_key.split(".")
     if len(parts) != 3 or parts[0] != "gai_live" or len(raw_key) > 300:
@@ -804,7 +808,7 @@ def check_api_key_rate_limit(key_id: str, user_id: int, limit: int) -> tuple[boo
     return True, current + 1, bounded_limit
 
 
-def get_developer_stats(user_id: int) -> Dict[str, Any]:
+def get_developer_stats(user_id: int) -> dict[str, Any]:
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M")
     with _connect() as connection:
         active = connection.execute("SELECT COUNT(*) AS count FROM api_keys WHERE user_id = ? AND status = 'active'", (user_id,)).fetchone()["count"]
@@ -813,7 +817,7 @@ def get_developer_stats(user_id: int) -> Dict[str, Any]:
     return {"active_keys": int(active), "requests_last_24h": int(total), "denied_events_last_24h": int(denied)}
 
 
-def list_users_by_status(status: Optional[str] = None, limit: int = 200) -> List[sqlite3.Row]:
+def list_users_by_status(status: str | None = None, limit: int = 200) -> list[sqlite3.Row]:
     if status is not None and status not in ALLOWED_STATUSES:
         raise ValueError("invalid user status")
     with _connect() as connection:
@@ -822,7 +826,7 @@ def list_users_by_status(status: Optional[str] = None, limit: int = 200) -> List
         return connection.execute("SELECT telegram_user_id, username, display_name, role, status, plan, quota_used, quota_limit, risk_score, strike_count, last_seen_at FROM users WHERE status != 'banned' ORDER BY last_seen_at DESC LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
 
 
-def list_users_by_role(role: str, limit: int = 200) -> List[sqlite3.Row]:
+def list_users_by_role(role: str, limit: int = 200) -> list[sqlite3.Row]:
     audience = str(role or "").strip().lower()
     if audience not in ALLOWED_ROLES:
         raise ValueError("invalid user role")
@@ -833,7 +837,7 @@ def list_users_by_role(role: str, limit: int = 200) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-def search_users(query: str, limit: int = 25) -> List[sqlite3.Row]:
+def search_users(query: str, limit: int = 25) -> list[sqlite3.Row]:
     query = (query or "").strip()[:100]
     try:
         numeric_id = int(query)
@@ -851,7 +855,7 @@ def search_users(query: str, limit: int = 25) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-def get_maintenance_state() -> Dict[str, Any]:
+def get_maintenance_state() -> dict[str, Any]:
     with _connect() as connection:
         row = connection.execute("SELECT singleton_id, mode, message, reason, incident_id, started_at, ends_at, updated_at, metadata_json FROM maintenance_state WHERE singleton_id = 1").fetchone()
     if not row:
@@ -865,7 +869,7 @@ def get_maintenance_state() -> Dict[str, Any]:
     return data
 
 
-def set_maintenance_state(mode: str, message: str = "", reason: str = "", actor_user_id: Optional[int] = None, incident_id: Optional[str] = None, ends_at: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def set_maintenance_state(mode: str, message: str = "", reason: str = "", actor_user_id: int | None = None, incident_id: str | None = None, ends_at: str | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     clean_mode = str(mode or "").strip().lower()
     if clean_mode not in MAINTENANCE_MODES:
         raise ValueError("invalid maintenance mode")
@@ -887,7 +891,7 @@ def set_maintenance_state(mode: str, message: str = "", reason: str = "", actor_
     return get_maintenance_state()
 
 
-def update_maintenance_recovery_progress(incident_id: str, consecutive_successes: int, last_probe_at: str, last_probe_status: str, probe_error_type: Optional[str] = None) -> bool:
+def update_maintenance_recovery_progress(incident_id: str, consecutive_successes: int, last_probe_at: str, last_probe_status: str, probe_error_type: str | None = None) -> bool:
     clean_incident = str(incident_id or "")[:100]
     if not clean_incident:
         return False
@@ -918,7 +922,7 @@ def update_maintenance_recovery_progress(incident_id: str, consecutive_successes
         return cursor.rowcount == 1
 
 
-def recover_automatic_maintenance(incident_id: str, stability_checks: int) -> Optional[Dict[str, Any]]:
+def recover_automatic_maintenance(incident_id: str, stability_checks: int) -> dict[str, Any] | None:
     clean_incident = str(incident_id or "")[:100]
     required_checks = max(1, min(int(stability_checks), 100))
     if not clean_incident:
@@ -949,12 +953,12 @@ def recover_automatic_maintenance(incident_id: str, stability_checks: int) -> Op
     return get_maintenance_state()
 
 
-def list_maintenance_events(limit: int = 50) -> List[sqlite3.Row]:
+def list_maintenance_events(limit: int = 50) -> list[sqlite3.Row]:
     with _connect() as connection:
         return connection.execute("SELECT event_id, mode, message, reason, incident_id, actor_user_id, metadata_json, created_at FROM maintenance_events ORDER BY created_at DESC LIMIT ?", (max(1, min(int(limit), 200)),)).fetchall()
 
 
-def save_runtime_snapshot(snapshot_kind: str, payload: Dict[str, Any], incident_id: Optional[str] = None) -> str:
+def save_runtime_snapshot(snapshot_kind: str, payload: dict[str, Any], incident_id: str | None = None) -> str:
     snapshot_id = "snp_" + secrets.token_urlsafe(8)
     safe_payload = json.dumps(payload or {}, separators=(",", ":"), default=str)[:12000]
     with _connect() as connection:
@@ -963,14 +967,14 @@ def save_runtime_snapshot(snapshot_kind: str, payload: Dict[str, Any], incident_
     return snapshot_id
 
 
-def get_latest_runtime_snapshot(snapshot_kind: Optional[str] = None) -> Optional[sqlite3.Row]:
+def get_latest_runtime_snapshot(snapshot_kind: str | None = None) -> sqlite3.Row | None:
     with _connect() as connection:
         if snapshot_kind:
             return connection.execute("SELECT snapshot_id, incident_id, snapshot_kind, payload_json, created_at FROM runtime_snapshots WHERE snapshot_kind = ? ORDER BY created_at DESC LIMIT 1", (str(snapshot_kind)[:80],)).fetchone()
         return connection.execute("SELECT snapshot_id, incident_id, snapshot_kind, payload_json, created_at FROM runtime_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
 
 
-def create_queue_entry(operation_id: str, user_id: int, chat_id: Optional[int], kind: str, priority: int, estimated_wait_seconds: int = 0) -> bool:
+def create_queue_entry(operation_id: str, user_id: int, chat_id: int | None, kind: str, priority: int, estimated_wait_seconds: int = 0) -> bool:
     now = utc_now()
     with _connect() as connection:
         try:
@@ -988,7 +992,7 @@ def claim_queue_entry(operation_id: str) -> bool:
         return cursor.rowcount == 1
 
 
-def update_queue_entry(operation_id: str, status: str, error_code: Optional[str] = None) -> bool:
+def update_queue_entry(operation_id: str, status: str, error_code: str | None = None) -> bool:
     clean_status = str(status or "").strip().lower()
     if clean_status not in QUEUE_STATUSES:
         raise ValueError("invalid queue status")
@@ -1005,7 +1009,7 @@ def update_queue_eta(operation_id: str, estimated_wait_seconds: int) -> bool:
         return cursor.rowcount == 1
 
 
-def list_queue_entries(status: Optional[str] = None, limit: int = 100) -> List[sqlite3.Row]:
+def list_queue_entries(status: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
     if status and status not in QUEUE_STATUSES:
         raise ValueError("invalid queue status")
     with _connect() as connection:
@@ -1014,7 +1018,7 @@ def list_queue_entries(status: Optional[str] = None, limit: int = 100) -> List[s
         return connection.execute("SELECT queue_id, operation_id, user_id, chat_id, kind, priority, status, estimated_wait_seconds, error_code, enqueued_at, started_at, completed_at FROM request_queue ORDER BY enqueued_at DESC LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
 
 
-def get_platform_activity_summary() -> Dict[str, Any]:
+def get_platform_activity_summary() -> dict[str, Any]:
     """Return bounded operational aggregates; never return user identities."""
     now = datetime.now(timezone.utc)
     active_since = (now - timedelta(minutes=5)).replace(microsecond=0).isoformat()
@@ -1032,10 +1036,21 @@ def get_platform_activity_summary() -> Dict[str, Any]:
     }
 
 
-def get_queue_stats() -> Dict[str, Any]:
+def get_queue_stats() -> dict[str, Any]:
     with _connect() as connection:
         counts = {row["status"]: int(row["count"]) for row in connection.execute("SELECT status, COUNT(*) AS count FROM request_queue GROUP BY status").fetchall()}
-        active = connection.execute("SELECT AVG((julianday(completed_at) - julianday(started_at)) * 86400.0) AS seconds FROM request_queue WHERE status = 'succeeded' AND started_at IS NOT NULL AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 100").fetchone()["seconds"]
+        active = connection.execute(
+            """
+            SELECT AVG(duration_seconds) AS seconds
+            FROM (
+                SELECT (julianday(completed_at) - julianday(started_at)) * 86400.0 AS duration_seconds
+                FROM request_queue
+                WHERE status = 'succeeded' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+                ORDER BY completed_at DESC
+                LIMIT 100
+            )
+            """
+        ).fetchone()["seconds"]
         oldest = connection.execute("SELECT enqueued_at FROM request_queue WHERE status = 'queued' ORDER BY priority DESC, enqueued_at ASC LIMIT 1").fetchone()
     return {"counts": counts, "queued": counts.get("queued", 0), "running": counts.get("running", 0), "oldest_queued_at": oldest["enqueued_at"] if oldest else None, "average_completed_seconds": round(float(active or 0), 2)}
 
@@ -1043,26 +1058,44 @@ def get_queue_stats() -> Dict[str, Any]:
 def consume_quota(user_id: int, units: int = 1) -> tuple[bool, int, int]:
     if units < 1 or units > 100:
         raise ValueError("invalid quota units")
-    user = ensure_user(user_id)
-    if user["role"] == ROLE_ADMIN:
-        return True, user["quota_used"], user["quota_limit"]
+    ensure_user(user_id)
     now = datetime.now(timezone.utc)
-    reset_at = user["quota_reset_at"]
-    if not reset_at or reset_at <= now.isoformat():
-        reset_at = (now + timedelta(days=30)).replace(microsecond=0).isoformat()
-        with _connect() as connection:
-            connection.execute("UPDATE users SET quota_used = 0, quota_reset_at = ?, updated_at = ? WHERE telegram_user_id = ?", (reset_at, utc_now(), user_id))
-            connection.commit()
-        user = ensure_user(user_id)
-    if user["quota_used"] + units > user["quota_limit"]:
-        return False, user["quota_used"], user["quota_limit"]
+    now_iso = now.isoformat()
     with _connect() as connection:
-        connection.execute("UPDATE users SET quota_used = quota_used + ?, updated_at = ? WHERE telegram_user_id = ?", (units, utc_now(), user_id))
+        connection.execute("BEGIN IMMEDIATE")
+        user = connection.execute(
+            "SELECT role, quota_used, quota_limit, quota_reset_at FROM users WHERE telegram_user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if user is None:
+            raise RuntimeError("user lookup failed during quota consumption")
+        if user["role"] == ROLE_ADMIN:
+            connection.commit()
+            return True, int(user["quota_used"] or 0), int(user["quota_limit"] or 0)
+        reset_at = user["quota_reset_at"]
+        if not reset_at or reset_at <= now_iso:
+            reset_at = (now + timedelta(days=30)).replace(microsecond=0).isoformat()
+            connection.execute(
+                "UPDATE users SET quota_used = 0, quota_reset_at = ?, updated_at = ? WHERE telegram_user_id = ?",
+                (reset_at, utc_now(), user_id),
+            )
+            used = 0
+        else:
+            used = int(user["quota_used"] or 0)
+        limit = int(user["quota_limit"] or 0)
+        if used + units > limit:
+            connection.commit()
+            return False, used, limit
+        new_used = used + units
+        connection.execute(
+            "UPDATE users SET quota_used = ?, updated_at = ? WHERE telegram_user_id = ?",
+            (new_used, utc_now(), user_id),
+        )
         connection.commit()
-    return True, user["quota_used"] + units, user["quota_limit"]
+        return True, new_used, limit
 
 
-def create_operation(operation_id: str, user_id: int, chat_id: Optional[int], kind: str, target_url: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
+def create_operation(operation_id: str, user_id: int, chat_id: int | None, kind: str, target_url: str | None = None, metadata: dict[str, Any] | None = None) -> None:
     now = utc_now()
     with _connect() as connection:
         connection.execute(
@@ -1103,7 +1136,7 @@ def count_download_jobs_since(user_id: int, since_iso: str) -> int:
     return int(row['count'] if row else 0)
 
 
-def get_last_download_job_at(user_id: int) -> Optional[str]:
+def get_last_download_job_at(user_id: int) -> str | None:
     with _connect() as connection:
         row = connection.execute(
             "SELECT created_at FROM download_jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -1112,7 +1145,7 @@ def get_last_download_job_at(user_id: int) -> Optional[str]:
     return str(row['created_at']) if row else None
 
 
-def update_operation(operation_id: str, status: str, attempt_count: Optional[int] = None) -> bool:
+def update_operation(operation_id: str, status: str, attempt_count: int | None = None) -> bool:
     with _connect() as connection:
         if attempt_count is None:
             cursor = connection.execute("UPDATE operations SET status = ?, updated_at = ? WHERE operation_id = ?", (status, utc_now(), operation_id))
@@ -1122,21 +1155,21 @@ def update_operation(operation_id: str, status: str, attempt_count: Optional[int
         return cursor.rowcount == 1
 
 
-def list_session_metadata(user_id: Optional[int] = None, limit: int = 100) -> List[sqlite3.Row]:
+def list_session_metadata(user_id: int | None = None, limit: int = 100) -> list[sqlite3.Row]:
     with _connect() as connection:
         if user_id is None:
             return connection.execute("SELECT user_id, name, created_at FROM sessions ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall()
         return connection.execute("SELECT user_id, name, created_at FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?", (user_id, max(1, min(limit, 500)))).fetchall()
 
 
-def list_operations(user_id: Optional[int] = None, limit: int = 100) -> List[sqlite3.Row]:
+def list_operations(user_id: int | None = None, limit: int = 100) -> list[sqlite3.Row]:
     with _connect() as connection:
         if user_id is None:
             return connection.execute("SELECT operation_id, telegram_user_id, chat_id, kind, status, target_url, attempt_count, created_at, updated_at FROM operations ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall()
         return connection.execute("SELECT operation_id, telegram_user_id, chat_id, kind, status, target_url, attempt_count, created_at, updated_at FROM operations WHERE telegram_user_id = ? ORDER BY created_at DESC LIMIT ?", (user_id, max(1, min(limit, 500)))).fetchall()
 
 
-def create_report(reporter_user_id: int, category: str, description: str, target_user_id: Optional[int] = None) -> str:
+def create_report(reporter_user_id: int, category: str, description: str, target_user_id: int | None = None) -> str:
     report_id = "rpt_" + secrets.token_urlsafe(8)
     now = utc_now()
     with _connect() as connection:
@@ -1145,7 +1178,7 @@ def create_report(reporter_user_id: int, category: str, description: str, target
     return report_id
 
 
-def create_appeal(user_id: int, message: str, related_report_id: Optional[str] = None) -> str:
+def create_appeal(user_id: int, message: str, related_report_id: str | None = None) -> str:
     appeal_id = "apl_" + secrets.token_urlsafe(8)
     now = utc_now()
     with _connect() as connection:
@@ -1154,22 +1187,22 @@ def create_appeal(user_id: int, message: str, related_report_id: Optional[str] =
     return appeal_id
 
 
-def list_reports(status: str = "open", limit: int = 100) -> List[sqlite3.Row]:
+def list_reports(status: str = "open", limit: int = 100) -> list[sqlite3.Row]:
     with _connect() as connection:
         return connection.execute("SELECT report_id, reporter_user_id, target_user_id, category, description, status, assigned_admin_id, resolution, created_at, updated_at FROM reports WHERE status = ? ORDER BY created_at ASC LIMIT ?", (status, max(1, min(limit, 500)))).fetchall()
 
 
-def list_appeals(status: str = "open", limit: int = 100) -> List[sqlite3.Row]:
+def list_appeals(status: str = "open", limit: int = 100) -> list[sqlite3.Row]:
     with _connect() as connection:
         return connection.execute("SELECT appeal_id, user_id, related_report_id, message, status, assigned_admin_id, resolution, created_at, updated_at FROM appeals WHERE status = ? ORDER BY created_at ASC LIMIT ?", (status, max(1, min(limit, 500)))).fetchall()
 
 
-def get_report(report_id: str) -> Optional[sqlite3.Row]:
+def get_report(report_id: str) -> sqlite3.Row | None:
     with _connect() as connection:
         return connection.execute("SELECT report_id, reporter_user_id, target_user_id, category, description, status, resolution FROM reports WHERE report_id = ?", (str(report_id)[:100],)).fetchone()
 
 
-def get_appeal(appeal_id: str) -> Optional[sqlite3.Row]:
+def get_appeal(appeal_id: str) -> sqlite3.Row | None:
     with _connect() as connection:
         return connection.execute("SELECT appeal_id, user_id, related_report_id, message, status, resolution FROM appeals WHERE appeal_id = ?", (str(appeal_id)[:100],)).fetchone()
 
@@ -1218,7 +1251,7 @@ NOTIFICATION_LEASE_SECONDS = 900
 MAX_NOTIFICATION_ATTEMPTS = 5
 
 
-def list_pending_notifications(limit: int = 50) -> List[sqlite3.Row]:
+def list_pending_notifications(limit: int = 50) -> list[sqlite3.Row]:
     now = utc_now()
     lease_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=NOTIFICATION_LEASE_SECONDS)).replace(microsecond=0).isoformat()
     with _connect() as connection:
@@ -1263,7 +1296,7 @@ def mark_notification_failed(notification_id: str, error: str, retry_after_secon
         return cursor.rowcount == 1
 
 
-def create_bulk_job(admin_user_id: int, action: str, payload: Dict[str, Any], target_ids: Iterable[Any], ttl_minutes: int = 10) -> Dict[str, Any]:
+def create_bulk_job(admin_user_id: int, action: str, payload: dict[str, Any], target_ids: Iterable[Any], ttl_minutes: int = 10) -> dict[str, Any]:
     allowed_actions = {"announce", "mass_dm", "mass_ban", "mass_unban", "mass_appeal"}
     clean_action = str(action or "").strip()[:40]
     if clean_action not in allowed_actions:
@@ -1283,7 +1316,7 @@ def create_bulk_job(admin_user_id: int, action: str, payload: Dict[str, Any], ta
     return {"job_id": job_id, "confirmation_token": token, "action": clean_action, "target_count": len(clean_targets), "expires_at": expires, "status": "preview"}
 
 
-def confirm_bulk_job(job_id: str, confirmation_token: str, admin_user_id: int) -> Optional[Dict[str, Any]]:
+def confirm_bulk_job(job_id: str, confirmation_token: str, admin_user_id: int) -> dict[str, Any] | None:
     now = utc_now()
     with _connect() as connection:
         row = connection.execute("SELECT * FROM admin_bulk_jobs WHERE job_id = ? AND admin_user_id = ? AND status = 'preview'", (str(job_id)[:100], admin_user_id)).fetchone()
@@ -1297,7 +1330,7 @@ def confirm_bulk_job(job_id: str, confirmation_token: str, admin_user_id: int) -
         return confirmed
 
 
-def get_admin_analytics(limit: int = 25) -> Dict[str, Any]:
+def get_admin_analytics(limit: int = 25) -> dict[str, Any]:
     bounded = max(1, min(int(limit), 100))
     with _connect() as connection:
         banned = connection.execute("SELECT telegram_user_id, username, display_name, status_reason, banned_until, updated_at FROM users WHERE status = 'banned' ORDER BY updated_at DESC LIMIT ?", (bounded,)).fetchall()
@@ -1310,7 +1343,7 @@ def get_admin_analytics(limit: int = 25) -> Dict[str, Any]:
     return {"banned_users": rows(banned), "suspicious_users": rows(suspicious), "top_users": rows(top_users), "top_referrers": rows(top_referrers), "most_risky_users": rows(most_risky)}
 
 
-def record_developer_event(owner_user_id: int, event_type: str, payload: Dict[str, Any]) -> str:
+def record_developer_event(owner_user_id: int, event_type: str, payload: dict[str, Any]) -> str:
     event_id = "evt_" + secrets.token_urlsafe(8)
     safe_payload = json.dumps(payload or {}, separators=(",", ":"))[:4000]
     with _connect() as connection:
@@ -1319,7 +1352,7 @@ def record_developer_event(owner_user_id: int, event_type: str, payload: Dict[st
     return event_id
 
 
-def list_developer_events(owner_user_id: int, after_event_id: Optional[str] = None, limit: int = 50) -> List[sqlite3.Row]:
+def list_developer_events(owner_user_id: int, after_event_id: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
     with _connect() as connection:
         if after_event_id:
             return connection.execute("SELECT event_id, event_type, payload_json, created_at FROM developer_events WHERE owner_user_id = ? AND created_at > COALESCE((SELECT created_at FROM developer_events WHERE event_id = ? AND owner_user_id = ?), '') ORDER BY created_at, event_id LIMIT ?", (owner_user_id, str(after_event_id)[:100], owner_user_id, max(1, min(int(limit), 200)))).fetchall()
@@ -1335,7 +1368,7 @@ def update_bulk_job_counts(job_id: str, processed: int, succeeded: int, failed: 
         return cursor.rowcount == 1
 
 
-def create_ad_campaign(admin_user_id: int, title: str, body: str, target_chat_ids: Iterable[int], repeat_count: int, interval_seconds: int, ttl_minutes: int = 15) -> Dict[str, Any]:
+def create_ad_campaign(admin_user_id: int, title: str, body: str, target_chat_ids: Iterable[int], repeat_count: int, interval_seconds: int, ttl_minutes: int = 15) -> dict[str, Any]:
     clean_targets = sorted({int(value) for value in target_chat_ids})
     if not clean_targets or len(clean_targets) > 50:
         raise ValueError("ad campaign target limit exceeded")
@@ -1357,7 +1390,7 @@ def create_ad_campaign(admin_user_id: int, title: str, body: str, target_chat_id
     return {"campaign_id": campaign_id, "confirmation_token": token, "title": clean_title, "body": clean_body, "target_chat_ids": clean_targets, "repeat_count": clean_repeat, "interval_seconds": clean_interval, "expires_at": expires, "status": "preview"}
 
 
-def confirm_ad_campaign(campaign_id: str, confirmation_token: str, admin_user_id: int) -> Optional[Dict[str, Any]]:
+def confirm_ad_campaign(campaign_id: str, confirmation_token: str, admin_user_id: int) -> dict[str, Any] | None:
     now = utc_now()
     with _connect() as connection:
         row = connection.execute("SELECT * FROM ad_campaigns WHERE campaign_id = ? AND admin_user_id = ? AND status = 'preview'", (str(campaign_id)[:100], int(admin_user_id))).fetchone()
@@ -1370,28 +1403,28 @@ def confirm_ad_campaign(campaign_id: str, confirmation_token: str, admin_user_id
         return confirmed
 
 
-def get_ad_campaign(campaign_id: str) -> Optional[sqlite3.Row]:
+def get_ad_campaign(campaign_id: str) -> sqlite3.Row | None:
     with _connect() as connection:
         return connection.execute("SELECT * FROM ad_campaigns WHERE campaign_id = ?", (str(campaign_id)[:100],)).fetchone()
 
 
-def list_ad_campaigns_for_admin(admin_user_id: int, limit: int = 20) -> List[sqlite3.Row]:
+def list_ad_campaigns_for_admin(admin_user_id: int, limit: int = 20) -> list[sqlite3.Row]:
     with _connect() as connection:
         return connection.execute("SELECT campaign_id, title, repeat_count, next_run_at, status, created_at, pause_reason, paused_at FROM ad_campaigns WHERE admin_user_id = ? ORDER BY created_at DESC LIMIT ?", (int(admin_user_id), max(1, min(int(limit), 50)))).fetchall()
 
 
-def list_active_ad_campaigns(limit: int = 50) -> List[sqlite3.Row]:
+def list_active_ad_campaigns(limit: int = 50) -> list[sqlite3.Row]:
     with _connect() as connection:
         return connection.execute("SELECT * FROM ad_campaigns WHERE status = 'active' AND next_run_at IS NOT NULL ORDER BY next_run_at LIMIT ?", (max(1, min(int(limit), 100)),)).fetchall()
 
 
-def list_due_ad_campaigns(limit: int = 20) -> List[sqlite3.Row]:
+def list_due_ad_campaigns(limit: int = 20) -> list[sqlite3.Row]:
     now = utc_now()
     with _connect() as connection:
         return connection.execute("SELECT * FROM ad_campaigns WHERE status = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at LIMIT ?", (now, max(1, min(int(limit), 50)))).fetchall()
 
 
-def update_ad_campaign_next_run(campaign_id: str, next_run_at: Optional[str], status: str = "active", next_occurrence: Optional[int] = None) -> bool:
+def update_ad_campaign_next_run(campaign_id: str, next_run_at: str | None, status: str = "active", next_occurrence: int | None = None) -> bool:
     if status not in {"active", "paused", "completed", "cancelled", "failed"}:
         raise ValueError("invalid ad campaign status")
     with _connect() as connection:
@@ -1409,7 +1442,7 @@ def count_ad_permission_loss_targets(campaign_id: str) -> int:
     return int(row["count"] if row else 0)
 
 
-def pause_ad_campaign_for_permission_loss(campaign_id: str, threshold: int) -> Optional[Dict[str, Any]]:
+def pause_ad_campaign_for_permission_loss(campaign_id: str, threshold: int) -> dict[str, Any] | None:
     clean_campaign = str(campaign_id or "")[:100]
     required = max(1, min(int(threshold), 50))
     if not clean_campaign:
@@ -1432,7 +1465,7 @@ def pause_ad_campaign_for_permission_loss(campaign_id: str, threshold: int) -> O
     return {"campaign_id": clean_campaign, "permission_loss_count": loss_count, "threshold": required, "reason": reason, "paused_at": now}
 
 
-def resume_ad_campaign(campaign_id: str, admin_user_id: int) -> Optional[Dict[str, Any]]:
+def resume_ad_campaign(campaign_id: str, admin_user_id: int) -> dict[str, Any] | None:
     clean_campaign = str(campaign_id or "")[:100]
     now = utc_now()
     with _connect() as connection:
@@ -1465,7 +1498,7 @@ def reclaim_stale_ad_deliveries(older_than_seconds: int = 600) -> int:
         return cursor.rowcount
 
 
-def list_pending_ad_deliveries(campaign_id: str, occurrence: int, limit: int = 50) -> List[sqlite3.Row]:
+def list_pending_ad_deliveries(campaign_id: str, occurrence: int, limit: int = 50) -> list[sqlite3.Row]:
     with _connect() as connection:
         return connection.execute("SELECT * FROM ad_deliveries WHERE campaign_id = ? AND occurrence = ? AND status IN ('pending', 'failed') AND attempt_count < 3 ORDER BY target_chat_id LIMIT ?", (str(campaign_id)[:100], int(occurrence), max(1, min(int(limit), 50)))).fetchall()
 
@@ -1478,7 +1511,7 @@ def mark_ad_delivery_sending(delivery_id: str) -> bool:
         return cursor.rowcount == 1
 
 
-def mark_ad_delivery_sent(delivery_id: str, telegram_message_id: Optional[int]) -> bool:
+def mark_ad_delivery_sent(delivery_id: str, telegram_message_id: int | None) -> bool:
     now = utc_now()
     with _connect() as connection:
         cursor = connection.execute("UPDATE ad_deliveries SET status = 'sent', telegram_message_id = ?, sent_at = ?, updated_at = ?, last_error = NULL WHERE delivery_id = ? AND status = 'sending'", (telegram_message_id, now, now, str(delivery_id)[:160]))
@@ -1507,18 +1540,18 @@ def count_ad_delivery_status(campaign_id: str, occurrence: int, status: str) -> 
     return int(row["count"] if row else 0)
 
 
-def get_ad_delivery(campaign_id: str, occurrence: int, target_chat_id: int) -> Optional[sqlite3.Row]:
+def get_ad_delivery(campaign_id: str, occurrence: int, target_chat_id: int) -> sqlite3.Row | None:
     with _connect() as connection:
         return connection.execute("SELECT * FROM ad_deliveries WHERE campaign_id = ? AND occurrence = ? AND target_chat_id = ?", (str(campaign_id)[:100], int(occurrence), int(target_chat_id))).fetchone()
 
 
-def get_ad_chat_last_sent_at(target_chat_id: int) -> Optional[str]:
+def get_ad_chat_last_sent_at(target_chat_id: int) -> str | None:
     with _connect() as connection:
         row = connection.execute("SELECT d.sent_at FROM ad_deliveries d JOIN ad_campaigns c ON c.campaign_id = d.campaign_id WHERE d.target_chat_id = ? AND d.status = 'sent' ORDER BY d.sent_at DESC LIMIT 1", (int(target_chat_id),)).fetchone()
     return row["sent_at"] if row else None
 
 
-def get_payment_order_by_external_id(provider: str, external_id: str) -> Optional[sqlite3.Row]:
+def get_payment_order_by_external_id(provider: str, external_id: str) -> sqlite3.Row | None:
     with _connect() as connection:
         return connection.execute("SELECT * FROM payment_orders WHERE provider = ? AND external_id = ?", (provider, external_id)).fetchone()
 
@@ -1532,7 +1565,7 @@ def calibrate_risk_decision(score: float, confidence: float) -> str:
     return "human_review"
 
 
-def record_risk_event(user_id: int, operation_id: Optional[str], score: float, confidence: float, decision: str, evidence: Dict[str, Any], model_version: str, human_review_required: bool = True) -> str:
+def record_risk_event(user_id: int, operation_id: str | None, score: float, confidence: float, decision: str, evidence: dict[str, Any], model_version: str, human_review_required: bool = True) -> str:
     event_id = "risk_" + secrets.token_urlsafe(8)
     with _connect() as connection:
         connection.execute("INSERT INTO risk_events (risk_event_id, user_id, operation_id, score, confidence, decision, evidence_json, model_version, human_review_required, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (event_id, user_id, operation_id, max(0.0, min(score, 1.0)), max(0.0, min(confidence, 1.0)), decision[:40], json.dumps(evidence or {}, separators=(",", ":")), model_version[:80], int(human_review_required), utc_now()))
@@ -1554,7 +1587,7 @@ def create_dashboard_login_token(user_id: int, ttl_minutes: int = 30) -> str:
     return raw
 
 
-def exchange_dashboard_login_token(raw_token: str, ttl_hours: int = 24) -> Optional[Dict[str, str]]:
+def exchange_dashboard_login_token(raw_token: str, ttl_hours: int = 24) -> dict[str, str] | None:
     if not raw_token or len(raw_token) > 200:
         return None
     now = utc_now()
@@ -1578,7 +1611,7 @@ def exchange_dashboard_login_token(raw_token: str, ttl_hours: int = 24) -> Optio
         return {"session": session_raw, "csrf": csrf_raw, "user_id": str(row["user_id"]), "expires_at": expires}
 
 
-def get_dashboard_session(raw_session: str) -> Optional[sqlite3.Row]:
+def get_dashboard_session(raw_session: str) -> sqlite3.Row | None:
     if not raw_session or len(raw_session) > 200:
         return None
     with _connect() as connection:
@@ -1631,7 +1664,7 @@ def attribute_referral(referred_user_id: int, code: str, source: str = "telegram
         return "attributed"
 
 
-def get_referral_stats(user_id: int) -> Dict[str, Any]:
+def get_referral_stats(user_id: int) -> dict[str, Any]:
     with _connect() as connection:
         code = connection.execute("SELECT code FROM referral_codes WHERE referrer_user_id = ? AND active = 1", (user_id,)).fetchone()
         counts = connection.execute("SELECT status, COUNT(*) AS count FROM referrals WHERE referrer_user_id = ? GROUP BY status", (user_id,)).fetchall()
@@ -1639,7 +1672,7 @@ def get_referral_stats(user_id: int) -> Dict[str, Any]:
     return {"code": code["code"] if code else None, "counts": {row["status"]: row["count"] for row in counts}, "reward_units": int(rewards["total"] if rewards else 0)}
 
 
-def qualify_referral(referred_user_id: int, source_event: str = "qualified_payment") -> Optional[str]:
+def qualify_referral(referred_user_id: int, source_event: str = "qualified_payment") -> str | None:
     """Qualify exactly once and grant auditable quota bonuses to both participants."""
     bonus = max(1, int(os.getenv("REFERRER_BONUS_UNITS", "20")))
     referred_bonus = max(1, bonus // 2)
@@ -1663,14 +1696,14 @@ def qualify_referral(referred_user_id: int, source_event: str = "qualified_payme
         return referral["referral_id"]
 
 
-def list_referrals(status: Optional[str] = None, limit: int = 100) -> List[sqlite3.Row]:
+def list_referrals(status: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
     with _connect() as connection:
         if status:
             return connection.execute("SELECT referral_id, code, referrer_user_id, referred_user_id, status, source, qualified_at, created_at, updated_at FROM referrals WHERE status = ? ORDER BY created_at DESC LIMIT ?", (status, max(1, min(limit, 500)))).fetchall()
         return connection.execute("SELECT referral_id, code, referrer_user_id, referred_user_id, status, source, qualified_at, created_at, updated_at FROM referrals ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall()
 
 
-def record_admin_action(admin_user_id: int, action: str, target_user_id: Optional[int], reason: str = "", metadata: Optional[Dict[str, Any]] = None) -> str:
+def record_admin_action(admin_user_id: int, action: str, target_user_id: int | None, reason: str = "", metadata: dict[str, Any] | None = None) -> str:
     action_id = "adm_" + secrets.token_urlsafe(8)
     with _connect() as connection:
         connection.execute("INSERT INTO admin_actions (action_id, admin_user_id, target_user_id, action, reason, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (action_id, admin_user_id, target_user_id, action[:80], reason[:500], json.dumps(metadata or {}, separators=(",", ":")), utc_now()))
@@ -1678,7 +1711,7 @@ def record_admin_action(admin_user_id: int, action: str, target_user_id: Optiona
     return action_id
 
 
-def record_payment_order(user_id: int, provider: str, external_id: str, amount: int, currency: str, payload: Optional[Dict[str, Any]] = None) -> tuple[str, bool]:
+def record_payment_order(user_id: int, provider: str, external_id: str, amount: int, currency: str, payload: dict[str, Any] | None = None) -> tuple[str, bool]:
     order_id = "ord_" + secrets.token_urlsafe(8)
     now = utc_now()
     with _connect() as connection:
@@ -1705,7 +1738,7 @@ def attach_payment_charge(order_id: str, charge_id: str) -> bool:
         return True
 
 
-def mark_payment_success(order_id: str, plan: str, expires_at: Optional[str] = None) -> bool:
+def mark_payment_success(order_id: str, plan: str, expires_at: str | None = None) -> bool:
     if plan not in {"pro", "max"}:
         raise ValueError("invalid entitlement plan")
     quota_limit = int(os.getenv("PRO_PLAN_QUOTA", "1000")) if plan == "pro" else int(os.getenv("MAX_PLAN_QUOTA", "5000"))
@@ -1739,11 +1772,11 @@ def record_conversation_turn(
     chat_id: int,
     role: str,
     text: str,
-    source_message_id: Optional[int] = None,
-    telegram_message_id: Optional[int] = None,
-    reply_to_message_id: Optional[int] = None,
-    business_connection_id: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
+    source_message_id: int | None = None,
+    telegram_message_id: int | None = None,
+    reply_to_message_id: int | None = None,
+    business_connection_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> int:
     clean_role = str(role or "").strip().lower()
     if clean_role not in {"user", "assistant", "system"}:
@@ -1771,7 +1804,7 @@ def record_conversation_turn(
         return int(cursor.lastrowid)
 
 
-def get_conversation_turn_by_telegram_message_id(owner_user_id: int, chat_id: int, telegram_message_id: int) -> Optional[sqlite3.Row]:
+def get_conversation_turn_by_telegram_message_id(owner_user_id: int, chat_id: int, telegram_message_id: int) -> sqlite3.Row | None:
     with _connect() as connection:
         return connection.execute(
             """SELECT turn_id, owner_user_id, chat_id, role, text, source_message_id,
@@ -1783,7 +1816,7 @@ def get_conversation_turn_by_telegram_message_id(owner_user_id: int, chat_id: in
         ).fetchone()
 
 
-def list_conversation_turns(owner_user_id: int, chat_id: int, limit: int = 24) -> List[sqlite3.Row]:
+def list_conversation_turns(owner_user_id: int, chat_id: int, limit: int = 24) -> list[sqlite3.Row]:
     bounded_limit = max(1, min(int(limit), 200))
     with _connect() as connection:
         rows = connection.execute(
@@ -1802,10 +1835,10 @@ def record_contact_log(
     chat_id: int,
     interaction_type: str,
     message_text: str = "",
-    message_id: Optional[int] = None,
-    reply_to_message_id: Optional[int] = None,
-    business_connection_id: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
+    message_id: int | None = None,
+    reply_to_message_id: int | None = None,
+    business_connection_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     contact_id = "contact_" + secrets.token_urlsafe(9)
     with _connect() as connection:
@@ -1831,7 +1864,7 @@ def record_contact_log(
     return contact_id
 
 
-def list_contact_logs(owner_user_id: int, chat_id: Optional[int] = None, limit: int = 50) -> List[sqlite3.Row]:
+def list_contact_logs(owner_user_id: int, chat_id: int | None = None, limit: int = 50) -> list[sqlite3.Row]:
     bounded_limit = max(1, min(int(limit), 200))
     with _connect() as connection:
         if chat_id is None:

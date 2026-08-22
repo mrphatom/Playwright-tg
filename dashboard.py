@@ -9,49 +9,46 @@ import asyncio
 import json
 import os
 import secrets
-from html import escape
-from typing import Any, Dict, Optional
+from typing import Any
 
 from aiohttp import web
 
 from api_contract import developer_api_contract
-
 from control_plane import (
-    admin_ids,
-    ensure_user,
-    exchange_dashboard_login_token,
-    get_dashboard_session,
-    get_user,
-    is_admin,
-    is_developer,
-    list_appeals,
-    list_operations,
-    list_reports,
-    list_session_metadata,
-    record_admin_action,
-    revoke_dashboard_session,
-    get_referral_stats,
-    list_referrals,
-    search_users,
-    set_user_status,
-    resolve_report,
-    resolve_appeal,
-    get_appeal,
-    get_admin_analytics,
-    list_users_by_status,
-    get_maintenance_state,
-    list_maintenance_events,
-    get_queue_stats,
-    get_latest_runtime_snapshot,
-    enqueue_user_notification,
     authenticate_api_key,
     check_api_key_rate_limit,
     consume_quota,
     create_api_key,
-    list_api_keys,
-    revoke_api_key,
+    enqueue_user_notification,
+    ensure_user,
+    exchange_dashboard_login_token,
+    get_admin_analytics,
+    get_appeal,
+    get_dashboard_session,
     get_developer_stats,
+    get_latest_runtime_snapshot,
+    get_maintenance_state,
+    get_queue_stats,
+    get_referral_stats,
+    get_user,
+    is_admin,
+    is_developer,
+    list_api_keys,
+    list_appeals,
+    list_maintenance_events,
+    list_operations,
+    list_referrals,
+    list_reports,
+    list_session_metadata,
+    list_users_by_status,
+    record_admin_action,
     record_developer_audit,
+    resolve_appeal,
+    resolve_report,
+    revoke_api_key,
+    revoke_dashboard_session,
+    search_users,
+    set_user_status,
 )
 
 SESSION_COOKIE = "greyai_session"
@@ -62,7 +59,7 @@ def _json_rows(rows):
     return [dict(row) for row in rows]
 
 
-def developer_api_docs() -> Dict[str, Any]:
+def developer_api_docs() -> dict[str, Any]:
     """Return the redacted, authoritative contract used by Grey’s API guidance."""
     return developer_api_contract(os.getenv("DASHBOARD_BASE_URL"))
 
@@ -98,7 +95,7 @@ def _require_admin(request: web.Request):
     return session, user
 
 
-def _require_api_key(request: web.Request, required_scope: Optional[str] = None):
+def _require_api_key(request: web.Request, required_scope: str | None = None):
     authorization = request.headers.get("Authorization", "")
     if not authorization.startswith("Bearer "):
         raise web.HTTPUnauthorized(text=json.dumps({"error": "api_key_required"}), content_type="application/json")
@@ -128,6 +125,17 @@ def _require_csrf(request: web.Request, session) -> None:
         raise web.HTTPForbidden(text=json.dumps({"error": "csrf_failed"}), content_type="application/json")
 
 
+def _bounded_query_limit(request: web.Request, default: int = 25, maximum: int = 100) -> int:
+    raw = request.query.get("limit", str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_limit"}), content_type="application/json")
+    if value < 1:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_limit"}), content_type="application/json")
+    return min(value, maximum)
+
+
 @web.middleware
 async def security_middleware(request: web.Request, handler):
     try:
@@ -137,7 +145,9 @@ async def security_middleware(request: web.Request, handler):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
+    nonce = request.get("csp_nonce")
+    script_source = "'self'" + (f" 'nonce-{nonce}'" if nonce else "")
+    response.headers["Content-Security-Policy"] = f"default-src 'self'; script-src {script_source}; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -176,7 +186,7 @@ async def operations_handler(request: web.Request):
     return web.json_response({"operations": _json_rows(list_operations(user_id, 100)), "sessions": _json_rows(list_session_metadata(user_id, 100))})
 
 
-def public_status_payload() -> Dict[str, Any]:
+def public_status_payload() -> dict[str, Any]:
     state = get_maintenance_state()
     return {"status": state.get("mode", "operational"), "message": state.get("message", ""), "reason": state.get("reason", ""), "incident_id": state.get("incident_id"), "started_at": state.get("started_at"), "ends_at": state.get("ends_at"), "updated_at": state.get("updated_at")}
 
@@ -193,13 +203,13 @@ async def public_maintenance_events_handler(request: web.Request):
 
 
 async def admin_runtime_handler(request: web.Request):
-    _, user = _require_admin(request)
+    _require_admin(request)
     snapshot = get_latest_runtime_snapshot("crash")
     return web.json_response({"queue": get_queue_stats(), "maintenance": public_status_payload(), "latest_crash_snapshot": ({"snapshot_id": snapshot["snapshot_id"], "incident_id": snapshot["incident_id"], "snapshot_kind": snapshot["snapshot_kind"], "created_at": snapshot["created_at"]} if snapshot else None)})
 
 
 async def health_handler(request: web.Request):
-    session, user = _require_session(request)
+    _, user = _require_session(request)
     operations = list_operations(None if is_admin(user["telegram_user_id"]) and request.query.get("scope") == "all" else user["telegram_user_id"], 100)
     response = {"status": "ok", "role": user["role"], "operations": len(operations), "process": {"pid": os.getpid()}, "maintenance": public_status_payload()}
     if not is_admin(user["telegram_user_id"]):
@@ -230,9 +240,17 @@ async def api_check_handler(request: web.Request):
         raise web.HTTPBadRequest(text=json.dumps({"error": "url_required"}), content_type="application/json")
 
     # Importing inside the handler avoids a bot/dashboard module cycle at startup.
-    from bot import COMMAND_TIMEOUT, is_domain_allowed, is_valid_url, run_browser_task_with_retry, run_browser_request, QueueUnavailable, QueueRejected
+    from bot import (
+        COMMAND_TIMEOUT,
+        QueueRejected,
+        QueueUnavailable,
+        is_valid_url,
+        route_url_allowed,
+        run_browser_request,
+        run_browser_task_with_retry,
+    )
 
-    if not is_valid_url(url) or not is_domain_allowed(url):
+    if not is_valid_url(url) or not route_url_allowed(url, principal["user_id"]):
         record_developer_audit(None, principal["user_id"], principal["key_id"], "api_check", "denied", {"reason": "url_not_allowed"})
         raise web.HTTPBadRequest(text=json.dumps({"error": "url_not_allowed"}), content_type="application/json")
     allowed_quota, used, limit = consume_quota(principal["user_id"])
@@ -327,12 +345,12 @@ async def admin_users_handler(request: web.Request):
 
 async def admin_analytics_handler(request: web.Request):
     _require_admin(request)
-    return web.json_response(get_admin_analytics(min(int(request.query.get("limit", "25")), 100)))
+    return web.json_response(get_admin_analytics(_bounded_query_limit(request, 25, 100)))
 
 
 async def admin_banned_handler(request: web.Request):
     _require_admin(request)
-    return web.json_response({"users": _json_rows(list_users_by_status("banned", min(int(request.query.get("limit", "100")), 200)))})
+    return web.json_response({"users": _json_rows(list_users_by_status("banned", _bounded_query_limit(request, 100, 200)))})
 
 
 async def admin_reports_handler(request: web.Request):
@@ -349,7 +367,12 @@ async def admin_ban_handler(request: web.Request):
     session, admin = _require_admin(request)
     _require_csrf(request, session)
     data = await request.json()
-    target_id = int(data.get("user_id"))
+    try:
+        target_id = int(data.get("user_id"))
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_user_id"}), content_type="application/json")
+    if target_id <= 0:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_user_id"}), content_type="application/json")
     target = get_user(target_id)
     if target and target["role"] == "admin":
         raise web.HTTPForbidden(text=json.dumps({"error": "admin_target_forbidden"}), content_type="application/json")
@@ -365,7 +388,14 @@ async def admin_unban_handler(request: web.Request):
     session, admin = _require_admin(request)
     _require_csrf(request, session)
     data = await request.json()
-    target_id = int(data.get("user_id"))
+    try:
+        target_id = int(data.get("user_id"))
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_user_id"}), content_type="application/json")
+    if target_id <= 0:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_user_id"}), content_type="application/json")
+    if not get_user(target_id):
+        raise web.HTTPNotFound(text=json.dumps({"error": "user_not_found"}), content_type="application/json")
     set_user_status(target_id, "active", "administrator unbanned user")
     action_id = record_admin_action(admin["telegram_user_id"], "unban_user", target_id, "administrator unbanned user")
     enqueue_user_notification(target_id, "moderation", "GreyAI account access restored", "An administrator restored access to your GreyAI account. You may use the bot again.", f"dashboard:moderation:unban:{action_id}")
@@ -425,13 +455,13 @@ HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GreyAI Operations</title>
 <style>body{font-family:system-ui;background:#0b1020;color:#e7ecff;margin:0}main{max-width:1100px;margin:auto;padding:28px}section{background:#131b32;border:1px solid #2d3b63;border-radius:14px;padding:18px;margin:14px 0}h1{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.metric{background:#0e1630;border-radius:10px;padding:14px}.muted{color:#9aa8cd}code{color:#9bd4ff}button{background:#5c7cfa;color:white;border:0;border-radius:8px;padding:8px 12px;cursor:pointer}input{background:#0e1630;color:white;border:1px solid #3b4c7c;border-radius:8px;padding:8px;margin-right:6px}pre{white-space:pre-wrap;overflow:auto;max-height:420px}</style></head>
 <body><main><h1>GreyAI Operations</h1><p class="muted">Live execution, account, and safety control plane</p><div class="grid"><div class="metric">Status<br><strong id="status">connecting</strong></div><div class="metric">Role<br><strong id="role">-</strong></div><div class="metric">Operations<br><strong id="count">0</strong></div></div><section><h2>Execution log</h2><pre id="ops">Loading…</pre></section><section><h2>Referrals</h2><pre id="referrals">Loading…</pre></section><section id="developer" hidden><h2>Developer console</h2><p class="muted">API keys are scoped and shown only once when created.</p><pre id="developerstats">Loading…</pre><pre id="developerkeys">Loading…</pre><p><input id="keyname" placeholder="Key name"><input id="keyscope" value="check" placeholder="Scopes"><button onclick="createKey()">Create key</button></p><p><input id="revokeid" placeholder="Key ID"><button onclick="revokeKey()">Revoke key</button></p></section><section id="admin" hidden><h2>Administrator console</h2><p><input id="userq" placeholder="Telegram ID or username"><button onclick="searchUsers()">Search user</button></p><pre id="users">Search results appear here.</pre><p><input id="banid" placeholder="User ID"><input id="reason" placeholder="Reason"><button onclick="banUser()">Ban</button><button onclick="unbanUser()">Unban</button></p><h3>Referral activity</h3><pre id="adminreferrals">Loading…</pre><h3>Open reports</h3><pre id="reports">Loading…</pre><p><input id="reportid" placeholder="Report ID"><input id="reportresolution" placeholder="Resolution"><button onclick="resolveReport()">Resolve report</button></p><h3>Open appeals</h3><pre id="appeals">Loading…</pre><p><input id="appealid" placeholder="Appeal ID"><input id="appealresolution" placeholder="Resolution"><button onclick="resolveAppeal()">Resolve appeal</button></p></section><p><a href="/logout" style="color:#9bd4ff">Sign out</a></p></main>
-<script>
+<script nonce="__GREYAI_CSP_NONCE__">
 const csrf=decodeURIComponent(document.cookie.split('; ').find(x=>x.startsWith('greyai_csrf='))?.split('=')[1]||'');
 const FETCH_TIMEOUT_MS=10000;
 const el=id=>document.querySelector('#'+id);
 async function fetchJson(url,options={}){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),FETCH_TIMEOUT_MS);try{const r=await fetch(url,{credentials:'same-origin',...options,signal:controller.signal});const text=await r.text();let data={};try{data=text?JSON.parse(text):{}}catch(_){data={error:text||'invalid_response'}}if(!r.ok){const error=new Error(data.error||('HTTP '+r.status));error.status=r.status;throw error}return data}finally{clearTimeout(timer)}}
 function showError(id,message){el(id).textContent=message}
-async function me(){try{const u=await fetchJson('/api/me');el('role').textContent=u.role;el('admin').hidden=u.role!=='admin';el('developer').hidden=u.role!=='developer';return u}catch(error){el('role').textContent='-';el('status').textContent=error.status===401?'session expired':'unavailable';showError('ops',error.name==='AbortError'?'Dashboard connection timed out. Retrying automatically.':'Dashboard data could not be loaded. Retrying automatically.');showError('referrals','Unavailable until the dashboard session reconnects.');if(error.status===401)setTimeout(()=>{location.href='/'},250);throw error}}
+async function me(){try{const u=await fetchJson('/api/me');el('role').textContent=u.role;el('admin').hidden=u.role!=='admin';el('developer').hidden=u.role!=='developer' && u.role!=='admin';return u}catch(error){el('role').textContent='-';el('status').textContent=error.status===401?'session expired':'unavailable';showError('ops',error.name==='AbortError'?'Dashboard connection timed out. Retrying automatically.':'Dashboard data could not be loaded. Retrying automatically.');showError('referrals','Unavailable until the dashboard session reconnects.');if(error.status===401)setTimeout(()=>{location.href='/'},250);throw error}}
 async function refresh(){try{const d=await fetchJson('/api/operations'+(el('role').textContent==='admin'?'?scope=all':''));el('count').textContent=d.operations.length;el('ops').textContent=d.operations.length?JSON.stringify(d.operations,null,2):'No operations yet.'}catch(error){el('status').textContent=error.name==='AbortError'?'timeout':'degraded';showError('ops',error.name==='AbortError'?'Operation refresh timed out. Retrying automatically.':'Operation data is temporarily unavailable. Retrying automatically.');return false}try{const ref=await fetchJson('/api/referrals');el('referrals').textContent=JSON.stringify(ref,null,2)}catch(error){showError('referrals',error.name==='AbortError'?'Referral refresh timed out. Retrying automatically.':'Referral data is temporarily unavailable. Retrying automatically.')}if(el('role').textContent==='admin'){try{const ar=await fetchJson('/api/admin/referrals');el('adminreferrals').textContent=JSON.stringify(ar.referrals,null,2)}catch(error){showError('adminreferrals','Admin referral data is temporarily unavailable.')}}el('status').textContent='healthy';return true}
 async function developerRefresh(){try{const s=await fetchJson('/api/v1/developer/stats');el('developerstats').textContent=JSON.stringify(s,null,2);const k=await fetchJson('/api/v1/keys');el('developerkeys').textContent=JSON.stringify(k.keys,null,2)}catch(error){showError('developerstats','Developer data is temporarily unavailable.');showError('developerkeys','Retrying automatically.')}}
 async function createKey(){try{const d=await fetchJson('/api/v1/keys',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({name:el('keyname').value,scopes:el('keyscope').value.split(',')})});alert('Copy this key now; it will not be shown again: '+d.key)}catch(error){alert(error.message||'Key creation failed')}finally{await developerRefresh()}}
@@ -440,7 +470,7 @@ async function searchUsers(){try{const q=encodeURIComponent(el('userq').value);c
 async function adminAction(path,body){try{await fetchJson(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)})}catch(error){alert(error.message||'Action failed')}finally{await refresh()}}
 function banUser(){adminAction('/api/admin/ban',{user_id:el('banid').value,reason:el('reason').value})}function unbanUser(){adminAction('/api/admin/unban',{user_id:el('banid').value})}function resolveReport(){adminAction('/api/admin/reports/'+encodeURIComponent(el('reportid').value),{status:'resolved',resolution:el('reportresolution').value})}function resolveAppeal(){adminAction('/api/admin/appeals/'+encodeURIComponent(el('appealid').value),{status:'resolved',resolution:el('appealresolution').value})}
 async function queues(){for(const [url,id,key] of [['/api/admin/reports','reports','reports'],['/api/admin/appeals','appeals','appeals']]){try{const d=await fetchJson(url);el(id).textContent=JSON.stringify(d[key],null,2)}catch(error){showError(id,error.status===401||error.status===403?'Not available for this account.':'Queue data temporarily unavailable. Retrying automatically.')}}}
-async function boot(){try{const user=await me();await Promise.allSettled([refresh(),queues()]);if(user.role==='developer'){await developerRefresh();setInterval(()=>developerRefresh().catch(()=>{}),10000)}}catch(_){/* me() rendered the recovery state */}finally{if(el('status').textContent==='connecting')el('status').textContent='unavailable';setInterval(()=>refresh().catch(()=>{}),3000);setInterval(()=>queues().catch(()=>{}),10000)}}
+async function boot(){try{const user=await me();await Promise.allSettled([refresh(),queues()]);if(user.role==='developer'||user.role==='admin'){await developerRefresh();setInterval(()=>developerRefresh().catch(()=>{}),10000)}}catch(_){/* me() rendered the recovery state */}finally{if(el('status').textContent==='connecting')el('status').textContent='unavailable';setInterval(()=>refresh().catch(()=>{}),3000);setInterval(()=>queues().catch(()=>{}),10000)}}
 boot();
 </script></body></html>"""
 
@@ -448,7 +478,9 @@ boot();
 async def index_handler(request: web.Request):
     if not _session_from_request(request):
         return web.Response(text="<h1>GreyAI dashboard</h1><p>Open a one-time dashboard link from the Telegram bot.</p>", content_type="text/html")
-    return web.Response(text=HTML, content_type="text/html")
+    nonce = secrets.token_urlsafe(18)
+    request["csp_nonce"] = nonce
+    return web.Response(text=HTML.replace('__GREYAI_CSP_NONCE__', nonce), content_type="text/html")
 
 
 def create_dashboard_app() -> web.Application:

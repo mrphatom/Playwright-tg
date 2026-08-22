@@ -32,6 +32,18 @@ jobs:
         
 
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run regression suite
+        run: pytest test_bot.py test_platform.py test_dashboard.py -q
+
       - name: Set up Fly CLI
       
         uses: superfly/flyctl-actions/setup-flyctl@master

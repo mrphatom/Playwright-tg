@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any
 
 DEFAULT_GREY_PUBLIC_BASE_URL = "https://playwright-tg-mrphatom.fly.dev"
 ENABLED_API_SCOPES = ("check",)
@@ -12,7 +12,7 @@ def _base_url(base_url: str | None = None) -> str:
     return str(base_url or DEFAULT_GREY_PUBLIC_BASE_URL).strip().rstrip("/")
 
 
-def developer_api_contract(base_url: str | None = None) -> Dict[str, Any]:
+def developer_api_contract(base_url: str | None = None) -> dict[str, Any]:
     """Return the exact shipped API contract; keep this free of credentials and sessions."""
     base = _base_url(base_url)
     return {

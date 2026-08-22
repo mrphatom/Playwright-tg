@@ -19,8 +19,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# Create the sessions directory with appropriate permissions
-RUN mkdir -p sessions && chmod 777 sessions
+# Create the sessions directory with least-privilege permissions.
+# The current entrypoint runs as the image user, so no world-writable directory is required.
+RUN mkdir -p sessions && chmod 700 sessions
 
 # Copy the rest of the application code
 COPY . .

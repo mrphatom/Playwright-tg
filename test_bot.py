@@ -1,39 +1,41 @@
-import pytest
+import asyncio
+import gzip
+import json
 import os
 import sqlite3
-import json
-import asyncio
 import tempfile
-import zipfile
-import gzip
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import zipfile
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
+
+import pytest
 
 # Set environment variable BEFORE importing bot module so bot uses test_telescout.db
 os.environ["DB_PATH"] = "test_telescout.db"
 
 from bot import (
-    is_valid_url, 
-    sanitize_session_name, 
-    truncate_text, 
-    is_domain_allowed,
-    save_encrypted_session,
-    load_encrypted_session,
-    init_db,
-    normalize_natural_language_plan,
-    mask_sensitive_action,
-    normalize_schedule_config,
+    build_chat_prompt,
     calculate_next_schedule_run,
-    save_schedule_to_db,
-    list_schedules_for_chat,
     deactivate_schedule_in_db,
-    restore_schedules_from_db,
+    init_db,
+    is_domain_allowed,
+    is_valid_url,
     is_web_automation_request,
-    build_chat_prompt
+    list_schedules_for_chat,
+    load_encrypted_session,
+    mask_sensitive_action,
+    normalize_natural_language_plan,
+    normalize_schedule_config,
+    restore_schedules_from_db,
+    sanitize_session_name,
+    save_encrypted_session,
+    save_schedule_to_db,
+    truncate_text,
 )
+
 
 @pytest.fixture(autouse=True)
 def setup_test_db():
@@ -1300,8 +1302,9 @@ def test_provider_alert_manager_suppresses_duplicates_and_notifies_recovery(monk
 
 
 def test_gemini_failover_uses_secondary_after_retryable_primary_failure(monkeypatch):
-    import bot
     from urllib.error import HTTPError
+
+    import bot
 
     provider = bot.GeminiFailoverProvider("primary", "secondary", "test-model", cooldown_seconds=60)
     calls = []
@@ -1321,8 +1324,9 @@ def test_gemini_failover_uses_secondary_after_retryable_primary_failure(monkeypa
 
 
 def test_gemini_failover_rotates_through_all_four_keys(monkeypatch):
-    import bot
     from urllib.error import HTTPError
+
+    import bot
 
     provider = bot.GeminiFailoverProvider("primary", "secondary", "test-model", cooldown_seconds=60, tertiary_key="tertiary", quaternary_key="quaternary")
     calls = []
@@ -1362,8 +1366,9 @@ def test_gemini_failover_skips_cooling_keys_and_uses_next_healthy_slot(monkeypat
 
 
 def test_gemini_text_failover_uses_fallback_model_after_quota(monkeypatch):
-    import bot
     from urllib.error import HTTPError
+
+    import bot
 
     provider = bot.GeminiFailoverProvider(
         "primary",
@@ -1404,8 +1409,9 @@ def test_chat_reply_reports_text_capacity_without_exposing_provider_details(monk
 
 
 def test_gemini_failover_does_not_retry_malformed_request(monkeypatch):
-    import bot
     from urllib.error import HTTPError
+
+    import bot
 
     provider = bot.GeminiFailoverProvider("primary", "secondary", "test-model")
     calls = []
@@ -1423,8 +1429,9 @@ def test_gemini_failover_does_not_retry_malformed_request(monkeypatch):
 
 
 def test_media_failover_uses_secondary_after_primary_quota_error(tmp_path):
-    import bot
     from urllib.error import HTTPError
+
+    import bot
 
     media = tmp_path / "sample.ogg"
     media.write_bytes(b"ogg-bytes")
@@ -1446,8 +1453,9 @@ def test_media_failover_uses_secondary_after_primary_quota_error(tmp_path):
 
 
 def test_media_quota_failure_has_safe_provider_error(tmp_path):
-    import bot
     from urllib.error import HTTPError
+
+    import bot
 
     media = tmp_path / "sample.png"
     media.write_bytes(b"png-bytes")
@@ -1496,8 +1504,9 @@ def test_api_key_listing_is_labeled_and_never_contains_secret():
 
 
 def test_one_time_api_key_delivery_is_copy_friendly_and_scheduled(monkeypatch):
-    import bot
     from types import SimpleNamespace
+
+    import bot
 
     delivered = {}
     scheduled = {}
@@ -1620,7 +1629,6 @@ def test_non_current_explanatory_question_stays_chat():
 
 def test_role_targeted_message_is_preview_only_and_server_scoped(monkeypatch):
     import bot
-    captured = {}
 
     class FakeMessage:
         async def reply_text(self, text, **kwargs):
@@ -3085,6 +3093,7 @@ def test_native_context_uses_authoritative_admin_predicate_not_stored_role_label
 
 def test_telegram_bot_starter_archive_contains_runnable_secret_free_project(tmp_path, monkeypatch):
     import zipfile
+
     import bot
     from starter_templates import build_telegram_bot_starter_archive
 
@@ -3131,6 +3140,7 @@ def test_management_parser_preserves_requested_starter_project_name_and_language
 def test_telegram_bot_starter_python_entrypoint_compiles(tmp_path, monkeypatch):
     import py_compile
     import zipfile
+
     from starter_templates import build_telegram_bot_starter_archive
 
     monkeypatch.chdir(tmp_path)
@@ -3333,8 +3343,9 @@ def test_navigation_planner_fails_closed_on_destructive_model_target(monkeypatch
 
 
 def test_intelligent_navigation_runs_in_real_chromium_on_local_fixture(monkeypatch):
-    import bot
     from playwright.async_api import async_playwright
+
+    import bot
 
     class FixtureProvider:
         def __init__(self):
