@@ -1649,6 +1649,27 @@ def test_role_targeted_message_is_preview_only_and_server_scoped(monkeypatch):
     assert "developers" in update.message.text
 
 
+def test_audit_startup_restore_is_exact_and_opt_in(monkeypatch):
+    import bot
+
+    audit_state = {
+        "mode": "hard_maintenance",
+        "reason": "Full audit, testing, and deployment in progress.",
+        "incident_id": None,
+    }
+    updated = []
+    monkeypatch.setenv("RESTORE_OPERATIONAL_AFTER_AUDIT", "true")
+    monkeypatch.setattr(bot, "get_maintenance_state", lambda: audit_state)
+    monkeypatch.setattr(bot, "set_maintenance_state", lambda *args, **kwargs: updated.append((args, kwargs)) or {"mode": "operational"})
+    assert bot.restore_operational_mode_after_audit() is True
+    assert updated and updated[0][0][0] == "operational"
+
+    updated.clear()
+    monkeypatch.setattr(bot, "get_maintenance_state", lambda: {**audit_state, "reason": "Scheduled maintenance window started."})
+    assert bot.restore_operational_mode_after_audit() is False
+    assert updated == []
+
+
 def test_hard_maintenance_blocks_browser_work_and_redacts_failure_reason(monkeypatch):
     import bot
     monkeypatch.setattr(bot, "CRASH_FAILSAFE_ENABLED", True)

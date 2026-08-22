@@ -4053,6 +4053,26 @@ async def automatic_recovery_worker(application: Application) -> None:
         raise
 
 
+def restore_operational_mode_after_audit() -> bool:
+    """Clear only the explicit audit marker when a verified release starts successfully."""
+    enabled = os.getenv("RESTORE_OPERATIONAL_AFTER_AUDIT", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return False
+    state = get_maintenance_state() or {}
+    if state.get("mode") != "hard_maintenance" or state.get("incident_id"):
+        return False
+    if state.get("reason") != "Full audit, testing, and deployment in progress.":
+        return False
+    set_maintenance_state(
+        "operational",
+        "GreyAI is operational.",
+        "The audit release completed successfully.",
+        metadata={"source": "audit_release_startup_restore"},
+    )
+    logger.info("audit_maintenance_marker_cleared")
+    return True
+
+
 async def post_init(application: Application):
     global notification_worker_task, maintenance_scheduler_task, recovery_monitor_task
     provider_alerts.attach_bot(application.bot)
@@ -4061,6 +4081,8 @@ async def post_init(application: Application):
     except Exception as exc:
         logger.exception("browser_pool_start_failed_entering_maintenance")
         await enter_hard_maintenance(application.bot, exc)
+    else:
+        restore_operational_mode_after_audit()
     await start_queue_dispatcher(application)
     if NOTIFICATION_WORKER_ENABLED:
         notification_worker_task = asyncio.create_task(notification_worker(application.bot))
