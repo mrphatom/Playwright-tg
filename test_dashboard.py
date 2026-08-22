@@ -20,6 +20,43 @@ def dashboard_db(tmp_path, monkeypatch):
     return path
 
 
+def test_dashboard_handoff_uses_running_main_module_registry(monkeypatch):
+    import asyncio
+    import sys
+    import types
+
+    token = "live-token"
+    running_bot = types.ModuleType("__main__")
+    running_bot.manual_challenge_status = lambda value: {"token": value, "status": "waiting"} if value == token else None
+    monkeypatch.setitem(sys.modules, "__main__", running_bot)
+    monkeypatch.delitem(sys.modules, "bot", raising=False)
+
+    class Request(SimpleNamespace):
+        def __setitem__(self, key, value):
+            setattr(self, key, value)
+
+    request = Request(match_info={"token": token})
+    response = asyncio.run(dashboard.challenge_page_handler(request))
+
+    assert response.status == 200
+    assert token in response.text
+
+
+def test_main_configures_concurrent_update_processing(monkeypatch):
+    import bot
+
+    captured = {}
+    monkeypatch.setattr(bot, "TELEGRAM_BOT_TOKEN", "123456:ABCDEF")
+
+    def fake_run_polling(application, *args, **kwargs):
+        captured["application"] = application
+
+    monkeypatch.setattr(bot.Application, "run_polling", fake_run_polling)
+    bot.main()
+
+    assert captured["application"].concurrent_updates > 1
+
+
 def test_dashboard_registers_developer_and_integration_routes(dashboard_db):
     paths = {resource.canonical for resource in dashboard.create_dashboard_app().router.resources()}
     assert "/api/v1/check" in paths

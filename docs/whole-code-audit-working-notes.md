@@ -47,3 +47,20 @@ This is an in-progress engineering note for the GreyAI recovery audit. It does n
 11. The natural-language durable secret sanitizer was over-broad: an unquoted `password is ...` pattern consumed all following prose unless it matched a very narrow reminder clause. A failing boundary test reproduced the loss. The matcher now stops at common new-clause markers (`and then/ask/tell/show`, plus existing remember/save/keep), while still redacting quoted values and end-of-message multi-word credentials. Positive secret-redaction and boundary tests pass.
 12. The queue worker could enter hard maintenance on an unexpected boundary exception (for example, a claim/database failure) without resolving the request future, leaving the originating handler waiting indefinitely. A focused fake-queue test reproduced the pending future. The worker now marks the queue/operation failed when possible, resolves the future with the original exception, then enters maintenance; `task_done()` remains guaranteed. The regression passes.
 13. Manual challenge handoff regression: the browser retry wrapper enforced the ordinary 90-second command timeout even while a handoff was advertised for 600 seconds, so the task could be cancelled and its in-memory token removed before the user opened it. A focused regression reproduced this with a live operation record. The retry wrapper now extends only that operation’s deadline to the active handoff expiry plus a small completion margin. A second regression confirmed cancellation previously orphaned the shielded browser task; cancellation now cancels and awaits it. Dashboard coverage also confirms a fresh unexpired token renders the handoff page. Focused handoff tests pass.
+
+14. Production handoff investigation found two runtime-only defects missed by same-process tests. First, the container launches `python bot.py`, so the live bot module is `__main__`; dashboard handlers lazily imported `bot`, creating a second module instance with an empty in-memory `manual_challenges` registry. Fresh handoff URLs therefore returned `handoff_not_found_or_expired` immediately. Dashboard stateful handlers now resolve the live runtime module, preferring `__main__` when it owns the bot state, and the regression test reproduces the script execution boundary. Second, python-telegram-bot defaults to serial update processing; `_process_natural_language` awaited long browser work inline, so a paused manual handoff prevented later normal chat updates from being dispatched. The application now uses bounded configurable concurrent update processing (2–64, default 16), with a regression test asserting the built application is concurrent. No Telegram Web or real CAPTCHA interaction was used. Focused and full test suites pass (315 tests).
+
+## Latest focused verification
+- Dashboard runtime-module handoff regression: passing.
+- Telegram concurrent-update startup regression: passing.
+- Full CI-equivalent suite: 315 passed, 2 warnings.
+- Python compilation, dashboard F/I lint, diff check, and changed-diff secret scan: passing.
+
+## Remaining deployment verification
+- Commit the focused repair, push it, monitor CI and Fly deployment workflows, then confirm production health.
+- Do not claim a real CAPTCHA handoff completion until the user independently opens a fresh production link and completes any challenge themselves.
+
+## Constraints
+- Do not inspect the attached screenshots with the file tool again; use the user-visible findings already supplied and source-level tests.
+- Do not send test messages through Telegram Web or act as the user.
+- Preserve security boundaries: no CAPTCHA/anti-bot evasion, no credential harvesting, no unrestricted executable delivery, no secret logging.

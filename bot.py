@@ -320,6 +320,7 @@ GREY_LIMITATION_CATALOG = (
 
 ALLOWED_USERS = set(int(uid.strip()) for uid in os.getenv("ALLOWED_TELEGRAM_USERS", "").split(",") if uid.strip().isdigit())
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
+TELEGRAM_UPDATE_CONCURRENCY = max(2, min(64, int(os.getenv("TELEGRAM_UPDATE_CONCURRENCY", "16"))))
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "90"))
 PROGRESS_FEEDBACK_DELAY_SECONDS = max(0.5, min(3.0, float(os.getenv("PROGRESS_FEEDBACK_DELAY_SECONDS", "1.2"))))
 TEXT_VIEWER_TTL_SECONDS = max(60, min(3600, int(os.getenv("TEXT_VIEWER_TTL_SECONDS", "900"))))
@@ -9799,7 +9800,14 @@ def main():
         logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is missing!")
         return
         
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_stop(stop_browser_pool).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .concurrent_updates(TELEGRAM_UPDATE_CONCURRENCY)
+        .post_init(post_init)
+        .post_stop(stop_browser_pool)
+        .build()
+    )
     
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))

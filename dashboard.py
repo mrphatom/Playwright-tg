@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import sys
 from typing import Any
 
 from aiohttp import web
@@ -237,6 +238,23 @@ document.addEventListener('keydown',e=>{if(['Enter','Tab','Escape','ArrowUp','Ar
 </script></main></body></html>"""
 
 
+def _bot_runtime_module():
+    """Return the live bot module, including when it was launched as ``__main__``.
+
+    ``python bot.py`` executes the file under ``__main__``. Importing ``bot`` from
+    a request handler would execute a second module instance with a separate
+    in-memory handoff registry, making fresh handoff URLs look expired.
+    """
+    running_main = sys.modules.get("__main__")
+    if running_main is not None and hasattr(running_main, "manual_challenge_status"):
+        return running_main
+    bot_module = sys.modules.get("bot")
+    if bot_module is not None:
+        return bot_module
+    import bot
+    return bot
+
+
 def _challenge_token(request: web.Request) -> str:
     token = str(request.match_info.get("token", ""))
     if not token or len(token) > 128 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
@@ -246,8 +264,8 @@ def _challenge_token(request: web.Request) -> str:
 
 async def challenge_page_handler(request: web.Request):
     token = _challenge_token(request)
-    from bot import manual_challenge_status
-    if not manual_challenge_status(token):
+    bot_runtime = _bot_runtime_module()
+    if not bot_runtime.manual_challenge_status(token):
         raise web.HTTPNotFound(text="handoff_not_found_or_expired")
     nonce = secrets.token_urlsafe(18)
     html = MANUAL_CHALLENGE_HTML.replace("__GREYAI_CSP_NONCE__", nonce).replace("__GREYAI_TOKEN__", json.dumps(token))
@@ -257,8 +275,8 @@ async def challenge_page_handler(request: web.Request):
 
 async def challenge_status_handler(request: web.Request):
     token = _challenge_token(request)
-    from bot import manual_challenge_status
-    status = manual_challenge_status(token)
+    bot_runtime = _bot_runtime_module()
+    status = bot_runtime.manual_challenge_status(token)
     if not status:
         raise web.HTTPNotFound(text=json.dumps({"error": "handoff_not_found_or_expired"}), content_type="application/json")
     return web.json_response(status, headers={"Cache-Control": "no-store"})
@@ -266,8 +284,8 @@ async def challenge_status_handler(request: web.Request):
 
 async def challenge_screenshot_handler(request: web.Request):
     token = _challenge_token(request)
-    from bot import manual_challenge_screenshot
-    image = await manual_challenge_screenshot(token)
+    bot_runtime = _bot_runtime_module()
+    image = await bot_runtime.manual_challenge_screenshot(token)
     if image is None:
         raise web.HTTPNotFound(text="handoff_not_found_or_expired")
     return web.Response(body=image, content_type="image/png", headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
@@ -281,13 +299,13 @@ async def _challenge_action_handler(request: web.Request, action_name: str):
         raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_json"}), content_type="application/json")
     if not isinstance(body, dict) or len(json.dumps(body)) > 2048:
         raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_action"}), content_type="application/json")
-    from bot import cancel_manual_challenge, complete_manual_challenge, manual_challenge_action
+    bot_runtime = _bot_runtime_module()
     if action_name == "action":
-        ok, result = await manual_challenge_action(token, body)
+        ok, result = await bot_runtime.manual_challenge_action(token, body)
     elif action_name == "complete":
-        ok, result = await complete_manual_challenge(token)
+        ok, result = await bot_runtime.complete_manual_challenge(token)
     else:
-        ok, result = await cancel_manual_challenge(token)
+        ok, result = await bot_runtime.cancel_manual_challenge(token)
     if not ok:
         exception_type = web.HTTPGone if "expired" in result or "not_found" in result else web.HTTPConflict
         raise exception_type(text=json.dumps({"error": result}), content_type="application/json")
@@ -350,18 +368,11 @@ async def api_check_handler(request: web.Request):
     if not url:
         raise web.HTTPBadRequest(text=json.dumps({"error": "url_required"}), content_type="application/json")
 
-    # Importing inside the handler avoids a bot/dashboard module cycle at startup.
-    from bot import (
-        COMMAND_TIMEOUT,
-        QueueRejected,
-        QueueUnavailable,
-        is_valid_url,
-        route_url_allowed,
-        run_browser_request,
-        run_browser_task_with_retry,
-    )
+    # Resolve the live runtime module so script execution cannot create a second
+    # bot instance with separate queue, provider, or handoff state.
+    bot_runtime = _bot_runtime_module()
 
-    if not is_valid_url(url) or not route_url_allowed(url, principal["user_id"]):
+    if not bot_runtime.is_valid_url(url) or not bot_runtime.route_url_allowed(url, principal["user_id"]):
         record_developer_audit(None, principal["user_id"], principal["key_id"], "api_check", "denied", {"reason": "url_not_allowed"})
         raise web.HTTPBadRequest(text=json.dumps({"error": "url_not_allowed"}), content_type="application/json")
     allowed_quota, used, limit = consume_quota(principal["user_id"])
@@ -370,27 +381,26 @@ async def api_check_handler(request: web.Request):
         raise web.HTTPTooManyRequests(text=json.dumps({"error": "quota_exceeded", "used": used, "limit": limit}), content_type="application/json")
 
     operation_id = "api_" + secrets.token_hex(6)
-    from bot import create_operation, update_operation
-    create_operation(operation_id, principal["user_id"], None, "api_check", url, {"api_key_id": principal["key_id"], "source": "telegram_integration"})
+    bot_runtime.create_operation(operation_id, principal["user_id"], None, "api_check", url, {"api_key_id": principal["key_id"], "source": "telegram_integration"})
     screenshot_path = None
     try:
-        result = await run_browser_request(
+        result = await bot_runtime.run_browser_request(
             operation_id, principal["user_id"], None, "api_check",
-            lambda: asyncio.wait_for(run_browser_task_with_retry(url, [f"ai_extract:{extract}"], principal["user_id"], operation_id), timeout=COMMAND_TIMEOUT + 5),
+            lambda: asyncio.wait_for(bot_runtime.run_browser_task_with_retry(url, [f"ai_extract:{extract}"], principal["user_id"], operation_id), timeout=bot_runtime.COMMAND_TIMEOUT + 5),
         )
         screenshot_path = result.get("screenshot")
         return web.json_response({"ok": True, "operation_id": operation_id, "title": str(result.get("title", ""))[:300], "url": url, "extracted": [str(item)[:4000] for item in result.get("extracted", [])[:10]]})
-    except QueueUnavailable:
-        update_operation(operation_id, "rejected")
+    except bot_runtime.QueueUnavailable:
+        bot_runtime.update_operation(operation_id, "rejected")
         raise web.HTTPServiceUnavailable(text=json.dumps({"error": "maintenance", "operation_id": operation_id}), content_type="application/json")
-    except QueueRejected:
-        update_operation(operation_id, "rejected")
+    except bot_runtime.QueueRejected:
+        bot_runtime.update_operation(operation_id, "rejected")
         raise web.HTTPTooManyRequests(text=json.dumps({"error": "queue_full", "operation_id": operation_id}), content_type="application/json")
     except asyncio.TimeoutError:
-        update_operation(operation_id, "failed")
+        bot_runtime.update_operation(operation_id, "failed")
         raise web.HTTPGatewayTimeout(text=json.dumps({"error": "browser_timeout", "operation_id": operation_id}), content_type="application/json")
     except Exception:
-        update_operation(operation_id, "failed")
+        bot_runtime.update_operation(operation_id, "failed")
         raise web.HTTPBadGateway(text=json.dumps({"error": "browser_check_failed", "operation_id": operation_id}), content_type="application/json")
     finally:
         if screenshot_path and os.path.exists(screenshot_path):
