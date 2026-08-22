@@ -1158,6 +1158,39 @@ def test_source_fallback_tries_next_provider_after_empty_extraction(monkeypatch)
     assert result["source_url"].startswith("https://coinmarketcap.com/")
 
 
+def test_manual_handoff_request_routes_deterministically():
+    import bot
+
+    plan = bot.parse_deterministic_management_request("Give me a manual handoff")
+
+    assert plan == {"mode": "manual_handoff"}
+    assert bot.classify_message_route("Give me a manual handoff") == "task"
+
+
+def test_active_manual_handoff_lookup_is_owner_scoped():
+    import bot
+
+    token = "owner-scoped-handoff"
+    bot.manual_challenges[token] = {
+        "user_id": 42,
+        "operation_id": "op-42",
+        "status": "waiting",
+        "expires_at": bot.time.monotonic() + 600,
+    }
+    try:
+        assert bot.active_manual_challenge_for_user(42)["token"] == token
+        assert bot.active_manual_challenge_for_user(7) is None
+    finally:
+        bot.manual_challenges.pop(token, None)
+
+
+def test_manual_handoff_without_active_challenge_is_explicit():
+    import bot
+
+    assert "no active manual challenge" in bot.manual_handoff_unavailable_message().lower()
+    assert "captcha" in bot.manual_handoff_unavailable_message().lower()
+
+
 def test_cancelling_retry_wrapper_cancels_shielded_browser_task(monkeypatch):
     import bot
 

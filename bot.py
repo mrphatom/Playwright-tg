@@ -2195,6 +2195,8 @@ def parse_deterministic_management_request(
         [str(turn.get("text", ""))[:1200] for turn in (chat_history or [])[-8:]]
         + [str((reply_context or {}).get("text", ""))[:1200]]
     ).lower()
+    if re.search(r"\b(?:give|send|open|show|request|provide)\b.*\bmanual\s+(?:security\s+)?handoff\b|\bmanual\s+(?:security\s+)?handoff\b", text):
+        return {"mode": "manual_handoff"}
     ad_plan = parse_deterministic_ad_campaign_request(user_text)
     if ad_plan:
         return ad_plan
@@ -2505,6 +2507,8 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
     if mode == "schedule":
         schedule_config = normalize_schedule_config(raw_plan)
         return {"mode": "schedule", "schedule": schedule_config} if schedule_config else None
+    if mode == "manual_handoff":
+        return {"mode": "manual_handoff"}
     if mode == "developer_bot_starter":
         language = str(raw_plan.get("language", "python") or "python").strip().lower()
         if language in {"js", "node", "typescript", "ts"}:
@@ -5016,6 +5020,39 @@ def manual_challenge_deadline_for_operation(operation_id: str) -> float | None:
     return max(deadlines) if deadlines else None
 
 
+def active_manual_challenge_for_user(user_id: int) -> dict[str, Any] | None:
+    """Return the newest waiting handoff owned by one Telegram user."""
+    _manual_challenge_cleanup()
+    candidates = [
+        (token, record)
+        for token, record in manual_challenges.items()
+        if int(record.get("user_id", -1)) == int(user_id)
+        and str(record.get("status", "waiting")) == "waiting"
+    ]
+    if not candidates:
+        return None
+    token, record = max(candidates, key=lambda item: float(item[1].get("created_at", 0)))
+    return {
+        "token": token,
+        "user_id": int(record.get("user_id", user_id)),
+        "operation_id": str(record.get("operation_id", "")),
+        "challenge_kind": str(record.get("challenge_kind", "security-check")),
+        "remaining_seconds": max(0, int(float(record.get("expires_at", 0)) - time.monotonic())),
+    }
+
+
+def manual_challenge_link(token: str) -> str:
+    return f"{DASHBOARD_BASE_URL.rstrip('/')}/challenge/{str(token)}"
+
+
+def manual_handoff_unavailable_message() -> str:
+    return (
+        "There is no active manual challenge to hand off right now. "
+        "Start or repeat the approved browser request; if the site presents a CAPTCHA, MFA, "
+        "or security check, GreyAI will pause and send a fresh private handoff link."
+    )
+
+
 def manual_challenge_status(token: str) -> dict[str, Any] | None:
     _manual_challenge_cleanup()
     record = manual_challenges.get(str(token or ""))
@@ -5066,7 +5103,7 @@ async def create_manual_challenge_handoff(page, user_id: int, operation_id: str,
             "actions": [],
             "action_window_started": time.monotonic(),
         }
-    link = f"{DASHBOARD_BASE_URL.rstrip('/')}/challenge/{token}"
+    link = manual_challenge_link(token)
     runtime_metrics["manual_challenge_handoffs"] += 1
     if status_msg:
         await status_msg.edit_text(
@@ -8298,6 +8335,28 @@ async def _process_natural_language(
             await status_msg.edit_text("⛔ This channel request contains an interactive browser action. Channel mode allows read-only extraction only.")
             update_operation(operation_id, "denied")
             return
+
+    if plan and plan.get("mode") == "manual_handoff":
+        if shared_context or public_context:
+            await status_msg.edit_text("⛔ Manual handoff links are private and cannot be issued in a group or channel. Open GreyAI in a private chat and repeat the approved browser request there.")
+            update_operation(operation_id, "denied")
+            log_audit(user_id, "manual_handoff_request", None, "DENIED_SHARED_CONTEXT")
+            return
+        active_handoff = active_manual_challenge_for_user(user_id)
+        if not active_handoff:
+            await status_msg.edit_text(manual_handoff_unavailable_message())
+            update_operation(operation_id, "succeeded")
+            log_audit(user_id, "manual_handoff_request", None, "NO_ACTIVE_CHALLENGE")
+            return
+        link = manual_challenge_link(active_handoff["token"])
+        await status_msg.edit_text(
+            "🛑 Your active manual security challenge is still paused.\n\n"
+            f"Open the private handoff link to continue:\n{link}\n\n"
+            f"It has about {active_handoff['remaining_seconds'] // 60} minutes remaining. GreyAI will resume only after you complete the challenge and press ‘I’m done’."
+        )
+        update_operation(operation_id, "succeeded")
+        log_audit(user_id, "manual_handoff_request", None, "ACTIVE_HANDOFF_REISSUED")
+        return
 
     if plan and plan.get("mode") == "ad_campaign":
         if shared_context:
