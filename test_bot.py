@@ -4408,14 +4408,18 @@ def test_help_command_uses_safe_plain_text_for_all_placeholders(monkeypatch):
     )
 
     asyncio.run(bot.help_command(update, SimpleNamespace()))
-    text = "\n".join(chunk for chunk, _kwargs in sent)
+    pages = bot.build_help_pages()
+    text = "\n".join(pages)
 
-    assert sent
+    assert len(sent) == 1
+    assert "page 1/" in sent[0][0]
     assert all("parse_mode" not in kwargs for _chunk, kwargs in sent)
     assert "<chat_id|@username,...>" in text
     assert "<campaign_id>" in text
     assert "<token>" in text
     assert "&lt;" not in text
+    keyboard = sent[0][1]["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].callback_data == "help:42:1"
 
 
 def test_login_requires_explicit_approval_before_browser_execution(monkeypatch):
@@ -4689,11 +4693,13 @@ def test_help_uses_plain_text_chunks_without_telegram_parse_mode(monkeypatch):
 
     asyncio.run(bot.help_command(update, SimpleNamespace()))
 
-    assert len(message.sent) >= 2
-    assert all(len(text) <= 3900 for text, _kwargs in message.sent)
-    assert all("<b>" not in text and "&lt;" not in text for text, _kwargs in message.sent)
-    assert all("parse_mode" not in kwargs for _text, kwargs in message.sent)
-    assert any("GreyAI command guide" in text for text, _kwargs in message.sent)
+    assert len(message.sent) == 1
+    text, kwargs = message.sent[0]
+    assert len(text) <= 3900
+    assert "<b>" not in text and "&lt;" not in text
+    assert "parse_mode" not in kwargs
+    assert "GreyAI command guide" in text
+    assert kwargs["reply_markup"].inline_keyboard[0][0].text == "Next ›"
 
 
 def test_split_telegram_message_prefers_bounded_chunks():
@@ -4702,3 +4708,40 @@ def test_split_telegram_message_prefers_bounded_chunks():
     chunks = bot.split_telegram_message("line\n" * 1200, max_length=700)
     assert len(chunks) > 1
     assert all(len(chunk) <= 700 for chunk in chunks)
+
+
+def test_help_callback_is_user_scoped_and_navigates_pages(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "is_allowed_user", lambda _user_id: True)
+
+    class FakeMessage:
+        def __init__(self):
+            self.edited = []
+
+        async def edit_message_text(self, text, **kwargs):
+            self.edited.append((text, kwargs))
+
+    class FakeQuery:
+        def __init__(self, user_id, data):
+            self.from_user = SimpleNamespace(id=user_id)
+            self.data = data
+            self.message = FakeMessage()
+            self.answers = []
+
+        async def answer(self, text=None, **kwargs):
+            self.answers.append((text, kwargs))
+
+        async def edit_message_text(self, text, **kwargs):
+            await self.message.edit_message_text(text, **kwargs)
+
+    allowed_query = FakeQuery(42, "help:42:1")
+    asyncio.run(bot.help_callback(SimpleNamespace(callback_query=allowed_query), SimpleNamespace()))
+    assert allowed_query.answers == [(None, {})]
+    assert "page 2/" in allowed_query.message.edited[0][0]
+    assert allowed_query.message.edited[0][1]["reply_markup"].inline_keyboard[0][0].callback_data == "help:42:0"
+
+    foreign_query = FakeQuery(99, "help:42:1")
+    asyncio.run(bot.help_callback(SimpleNamespace(callback_query=foreign_query), SimpleNamespace()))
+    assert foreign_query.answers[0][1]["show_alert"] is True
+    assert foreign_query.message.edited == []

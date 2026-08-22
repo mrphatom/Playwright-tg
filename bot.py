@@ -8770,8 +8770,30 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-@restricted
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+HELP_PAGE_LENGTH = 3300
+
+
+def build_help_pages() -> list[str]:
+    plain = telegram_plain_text(build_help_text())
+    plain = re.sub(r"^GreyAI command guide\s*\n\n", "", plain, count=1)
+    return split_telegram_message(plain, max_length=HELP_PAGE_LENGTH)
+
+
+def help_page_keyboard(user_id: int, page_index: int, total_pages: int) -> InlineKeyboardMarkup:
+    buttons = []
+    if page_index > 0:
+        buttons.append(InlineKeyboardButton("‹ Previous", callback_data=f"help:{int(user_id)}:{page_index - 1}"))
+    if page_index < total_pages - 1:
+        buttons.append(InlineKeyboardButton("Next ›", callback_data=f"help:{int(user_id)}:{page_index + 1}"))
+    return InlineKeyboardMarkup([buttons] if buttons else [])
+
+
+def help_page_text(pages: list[str], page_index: int) -> str:
+    total_pages = len(pages)
+    return f"GreyAI command guide — page {page_index + 1}/{total_pages}\n\n{pages[page_index]}"
+
+
+def build_help_text() -> str:
     help_text = (
         "<b>GreyAI command guide</b>\n\n"
         "<b>Conversation and multimodal input</b>\n"
@@ -8834,11 +8856,46 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n"
         "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n"
         "/allowdomain &lt;domain|*.domain&gt;, /disallowdomain &lt;pattern&gt;, /resetdomain &lt;pattern&gt;, /domains\n\n"
-        "Never send an API secret again after copying it. If a key is exposed, revoke it immediately with /revokekey.",
+        "Never send an API secret again after copying it. If a key is exposed, revoke it immediately with /revokekey."
     )
-    plain_help = telegram_plain_text(help_text)
-    for chunk in split_telegram_message(plain_help):
-        await update.message.reply_text(chunk)
+    return help_text
+
+
+@restricted
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pages = build_help_pages()
+    await update.message.reply_text(
+        help_page_text(pages, 0),
+        reply_markup=help_page_keyboard(update.effective_user.id, 0, len(pages)),
+    )
+
+
+async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    match = re.fullmatch(r"help:(\d+):(\d+)", str(query.data or ""))
+    if not match:
+        await query.answer("That help page is no longer available.", show_alert=True)
+        return
+    owner_id, page_raw = int(match.group(1)), int(match.group(2))
+    ensure_user(owner_id, getattr(query.from_user, "username", None), getattr(query.from_user, "full_name", None))
+    if not is_allowed_user(owner_id):
+        await query.answer("Your account is not currently allowed to use this help viewer.", show_alert=True)
+        return
+    if int(query.from_user.id) != owner_id:
+        await query.answer("This help viewer belongs to another user.", show_alert=True)
+        return
+    pages = build_help_pages()
+    if page_raw < 0 or page_raw >= len(pages):
+        await query.answer("That help page is no longer available.", show_alert=True)
+        return
+    await query.answer()
+    if query.message:
+        await query.edit_message_text(
+            help_page_text(pages, page_raw),
+            reply_markup=help_page_keyboard(owner_id, page_raw, len(pages)),
+        )
 
 
 @restricted
@@ -8900,6 +8957,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(settings:|session:delete:)"))
+    app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:\d+:\d+$"))
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("enablegreyai", enable_group_command))
     app.add_handler(CommandHandler("disablegreyai", disable_group_command))
