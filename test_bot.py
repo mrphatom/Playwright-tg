@@ -4413,8 +4413,14 @@ def test_help_command_escapes_ad_campaign_angle_brackets(monkeypatch):
     asyncio.run(bot.help_command(update, SimpleNamespace()))
 
     assert sent["kwargs"]["parse_mode"] == "HTML"
-    assert "<chat_id|@username,...>" not in sent["text"]
+    for raw_placeholder in (
+        "<chat_id|@username,...>",
+        "<campaign_id>",
+        "<token>",
+    ):
+        assert raw_placeholder not in sent["text"]
     assert "&lt;chat_id|@username,...&gt;" in sent["text"]
+    assert "&lt;campaign_id&gt;" in sent["text"]
 
 
 def test_login_requires_explicit_approval_before_browser_execution(monkeypatch):
@@ -4471,3 +4477,158 @@ def test_global_error_handler_does_not_enter_maintenance_for_telegram_bad_reques
     assert maintenance_calls == []
     assert replies
     assert "formatting" in replies[0][0].lower()
+
+
+def test_manual_challenge_detector_identifies_captcha_and_ignores_normal_page():
+    import bot
+
+    class FakePage:
+        url = "https://example.com/login"
+
+        async def title(self):
+            return "Verify you are human"
+
+        async def evaluate(self, _script):
+            return "Please complete the CAPTCHA to continue"
+
+    class NormalPage:
+        url = "https://example.com"
+
+        async def title(self):
+            return "Example Domain"
+
+        async def evaluate(self, _script):
+            return "Example Domain"
+
+    assert asyncio.run(bot.detect_manual_challenge(FakePage())) == "captcha"
+    assert asyncio.run(bot.detect_manual_challenge(NormalPage())) is None
+
+
+def test_settings_keyboard_exposes_button_only_controls():
+    import bot
+
+    settings = {
+        "persistent_login_enabled": False,
+        "auto_save_sessions_enabled": False,
+        "challenge_handoff_enabled": True,
+    }
+    keyboard = bot.settings_keyboard(settings, ["example.com"])
+    callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row if button.callback_data]
+
+    assert "settings:toggle_persistent" in callbacks
+    assert "settings:toggle_challenge" in callbacks
+    assert "settings:sessions" in callbacks
+    assert f"session:delete:{bot._session_callback_key('example.com')}" in callbacks
+    assert all(callback != "settings:toggle_autosave" for callback in callbacks)
+
+
+def test_persistent_login_setting_updates_auto_save_as_a_pair(monkeypatch):
+    import bot
+
+    captured = {}
+    monkeypatch.setattr(bot, "get_user_settings", lambda _user_id: {
+        "persistent_login_enabled": False,
+        "auto_save_sessions_enabled": False,
+        "challenge_handoff_enabled": True,
+    })
+
+    def fake_set_settings(user_id, **values):
+        captured.update(user_id=user_id, values=values)
+        return {"persistent_login_enabled": True, "auto_save_sessions_enabled": True, "challenge_handoff_enabled": True}
+
+    monkeypatch.setattr(bot, "set_user_settings", fake_set_settings)
+    updated = bot.toggle_persistent_login_setting(42)
+
+    assert captured == {"user_id": 42, "values": {"persistent_login_enabled": True, "auto_save_sessions_enabled": True}}
+    assert updated["persistent_login_enabled"] is True
+    assert updated["auto_save_sessions_enabled"] is True
+
+
+
+
+def test_manual_challenge_actions_are_bounded_and_script_free():
+    import bot
+
+    class FakeMouse:
+        def __init__(self):
+            self.events = []
+
+        async def click(self, x, y):
+            self.events.append(("click", x, y))
+
+        async def wheel(self, _x, delta):
+            self.events.append(("scroll", delta))
+
+    class FakeKeyboard:
+        def __init__(self):
+            self.events = []
+
+        async def press(self, key):
+            self.events.append(("key", key))
+
+        async def type(self, text, delay=0):
+            self.events.append(("type", text, delay))
+
+    page = SimpleNamespace(mouse=FakeMouse(), keyboard=FakeKeyboard())
+    token = "test-handoff-token"
+    bot.manual_challenges[token] = {
+        "user_id": 42,
+        "operation_id": "op_42",
+        "page": page,
+        "challenge_kind": "captcha",
+        "created_at": bot.time.monotonic(),
+        "expires_at": bot.time.monotonic() + 60,
+        "status": "waiting",
+        "event": asyncio.Event(),
+        "lock": asyncio.Lock(),
+        "actions": [],
+        "action_window_started": bot.time.monotonic(),
+    }
+    try:
+        assert asyncio.run(bot.manual_challenge_action(token, {"type": "click", "x": 12, "y": 34})) == (True, "ok")
+        assert asyncio.run(bot.manual_challenge_action(token, {"type": "key", "key": "Enter"})) == (True, "ok")
+        assert asyncio.run(bot.manual_challenge_action(token, {"type": "evaluate", "script": "document.cookie"})) == (False, "action_not_allowed")
+        assert page.mouse.events == [("click", 12.0, 34.0)]
+        assert page.keyboard.events == [("key", "Enter")]
+    finally:
+        bot.manual_challenges.pop(token, None)
+
+
+
+def test_manual_challenge_handoff_pauses_and_resumes_after_user_completion(monkeypatch):
+    import bot
+
+    class FakePage:
+        url = "https://example.com/login"
+        challenge_visible = True
+
+        async def title(self):
+            return "Verify you are human" if self.challenge_visible else "Signed in"
+
+        async def evaluate(self, _script):
+            return "CAPTCHA" if self.challenge_visible else "Signed in"
+
+    class FakeStatus:
+        def __init__(self):
+            self.messages = []
+
+        async def edit_text(self, text, **_kwargs):
+            self.messages.append(text)
+
+    async def scenario():
+        monkeypatch.setattr(bot, "DASHBOARD_BASE_URL", "https://greyai.example")
+        monkeypatch.setattr(bot, "MANUAL_CHALLENGE_TIMEOUT_SECONDS", 60)
+        monkeypatch.setattr(bot, "route_url_allowed", lambda _url, _user_id: True)
+        page = FakePage()
+        status = FakeStatus()
+        task = asyncio.create_task(bot.wait_for_manual_challenge(page, 42, "op_handoff", status))
+        await asyncio.sleep(0)
+        token = next(iter(bot.manual_challenges))
+        assert "https://greyai.example/challenge/" in "\n".join(status.messages)
+        assert bot.manual_challenge_status(token)["status"] == "waiting"
+        page.challenge_visible = False
+        assert await bot.complete_manual_challenge(token) == (True, "resume_requested")
+        await task
+        assert bot.manual_challenge_status(token) is None
+
+    asyncio.run(scenario())

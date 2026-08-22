@@ -175,3 +175,38 @@ def test_dashboard_inline_script_receives_a_request_scoped_csp_nonce(monkeypatch
     assert "__GREYAI_CSP_NONCE__" not in response.text
     assert request["csp_nonce"]
     assert "nonce=\"" in response.text
+
+
+def test_dashboard_registers_manual_challenge_handoff_routes(dashboard_db):
+    paths = {resource.canonical for resource in dashboard.create_dashboard_app().router.resources()}
+    assert "/challenge/{token}" in paths
+    assert "/challenge/{token}/status" in paths
+    assert "/challenge/{token}/screenshot" in paths
+    assert "/challenge/{token}/action" in paths
+    assert "/challenge/{token}/complete" in paths
+    assert "/challenge/{token}/cancel" in paths
+
+
+def test_challenge_page_rejects_unknown_or_malformed_token(dashboard_db, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(dashboard, "_challenge_token", lambda _request: "unknown")
+    monkeypatch.setattr(dashboard, "secrets", SimpleNamespace(token_urlsafe=lambda _size: "nonce"))
+    monkeypatch.setattr("bot.manual_challenge_status", lambda _token: None)
+
+    with pytest.raises(web.HTTPNotFound):
+        asyncio.run(dashboard.challenge_page_handler(SimpleNamespace(match_info={"token": "unknown"})))
+
+
+def test_challenge_action_handler_rejects_unsafe_action(dashboard_db, monkeypatch):
+    import asyncio
+    import bot
+
+    monkeypatch.setattr(bot, "manual_challenge_action", lambda _token, _body: asyncio.sleep(0, result=(False, "action_not_allowed")))
+    request = SimpleNamespace(
+        match_info={"token": "safe-token"},
+        json=lambda: asyncio.sleep(0, result={"type": "evaluate", "script": "document.cookie"}),
+    )
+
+    with pytest.raises(web.HTTPConflict) as error:
+        asyncio.run(dashboard.challenge_action_handler(request))
+    assert "action_not_allowed" in error.value.text

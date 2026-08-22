@@ -87,6 +87,14 @@ def init_platform_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
             CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 
+            CREATE TABLE IF NOT EXISTS user_settings (
+                telegram_user_id INTEGER PRIMARY KEY,
+                persistent_login_enabled INTEGER NOT NULL DEFAULT 0,
+                auto_save_sessions_enabled INTEGER NOT NULL DEFAULT 0,
+                challenge_handoff_enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS conversation_turns (
                 turn_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_user_id INTEGER NOT NULL,
@@ -579,6 +587,84 @@ def ensure_user(user_id: int, username: str | None = None, display_name: str | N
 def get_user(user_id: int) -> sqlite3.Row | None:
     with _connect() as connection:
         return connection.execute("SELECT * FROM users WHERE telegram_user_id = ?", (user_id,)).fetchone()
+
+
+def get_user_settings(user_id: int) -> dict[str, Any]:
+    """Return durable non-secret settings with safe defaults for existing users."""
+    now = utc_now()
+    try:
+        with _connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO user_settings (telegram_user_id, updated_at) VALUES (?, ?)",
+                (int(user_id), now),
+            )
+            row = connection.execute(
+                """SELECT persistent_login_enabled, auto_save_sessions_enabled, challenge_handoff_enabled
+                   FROM user_settings WHERE telegram_user_id = ?""",
+                (int(user_id),),
+            ).fetchone()
+            connection.commit()
+    except sqlite3.OperationalError as exc:
+        if "no such table: user_settings" not in str(exc).lower():
+            raise
+        init_platform_db()
+        with _connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO user_settings (telegram_user_id, updated_at) VALUES (?, ?)",
+                (int(user_id), now),
+            )
+            row = connection.execute(
+                """SELECT persistent_login_enabled, auto_save_sessions_enabled, challenge_handoff_enabled
+                   FROM user_settings WHERE telegram_user_id = ?""",
+                (int(user_id),),
+            ).fetchone()
+            connection.commit()
+    if not row:
+        return {
+            "persistent_login_enabled": False,
+            "auto_save_sessions_enabled": False,
+            "challenge_handoff_enabled": True,
+        }
+    return {
+        "persistent_login_enabled": bool(row[0]),
+        "auto_save_sessions_enabled": bool(row[1]),
+        "challenge_handoff_enabled": bool(row[2]),
+    }
+
+
+def set_user_settings(user_id: int, **values: Any) -> dict[str, bool]:
+    """Update allowlisted settings; persistent login and auto-save are always paired."""
+    current = get_user_settings(user_id)
+    if "persistent_login_enabled" in values:
+        paired = bool(values["persistent_login_enabled"])
+        current["persistent_login_enabled"] = paired
+        current["auto_save_sessions_enabled"] = paired
+    if "auto_save_sessions_enabled" in values:
+        paired = bool(values["auto_save_sessions_enabled"])
+        current["persistent_login_enabled"] = paired
+        current["auto_save_sessions_enabled"] = paired
+    if "challenge_handoff_enabled" in values:
+        current["challenge_handoff_enabled"] = bool(values["challenge_handoff_enabled"])
+    with _connect() as connection:
+        connection.execute(
+            """INSERT INTO user_settings
+               (telegram_user_id, persistent_login_enabled, auto_save_sessions_enabled, challenge_handoff_enabled, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(telegram_user_id) DO UPDATE SET
+                 persistent_login_enabled=excluded.persistent_login_enabled,
+                 auto_save_sessions_enabled=excluded.auto_save_sessions_enabled,
+                 challenge_handoff_enabled=excluded.challenge_handoff_enabled,
+                 updated_at=excluded.updated_at""",
+            (
+                int(user_id),
+                int(current["persistent_login_enabled"]),
+                int(current["auto_save_sessions_enabled"]),
+                int(current["challenge_handoff_enabled"]),
+                utc_now(),
+            ),
+        )
+        connection.commit()
+    return current
 
 
 def is_admin(user_id: int) -> bool:

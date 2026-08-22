@@ -100,6 +100,7 @@ from control_plane import (
     get_queue_stats,
     get_referral_stats,
     get_user,
+    get_user_settings,
     grant_plan_entitlement,
     init_platform_db,
     is_admin,
@@ -148,6 +149,7 @@ from control_plane import (
     search_users,
     set_maintenance_state,
     set_user_role,
+    set_user_settings,
     set_user_status,
     update_ad_campaign_next_run,
     update_bulk_job_counts,
@@ -190,6 +192,9 @@ INTELLIGENT_NAVIGATION_ENABLED = os.getenv("INTELLIGENT_NAVIGATION_ENABLED", "tr
 INTELLIGENT_NAVIGATION_MAX_STEPS = max(1, min(8, int(os.getenv("INTELLIGENT_NAVIGATION_MAX_STEPS", "5"))))
 INTELLIGENT_NAVIGATION_MAX_ELEMENTS = max(20, min(120, int(os.getenv("INTELLIGENT_NAVIGATION_MAX_ELEMENTS", "80"))))
 INTELLIGENT_NAVIGATION_PAGE_TEXT_CHARS = max(2000, min(12000, int(os.getenv("INTELLIGENT_NAVIGATION_PAGE_TEXT_CHARS", "6000"))))
+MANUAL_CHALLENGE_HANDOFF_ENABLED = os.getenv("MANUAL_CHALLENGE_HANDOFF_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+MANUAL_CHALLENGE_TIMEOUT_SECONDS = max(60, min(900, int(os.getenv("MANUAL_CHALLENGE_TIMEOUT_SECONDS", "600"))))
+MANUAL_CHALLENGE_MAX_ACTIVE = max(1, min(16, int(os.getenv("MANUAL_CHALLENGE_MAX_ACTIVE", "4"))))
 DOWNLOADS_ENABLED = os.getenv("DOWNLOADS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 DOWNLOAD_FREE_ENABLED = os.getenv("DOWNLOAD_FREE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 DOWNLOAD_PRO_MAX_BYTES = max(1_000_000, min(100_000_000, int(os.getenv("DOWNLOAD_PRO_MAX_BYTES", "25000000"))))
@@ -221,6 +226,7 @@ GREY_OWNER_TELEGRAM_ID = int(_GREY_OWNER_ID_RAW) if _GREY_OWNER_ID_RAW.isdigit()
 GREY_COMMAND_CATALOG = (
     ("start", "start GreyAI and see the referral link"),
     ("help", "show GreyAI’s feature and permission guide"),
+    ("settings", "open button-driven personal settings"),
     ("ask", "invoke GreyAI in an enabled shared chat"),
     ("enablegreyai", "enable GreyAI in a group"),
     ("disablegreyai", "disable GreyAI in a group"),
@@ -384,6 +390,8 @@ ALLOWED_CHANNEL_IDS = {
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 download_semaphore = asyncio.Semaphore(DOWNLOAD_MAX_CONCURRENT)
 active_download_jobs: dict[int, str] = {}
+manual_challenges: dict[str, dict[str, Any]] = {}
+manual_challenge_lock = asyncio.Lock()
 notification_worker_task = None
 maintenance_scheduler_task = None
 recovery_monitor_task = None
@@ -505,6 +513,7 @@ async def configure_bot_profile(bot) -> None:
     commands = [
         BotCommand("start", "Start GreyAI and see your referral link"),
         BotCommand("help", "Show the full command and feature guide"),
+        BotCommand("settings", "Open button-driven personal settings"),
         BotCommand("ask", "Ask GreyAI in a private chat or enabled group"),
         BotCommand("enablegreyai", "Enable GreyAI in a group"),
         BotCommand("disablegreyai", "Disable GreyAI in a group"),
@@ -1261,10 +1270,14 @@ runtime_metrics = {
     "download_jobs_failed": 0,
     "download_bytes": 0,
     "download_active": 0,
+    "manual_challenge_handoffs": 0,
+    "manual_challenge_completions": 0,
+    "manual_challenge_timeouts": 0,
+    "manual_challenge_failures": 0,
 }
-
 # ==========================================
 # DATABASE ENGINE (SQLITE)
+
 # ==========================================
 def init_db():
     """Initializes the SQLite database tables."""
@@ -3780,6 +3793,9 @@ async def run_browser_task_with_retry(url: str, actions: list[str], user_id: int
             return result
         except asyncio.CancelledError:
             raise
+        except ManualChallengeRequired:
+            update_operation(operation_id, "paused", attempt)
+            raise
         except Exception as exc:
             last_error = exc
             logger.warning(
@@ -4401,7 +4417,223 @@ async def _ai_extract_current_page(page, prompt: str, native_context: dict[str, 
     return extracted.strip()[:3500]
 
 
-async def _execute_intelligent_navigation(page, goal: str, user_id: int, native_context: dict[str, Any] | None, status_msg=None) -> dict[str, Any]:
+class ManualChallengeRequired(RuntimeError):
+    """Raised when a browser task must pause for an authorized user to complete a challenge."""
+
+
+async def detect_manual_challenge(page) -> str | None:
+    """Detect strong CAPTCHA/MFA/security-check signals without trying to solve them."""
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+    try:
+        body = await page.evaluate("document.body ? document.body.innerText : ''")
+    except Exception:
+        body = ""
+    text = f"{title}\n{body}".lower()[:30000]
+    if any(marker in text for marker in ("captcha", "recaptcha", "hcaptcha", "turnstile", "i'm not a robot", "verify you are human")):
+        return "captcha"
+    if any(marker in text for marker in ("two-factor", "two factor", "2fa", "mfa", "one-time code", "one time code", "authenticator app", "verification code")):
+        return "mfa"
+    if any(marker in text for marker in ("automated traffic", "unusual traffic", "checking your browser", "security verification", "security check")) and any(marker in text for marker in ("verify", "complete", "human", "robot", "browser")):
+        return "security-check"
+    return None
+
+
+def _manual_challenge_cleanup() -> None:
+    now = time.monotonic()
+    for token, record in list(manual_challenges.items()):
+        if float(record.get("expires_at", 0)) <= now:
+            record["status"] = "expired"
+            record["event"].set()
+            manual_challenges.pop(token, None)
+
+
+def manual_challenge_status(token: str) -> dict[str, Any] | None:
+    _manual_challenge_cleanup()
+    record = manual_challenges.get(str(token or ""))
+    if not record:
+        return None
+    return {
+        "status": str(record.get("status", "waiting")),
+        "challenge_kind": str(record.get("challenge_kind", "security-check")),
+        "remaining_seconds": max(0, int(float(record.get("expires_at", 0)) - time.monotonic())),
+    }
+
+
+async def manual_challenge_screenshot(token: str) -> bytes | None:
+    _manual_challenge_cleanup()
+    record = manual_challenges.get(str(token or ""))
+    if not record or record.get("status") not in {"waiting", "resume_requested"}:
+        return None
+    async with record["lock"]:
+        try:
+            return await record["page"].screenshot(type="png", full_page=False)
+        except Exception:
+            runtime_metrics["manual_challenge_failures"] += 1
+            logger.warning("manual_challenge_screenshot_failed", exc_info=True)
+            return None
+
+
+async def create_manual_challenge_handoff(page, user_id: int, operation_id: str, status_msg=None) -> str:
+    """Register a short-lived page capability and tell the user how to open it."""
+    if not MANUAL_CHALLENGE_HANDOFF_ENABLED or not DASHBOARD_BASE_URL:
+        raise ManualChallengeRequired("manual challenge handoff is unavailable")
+    if not get_user_settings(user_id).get("challenge_handoff_enabled", True):
+        raise ManualChallengeRequired("manual challenge handoff is disabled in user settings")
+    async with manual_challenge_lock:
+        _manual_challenge_cleanup()
+        if len(manual_challenges) >= MANUAL_CHALLENGE_MAX_ACTIVE:
+            raise ManualChallengeRequired("manual challenge handoff capacity is full")
+        token = secrets.token_urlsafe(32)
+        manual_challenges[token] = {
+            "user_id": int(user_id),
+            "operation_id": str(operation_id)[:80],
+            "page": page,
+            "challenge_kind": "security-check",
+            "created_at": time.monotonic(),
+            "expires_at": time.monotonic() + MANUAL_CHALLENGE_TIMEOUT_SECONDS,
+            "status": "waiting",
+            "event": asyncio.Event(),
+            "lock": asyncio.Lock(),
+            "actions": [],
+            "action_window_started": time.monotonic(),
+        }
+    link = f"{DASHBOARD_BASE_URL.rstrip('/')}/challenge/{token}"
+    runtime_metrics["manual_challenge_handoffs"] += 1
+    if status_msg:
+        await status_msg.edit_text(
+            "🛑 GreyAI paused because the site requires a manual security challenge.\n\n"
+            f"Open this private handoff link to complete it yourself:\n{link}\n\n"
+            "Use the page controls to click, scroll, or type the required code. GreyAI will not solve or bypass the challenge. "
+            f"The handoff expires in about {MANUAL_CHALLENGE_TIMEOUT_SECONDS // 60} minutes.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open secure manual handoff", url=link)]]),
+        )
+    return token
+
+
+async def wait_for_manual_challenge(page, user_id: int, operation_id: str, status_msg=None) -> None:
+    """Pause the task until the user completes the challenge or the handoff expires."""
+    challenge_kind = await detect_manual_challenge(page)
+    if not challenge_kind:
+        return
+    token = await create_manual_challenge_handoff(page, user_id, operation_id, status_msg)
+    record = manual_challenges.get(token)
+    if record:
+        record["challenge_kind"] = challenge_kind
+    while True:
+        record = manual_challenges.get(token)
+        if not record:
+            raise ManualChallengeRequired("manual challenge handoff expired")
+        remaining = max(0, float(record["expires_at"]) - time.monotonic())
+        if remaining <= 0:
+            runtime_metrics["manual_challenge_timeouts"] += 1
+            manual_challenges.pop(token, None)
+            raise ManualChallengeRequired("manual challenge handoff expired")
+        try:
+            await asyncio.wait_for(record["event"].wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            runtime_metrics["manual_challenge_timeouts"] += 1
+            manual_challenges.pop(token, None)
+            raise ManualChallengeRequired("manual challenge handoff expired")
+        if record.get("status") == "cancelled":
+            manual_challenges.pop(token, None)
+            raise ManualChallengeRequired("manual challenge handoff cancelled")
+        if record.get("status") != "resume_requested":
+            record["event"].clear()
+            continue
+        if await detect_manual_challenge(page):
+            record["status"] = "waiting"
+            record["event"].clear()
+            if status_msg:
+                await status_msg.edit_text("🛑 The challenge is still visible. Complete it in the handoff page, then press ‘I’m done’.")
+            continue
+        if not route_url_allowed(str(page.url), user_id):
+            manual_challenges.pop(token, None)
+            runtime_metrics["manual_challenge_failures"] += 1
+            raise ManualChallengeRequired("manual challenge navigation left the approved route policy")
+        runtime_metrics["manual_challenge_completions"] += 1
+        manual_challenges.pop(token, None)
+        if status_msg:
+            await status_msg.edit_text("✅ Manual challenge completed. GreyAI is resuming the approved task…")
+        return
+
+
+async def manual_challenge_action(token: str, action: dict[str, Any]) -> tuple[bool, str]:
+    """Apply one bounded, user-directed browser input to a live challenge page."""
+    record = manual_challenges.get(str(token or ""))
+    if not record:
+        return False, "handoff_not_found_or_expired"
+    if record.get("status") != "waiting":
+        return False, "handoff_not_waiting"
+    if float(record.get("expires_at", 0)) <= time.monotonic():
+        record["status"] = "expired"
+        record["event"].set()
+        return False, "handoff_expired"
+    async with record["lock"]:
+        now = time.monotonic()
+        if now - float(record.get("action_window_started", now)) >= 60:
+            record["action_window_started"] = now
+            record["actions"] = []
+        if len(record["actions"]) >= 120:
+            return False, "handoff_action_rate_limited"
+        page = record["page"]
+        kind = str(action.get("type", ""))
+        if kind == "click":
+            try:
+                x = float(action.get("x"))
+                y = float(action.get("y"))
+            except (TypeError, ValueError):
+                return False, "invalid_coordinates"
+            if not (0 <= x <= 1280 and 0 <= y <= 900):
+                return False, "coordinates_out_of_bounds"
+            await page.mouse.click(x, y)
+        elif kind == "scroll":
+            try:
+                delta = float(action.get("delta", 0))
+            except (TypeError, ValueError):
+                return False, "invalid_scroll"
+            if not (-1200 <= delta <= 1200):
+                return False, "scroll_out_of_bounds"
+            await page.mouse.wheel(0, delta)
+        elif kind == "key":
+            key = str(action.get("key", ""))
+            if key not in {"Enter", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Backspace"}:
+                return False, "key_not_allowed"
+            await page.keyboard.press(key)
+        elif kind == "type":
+            value = str(action.get("text", ""))
+            if not value or len(value) > 128:
+                return False, "text_length_invalid"
+            await page.keyboard.type(value, delay=20)
+        else:
+            return False, "action_not_allowed"
+        record["actions"].append(kind)
+    return True, "ok"
+
+
+async def complete_manual_challenge(token: str) -> tuple[bool, str]:
+    record = manual_challenges.get(str(token or ""))
+    if not record:
+        return False, "handoff_not_found_or_expired"
+    if record.get("status") != "waiting":
+        return False, "handoff_not_waiting"
+    record["status"] = "resume_requested"
+    record["event"].set()
+    return True, "resume_requested"
+
+
+async def cancel_manual_challenge(token: str) -> tuple[bool, str]:
+    record = manual_challenges.get(str(token or ""))
+    if not record:
+        return False, "handoff_not_found_or_expired"
+    record["status"] = "cancelled"
+    record["event"].set()
+    return True, "cancelled"
+
+
+async def _execute_intelligent_navigation(page, goal: str, user_id: int, native_context: dict[str, Any] | None, status_msg=None, operation_id: str = "navigation") -> dict[str, Any]:
     runtime_metrics["intelligent_navigation_runs"] += 1
     result = {"extracted": [], "condition_met": False, "screenshot_needed": True, "action_errors": [], "navigation_steps": []}
     if not INTELLIGENT_NAVIGATION_ENABLED:
@@ -4434,6 +4666,9 @@ async def _execute_intelligent_navigation(page, goal: str, user_id: int, native_
                 break
             if action == "click":
                 seen_urls.add(current_url)
+            await wait_for_manual_challenge(page, user_id, operation_id, status_msg)
+        except ManualChallengeRequired:
+            raise
         except Exception as exc:
             runtime_metrics["intelligent_navigation_failures"] += 1
             result["action_errors"].append(type(exc).__name__)
@@ -4444,7 +4679,7 @@ async def _execute_intelligent_navigation(page, goal: str, user_id: int, native_
     return result
 
 
-async def execute_pipeline(page, browser_context, actions: list[str], user_id: int, status_msg=None, native_context: dict[str, Any] | None = None) -> dict[str, Any]:
+async def execute_pipeline(page, browser_context, actions: list[str], user_id: int, status_msg=None, native_context: dict[str, Any] | None = None, operation_id: str = "pipeline") -> dict[str, Any]:
     native_context = native_context or build_native_grey_context(user_id, user_id, "agent")
     result = {"extracted": [], "condition_met": False, "screenshot_needed": True, "action_errors": []}
     
@@ -4497,7 +4732,7 @@ async def execute_pipeline(page, browser_context, actions: list[str], user_id: i
             elif action.startswith("navigate:"):
                 goal = action.replace("navigate:", "", 1).strip()
                 navigation_result = await _execute_intelligent_navigation(
-                    page, goal, user_id, native_context, status_msg=status_msg
+                    page, goal, user_id, native_context, status_msg=status_msg, operation_id=operation_id
                 )
                 for key in ("extracted", "navigation_steps", "action_errors"):
                     if navigation_result.get(key):
@@ -4541,6 +4776,9 @@ async def execute_pipeline(page, browser_context, actions: list[str], user_id: i
                     result["condition_met"] = True
                     result["extracted"].append(f"🧠🔔 **AI Condition Met:** '{prompt}'")
 
+            await wait_for_manual_challenge(page, user_id, operation_id, status_msg)
+        except ManualChallengeRequired:
+            raise
         except Exception as e:
             logger.warning(f"Action Failed [{safe_log}]: {e}")
             result["action_errors"].append(type(e).__name__)
@@ -4550,9 +4788,23 @@ async def execute_pipeline(page, browser_context, actions: list[str], user_id: i
 
 async def run_browser_task(url: str, actions: list[str], user_id: int, status_msg=None, native_context: dict[str, Any] | None = None, screenshot_requested: bool = False) -> dict[str, Any]:
     native_context = native_context or build_native_grey_context(user_id, user_id, "agent", request_text=url)
-    context_opts = {
-        "viewport": {'width': 1280, 'height': 800}
-    }
+    operation_id = str((native_context.get("request") or {}).get("operation_id") or "browser")[:80]
+    user_settings = get_user_settings(user_id)
+    effective_actions = list(actions)
+    hostname = (urlparse(url).hostname or "site").removeprefix("www.")
+    default_session_name = sanitize_session_name(hostname)[:80]
+    if user_settings.get("persistent_login_enabled") and not any(action.startswith("load_session:") for action in effective_actions):
+        session_state = load_encrypted_session(user_id, default_session_name)
+        if session_state:
+            context_opts = {"viewport": {'width': 1280, 'height': 800}, "storage_state": session_state}
+        else:
+            context_opts = {"viewport": {'width': 1280, 'height': 800}}
+    else:
+        context_opts = {
+            "viewport": {'width': 1280, 'height': 800}
+        }
+    if user_settings.get("auto_save_sessions_enabled") and any(action.startswith(("type_password:", "click_login_submit:")) for action in effective_actions) and not any(action.startswith("save_session:") for action in effective_actions):
+        effective_actions.append("save_session:" + default_session_name)
 
     if ("proxy:tor" in actions or "proxy:on" in actions) and not proxy_routing_allowed_for_url(url):
         raise PermissionError("explicit proxy routing is disabled for search providers and transparency-sensitive hosts")
@@ -4563,7 +4815,7 @@ async def run_browser_task(url: str, actions: list[str], user_id: int, status_ms
     elif "proxy:on" in actions and PROXY_SERVER:
         context_opts["proxy"] = {"server": PROXY_SERVER, "username": PROXY_USERNAME, "password": PROXY_PASSWORD}
 
-    for action in actions:
+    for action in effective_actions:
         if action.startswith("load_session:"):
             safe_name = sanitize_session_name(action.replace("load_session:", ""))
             session_state = load_encrypted_session(user_id, safe_name)
@@ -4579,8 +4831,17 @@ async def run_browser_task(url: str, actions: list[str], user_id: int, status_ms
         if status_msg: await status_msg.edit_text("🌐 Navigating...")
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(2000)
+        await wait_for_manual_challenge(page, user_id, operation_id, status_msg)
 
-        pipeline_res = await execute_pipeline(page, browser_context, actions, user_id, status_msg, native_context=native_context)
+        pipeline_res = await execute_pipeline(
+            page,
+            browser_context,
+            effective_actions,
+            user_id,
+            status_msg,
+            native_context=native_context,
+            operation_id=operation_id,
+        )
         pipeline_res["requested_url"] = url
         pipeline_res["final_url"] = page.url
 
@@ -4594,6 +4855,11 @@ async def run_browser_task(url: str, actions: list[str], user_id: int, status_ms
         
         return pipeline_res
     finally:
+        for token, record in list(manual_challenges.items()):
+            if str(record.get("operation_id")) == operation_id:
+                record["status"] = "cancelled"
+                record["event"].set()
+                manual_challenges.pop(token, None)
         if page: await page.close()
         if browser_context: await browser_context.close()
 
@@ -7845,6 +8111,10 @@ async def _process_natural_language(
             await status_msg.edit_text(
                 f"❌ The request exceeded the {COMMAND_TIMEOUT}-second timeout."
             )
+        except ManualChallengeRequired as exc:
+            update_operation(operation_id, "paused")
+            log_audit(user_id, "natural_language", plan["url"], "PAUSED_MANUAL_CHALLENGE")
+            await status_msg.edit_text(f"🛑 GreyAI paused for your manual challenge: {str(exc)[:240]}")
         except Exception as exc:
             runtime_metrics["failures_total"] += 1
             logger.exception("Natural-language check failed operation_id=%s", operation_id)
@@ -8308,6 +8578,121 @@ def build_health_report() -> str:
     )
 
 
+def toggle_persistent_login_setting(user_id: int) -> dict[str, bool]:
+    current = get_user_settings(user_id)
+    enabled = not current.get("persistent_login_enabled", False)
+    return set_user_settings(
+        user_id,
+        persistent_login_enabled=enabled,
+        auto_save_sessions_enabled=enabled,
+    )
+
+
+def toggle_challenge_handoff_setting(user_id: int) -> dict[str, bool]:
+    current = get_user_settings(user_id)
+    return set_user_settings(user_id, challenge_handoff_enabled=not current.get("challenge_handoff_enabled", True))
+
+
+def _session_callback_key(name: str) -> str:
+    safe = sanitize_session_name(name)
+    return safe if len(safe) <= 45 else hashlib.sha256(safe.encode("utf-8")).hexdigest()[:16]
+
+
+def settings_text(settings: dict[str, Any], session_names: list[str], active_handoffs: int = 0) -> str:
+    persistent = "ON" if settings.get("persistent_login_enabled") else "OFF"
+    challenge = "ON" if settings.get("challenge_handoff_enabled", True) else "OFF"
+    lines = [
+        "<b>GreyAI settings</b>",
+        "Settings are saved to your account. Use the buttons below; no settings action requires a command.",
+        "",
+        f"<b>Persistent login + automatic session save:</b> {persistent}",
+        "These two protections are paired. When enabled, GreyAI may reuse and refresh the encrypted session for an approved site. Disabling them stops automatic reuse/save but does not delete existing sessions.",
+        "",
+        f"<b>Manual CAPTCHA/MFA handoff:</b> {challenge}",
+        "When enabled, GreyAI pauses and gives you a private browser handoff to complete the site’s own challenge. GreyAI never solves or bypasses it.",
+        "",
+        f"<b>Saved encrypted sessions:</b> {len(session_names)}",
+        f"<b>Active manual handoffs:</b> {active_handoffs}",
+    ]
+    return "\n".join(lines)
+
+
+def settings_keyboard(settings: dict[str, Any], session_names: list[str]) -> InlineKeyboardMarkup:
+    persistent = "✅ Persistent login + auto-save: ON" if settings.get("persistent_login_enabled") else "⚪ Persistent login + auto-save: OFF"
+    challenge = "✅ Manual challenge handoff: ON" if settings.get("challenge_handoff_enabled", True) else "⚪ Manual challenge handoff: OFF"
+    rows = [
+        [InlineKeyboardButton(persistent, callback_data="settings:toggle_persistent")],
+        [InlineKeyboardButton(challenge, callback_data="settings:toggle_challenge")],
+        [InlineKeyboardButton("🔐 Manage saved sessions", callback_data="settings:sessions")],
+        [InlineKeyboardButton("🛑 Cancel my active handoffs", callback_data="settings:cancel_handoffs")],
+    ]
+    for name in session_names[:10]:
+        rows.append([InlineKeyboardButton(f"Delete {name[:40]}", callback_data=f"session:delete:{_session_callback_key(name)}")])
+    return InlineKeyboardMarkup(rows)
+
+
+@restricted
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    settings = get_user_settings(user_id)
+    sessions = list_user_sessions(user_id)
+    handoffs = sum(1 for record in manual_challenges.values() if int(record.get("user_id", -1)) == int(user_id))
+    await update.message.reply_text(
+        settings_text(settings, sessions, handoffs),
+        parse_mode="HTML",
+        reply_markup=settings_keyboard(settings, sessions),
+    )
+
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    user = query.from_user
+    user_id = int(user.id)
+    ensure_user(user_id, getattr(user, "username", None), getattr(user, "full_name", None))
+    if not is_allowed_user(user_id):
+        await query.answer("Your account is not currently allowed to change settings.", show_alert=True)
+        return
+    data = str(query.data or "")
+    if data == "settings:toggle_persistent":
+        settings = toggle_persistent_login_setting(user_id)
+        await query.answer("Persistent login and auto-save were updated together.")
+    elif data == "settings:toggle_challenge":
+        settings = toggle_challenge_handoff_setting(user_id)
+        await query.answer("Manual challenge handoff setting updated.")
+    elif data == "settings:cancel_handoffs":
+        tokens = [token for token, record in manual_challenges.items() if int(record.get("user_id", -1)) == user_id]
+        for token in tokens:
+            await cancel_manual_challenge(token)
+        settings = get_user_settings(user_id)
+        await query.answer(f"Cancelled {len(tokens)} active handoff(s).")
+    elif data == "settings:sessions":
+        settings = get_user_settings(user_id)
+        await query.answer("Saved sessions are encrypted and never displayed.")
+    elif data.startswith("session:delete:"):
+        key = data.removeprefix("session:delete:")
+        sessions = list_user_sessions(user_id)
+        match = next((name for name in sessions if _session_callback_key(name) == key), None)
+        if match:
+            delete_user_session(user_id, match)
+            await query.answer("Saved session deleted.")
+        else:
+            await query.answer("That saved session is no longer available.", show_alert=True)
+        settings = get_user_settings(user_id)
+    else:
+        await query.answer("That settings action is no longer available.", show_alert=True)
+        return
+    sessions = list_user_sessions(user_id)
+    handoffs = sum(1 for record in manual_challenges.values() if int(record.get("user_id", -1)) == user_id)
+    if query.message:
+        await query.edit_message_text(
+            settings_text(settings, sessions, handoffs),
+            parse_mode="HTML",
+            reply_markup=settings_keyboard(settings, sessions),
+        )
+
+
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -8336,6 +8721,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/deletesession &lt;name&gt; — Delete a session\n"
         "Use <code>save_session:name</code> and <code>load_session:name</code> inside browser workflows.\n\n"
         "<b>Account and platform</b>\n"
+        "/settings — Open button-driven personal settings for persistent login, auto-save, handoffs, and session cleanup\n"
         "/start — Start GreyAI and get your referral link\n"
         "/dashboard — Open the secure operations dashboard\n"
         "/health — View service health\n"
@@ -8364,9 +8750,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stars or /starsbalance — view the bot’s current Telegram Stars balance and recent revenue summary\n"
         "/withdrawstars — open the owner-side Telegram/Fragment withdrawal handoff\n"
         "/adcreate &lt;chat_id|@username,...&gt; | &lt;title&gt; | &lt;copy or ai: brief&gt; | &lt;repeat/timing options&gt; — preview an ad campaign\n"
-        "/confirmad <campaign_id> <token> — confirm a campaign and start delivery\n"
-        "/adlist — list your campaigns; /cancelad <campaign_id> — cancel one\n"
-        "/resumead <campaign_id> — resume a paused campaign after restoring permissions\n"
+        "/confirmad &lt;campaign_id&gt; &lt;token&gt; — confirm a campaign and start delivery\n"
+        "/adlist — list your campaigns; /cancelad &lt;campaign_id&gt; — cancel one\n"
+        "/resumead &lt;campaign_id&gt; — resume a paused campaign after restoring permissions\n"
         "Admins receive a durable alert when a Pro or Max subscription is successfully purchased.\n"
         "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper\n"
         "/allowchannel &lt;channel_id&gt;, /disallowchannel &lt;channel_id&gt;\n"
@@ -8433,6 +8819,8 @@ def main():
     
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(settings:|session:delete:)"))
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("enablegreyai", enable_group_command))
     app.add_handler(CommandHandler("disablegreyai", disable_group_command))

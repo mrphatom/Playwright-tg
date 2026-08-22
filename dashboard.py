@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 from typing import Any
 
@@ -193,6 +194,105 @@ def public_status_payload() -> dict[str, Any]:
 
 async def public_status_handler(request: web.Request):
     return web.json_response(public_status_payload())
+
+
+MANUAL_CHALLENGE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GreyAI manual challenge</title>
+<style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;background:#10141c;color:#f4f7fb}main{background:#192231;border:1px solid #334155;border-radius:16px;padding:1.25rem}img{display:block;width:100%;max-height:70vh;object-fit:contain;background:#fff;border-radius:10px;cursor:crosshair}button,input{font:inherit;padding:.7rem 1rem;border-radius:9px;border:1px solid #64748b;margin:.25rem}button{cursor:pointer;background:#93c5fd;color:#0f172a;font-weight:700}input{background:#0f172a;color:#f4f7fb}.muted{color:#cbd5e1}.status{min-height:1.5rem}</style>
+</head>
+<body><main>
+<h1>GreyAI manual challenge handoff</h1>
+<p class="muted">Complete the site’s CAPTCHA, MFA, or security check yourself. GreyAI will not solve or bypass it. This private link expires automatically.</p>
+<p id="status" class="status">Connecting…</p>
+<img id="screen" alt="Current browser challenge view">
+<div><button id="scroll-up" type="button">Scroll up</button><button id="scroll-down" type="button">Scroll down</button><button id="done" type="button">I’m done — resume GreyAI</button><button id="cancel" type="button">Cancel task</button></div>
+<div><input id="text" maxlength="128" autocomplete="one-time-code" placeholder="Optional one-time code"><button id="type" type="button">Type code</button></div>
+<p class="muted">Click the screenshot to click the corresponding location in the live page. Allowed keyboard controls: Enter, Tab, Escape, arrows, and Backspace.</p>
+<script nonce="__GREYAI_CSP_NONCE__">
+const token=__GREYAI_TOKEN__; const statusEl=document.getElementById('status'); const screen=document.getElementById('screen');
+const endpoint=(suffix)=>`/challenge/${token}/${suffix}`;
+async function send(suffix,body={}){const r=await fetch(endpoint(suffix),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),cache:'no-store'});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error||'handoff request failed');return data}
+async function poll(){try{const r=await fetch(endpoint('status'),{cache:'no-store'});const data=await r.json();if(!r.ok)throw new Error(data.error||'handoff expired');statusEl.textContent=`${data.challenge_kind} challenge — ${data.remaining_seconds}s remaining — ${data.status}`;if(data.status==='waiting'){screen.src=endpoint('screenshot')+'?t='+Date.now();setTimeout(poll,2000)}else{screen.remove();}}catch(e){statusEl.textContent=e.message;}}
+screen.addEventListener('click',async e=>{const r=screen.getBoundingClientRect();try{await send('action',{type:'click',x:(e.clientX-r.left)*screen.naturalWidth/r.width,y:(e.clientY-r.top)*screen.naturalHeight/r.height});statusEl.textContent='Click sent.';screen.src=endpoint('screenshot')+'?t='+Date.now()}catch(err){statusEl.textContent=err.message}});
+document.getElementById('scroll-up').onclick=()=>send('action',{type:'scroll',delta:-700}).catch(e=>statusEl.textContent=e.message);
+document.getElementById('scroll-down').onclick=()=>send('action',{type:'scroll',delta:700}).catch(e=>statusEl.textContent=e.message);
+document.getElementById('done').onclick=async()=>{try{await send('complete');statusEl.textContent='Resume requested. You can close this page.'}catch(e){statusEl.textContent=e.message}};
+document.getElementById('cancel').onclick=async()=>{try{await send('cancel');statusEl.textContent='Task cancelled.'}catch(e){statusEl.textContent=e.message}};
+document.getElementById('type').onclick=async()=>{const input=document.getElementById('text');try{await send('action',{type:'type',text:input.value});input.value='';statusEl.textContent='Code typed into the live page.'}catch(e){statusEl.textContent=e.message}};
+document.addEventListener('keydown',e=>{if(['Enter','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Backspace'].includes(e.key)){e.preventDefault();send('action',{type:'key',key:e.key}).catch(err=>statusEl.textContent=err.message)}});poll();
+</script></main></body></html>"""
+
+
+def _challenge_token(request: web.Request) -> str:
+    token = str(request.match_info.get("token", ""))
+    if not token or len(token) > 128 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        raise web.HTTPNotFound(text="handoff_not_found")
+    return token
+
+
+async def challenge_page_handler(request: web.Request):
+    token = _challenge_token(request)
+    from bot import manual_challenge_status
+    if not manual_challenge_status(token):
+        raise web.HTTPNotFound(text="handoff_not_found_or_expired")
+    nonce = secrets.token_urlsafe(18)
+    html = MANUAL_CHALLENGE_HTML.replace("__GREYAI_CSP_NONCE__", nonce).replace("__GREYAI_TOKEN__", json.dumps(token))
+    request["csp_nonce"] = nonce
+    return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+
+
+async def challenge_status_handler(request: web.Request):
+    token = _challenge_token(request)
+    from bot import manual_challenge_status
+    status = manual_challenge_status(token)
+    if not status:
+        raise web.HTTPNotFound(text=json.dumps({"error": "handoff_not_found_or_expired"}), content_type="application/json")
+    return web.json_response(status, headers={"Cache-Control": "no-store"})
+
+
+async def challenge_screenshot_handler(request: web.Request):
+    token = _challenge_token(request)
+    from bot import manual_challenge_screenshot
+    image = await manual_challenge_screenshot(token)
+    if image is None:
+        raise web.HTTPNotFound(text="handoff_not_found_or_expired")
+    return web.Response(body=image, content_type="image/png", headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+
+
+async def _challenge_action_handler(request: web.Request, action_name: str):
+    token = _challenge_token(request)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_json"}), content_type="application/json")
+    if not isinstance(body, dict) or len(json.dumps(body)) > 2048:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "invalid_action"}), content_type="application/json")
+    from bot import cancel_manual_challenge, complete_manual_challenge, manual_challenge_action
+    if action_name == "action":
+        ok, result = await manual_challenge_action(token, body)
+    elif action_name == "complete":
+        ok, result = await complete_manual_challenge(token)
+    else:
+        ok, result = await cancel_manual_challenge(token)
+    if not ok:
+        exception_type = web.HTTPGone if "expired" in result or "not_found" in result else web.HTTPConflict
+        raise exception_type(text=json.dumps({"error": result}), content_type="application/json")
+    return web.json_response({"ok": True, "status": result}, headers={"Cache-Control": "no-store"})
+
+
+async def challenge_action_handler(request: web.Request):
+    return await _challenge_action_handler(request, "action")
+
+
+async def challenge_complete_handler(request: web.Request):
+    return await _challenge_action_handler(request, "complete")
+
+
+async def challenge_cancel_handler(request: web.Request):
+    return await _challenge_action_handler(request, "cancel")
 
 
 async def public_maintenance_events_handler(request: web.Request):
@@ -553,6 +653,12 @@ def create_dashboard_app() -> web.Application:
         web.get("/logout", logout_handler),
         web.get("/api/me", me_handler),
         web.get("/api/status", public_status_handler),
+        web.get("/challenge/{token}", challenge_page_handler),
+        web.get("/challenge/{token}/status", challenge_status_handler),
+        web.get("/challenge/{token}/screenshot", challenge_screenshot_handler),
+        web.post("/challenge/{token}/action", challenge_action_handler),
+        web.post("/challenge/{token}/complete", challenge_complete_handler),
+        web.post("/challenge/{token}/cancel", challenge_cancel_handler),
         web.get("/api/status/events", public_maintenance_events_handler),
         web.get("/api/health", health_handler),
         web.post("/api/v1/check", api_check_handler),
