@@ -2214,7 +2214,12 @@ def is_artifact_download_request(user_text: str) -> bool:
         return False
     has_action = any(re.search(r"\b" + re.escape(term) + r"\b", text) for term in DOWNLOAD_REQUEST_ACTION_TERMS)
     has_artifact = any(re.search(r"\b" + re.escape(term) + r"\b", text) for term in DOWNLOAD_REQUEST_ARTIFACT_TERMS)
-    return bool(has_action and has_artifact)
+    title_artist_send = bool(re.search(
+        r"\b(?:find|search|look\s+for)\b.+\bby\b.+\b(?:send|attach|get|fetch|retrieve)\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    return bool((has_action and has_artifact) or title_artist_send)
 
 
 def artifact_discovery_query(user_text: str) -> str:
@@ -2353,7 +2358,13 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: Optional[int] = None
     if mode not in {"check", "watch", "download"} or not route_url_allowed(url, user_id):
         return None
 
-    if GOOGLE_CUSTOM_SEARCH_ENABLED and mode == "check" and urlparse(url).netloc.lower().removeprefix("www.") in {"google.com", "news.google.com"}:
+    if (
+        GOOGLE_CUSTOM_SEARCH_ENABLED
+        and mode == "check"
+        and not bool(raw_plan.get("screenshot", False))
+        and not re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", request, flags=re.IGNORECASE)
+        and urlparse(url).netloc.lower().removeprefix("www.") in {"google.com", "news.google.com"}
+    ):
         query = request or parse_qs(urlparse(url).query).get("q", [""])[0]
         query = re.sub(r"\s+", " ", str(query).strip())[:500]
         if query:
@@ -2485,7 +2496,11 @@ neutral, respectful tone in groups and inline results.
 The application runs a unified intent interpreter before this prompt. The application-owned context and recorded receipts are authoritative for identity, capabilities, roles, plans, and completed work. Do not answer an
 executable request with a generic “I can’t browse” or “I can’t perform that” disclaimer;
 executable plans are handled by the Agentic pipeline, and this prompt is only reached for
-conversational fallback or clarification. Do not claim that you browsed a page, changed a
+conversational fallback or clarification. Grey supports authorized browser work and lawful
+file retrieval with Telegram document delivery for eligible private-chat users. Never claim
+that Grey cannot stream, retrieve, or send an audio, video, image, document, or archive when
+the request is being handled by the application; explain that authorization or a provider
+restriction prevented execution only when the application supplies that state. Do not claim that you browsed a page, changed a
 system, sent a message, or completed an action unless the application explicitly did it.
 Agent task receipts in the conversation
 
@@ -3078,6 +3093,8 @@ def custom_search_query_for_request(user_text: str) -> Optional[str]:
         return None
     if any(marker in text.lower() for marker in ("monitor", "watch", "tell me when", "alert me when", "notify me when")):
         return None
+    if re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", text, flags=re.IGNORECASE):
+        return None
     if is_factual_web_verification_request(raw_text) or is_live_web_lookup_request(raw_text):
         return text[:500]
     return None
@@ -3101,10 +3118,23 @@ def discover_named_web_reference(user_text: str) -> Optional[str]:
         match = re.search(r"\bsubreddit\s+([A-Za-z0-9_]{2,21})\b", text, flags=re.IGNORECASE)
     if match:
         return f"https://www.reddit.com/r/{match.group(1).lower()}"
+    named_provider_request = bool(re.search(
+        r"\b(?:check|open|visit|browse|screenshot|screen\s*shot|look\s+up|search|find|summari[sz]e|tell\s+me\s+about)\b",
+        lowered,
+    ))
+    screenshot_request = bool(re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", lowered))
     if re.search(r"\bgoogle\s+news\b", lowered):
         return "https://news.google.com/search?q=" + quote_plus(re.sub(r"\s+", " ", text).strip()[:240])
-    if re.search(r"\bgoogle\b", lowered) and is_live_web_lookup_request(text):
-        return "https://www.google.com/search?q=" + quote_plus(re.sub(r"\s+", " ", text).strip()[:240])
+    if re.search(r"\bgoogle\b", lowered) and named_provider_request:
+        return "https://www.google.com/" if screenshot_request else "https://www.google.com/search?q=" + quote_plus(re.sub(r"\s+", " ", text).strip()[:240])
+    if re.search(r"\bduckduckgo\b", lowered) and named_provider_request:
+        return "https://duckduckgo.com/" if screenshot_request else "https://duckduckgo.com/?q=" + quote_plus(re.sub(r"\s+", " ", text).strip()[:240])
+    if re.search(r"\bbing\b", lowered) and named_provider_request:
+        return "https://www.bing.com/" if screenshot_request else "https://www.bing.com/search?q=" + quote_plus(re.sub(r"\s+", " ", text).strip()[:240])
+    if re.search(r"\bbrave\s+search\b", lowered) and named_provider_request:
+        return "https://search.brave.com/" if screenshot_request else "https://search.brave.com/search?q=" + quote_plus(re.sub(r"\s+", " ", text).strip()[:240])
+    if re.search(r"\bstartpage\b", lowered) and named_provider_request:
+        return "https://www.startpage.com/" if screenshot_request else "https://www.startpage.com/sp/search?query=" + quote_plus(re.sub(r"\s+", " ", text).strip()[:240])
     return None
 
 
@@ -6737,7 +6767,8 @@ async def _deliver_download_artifact(
         await status_msg.edit_text(_download_policy_message({"reason": "free_plan"}))
         update_operation(operation_id, "denied")
         return
-    source_url = str(plan.get("url") or "").strip().rstrip(".,;!?)")
+    candidate_sources = [str(item).strip() for item in (plan.get("source_candidates") or []) if str(item).strip()]
+    source_url = str(plan.get("url") or (candidate_sources[0] if candidate_sources else "")).strip().rstrip(".,;!?)")
     parsed = urlparse(source_url)
     if parsed.username or parsed.password or parsed.scheme not in {"http", "https"} or not route_url_allowed(source_url, user_id):
         await status_msg.edit_text("⛔ This file source is not an approved HTTPS/allowlisted destination. Grey will not fetch private, credentialed, or unrestricted sources.")
@@ -7422,7 +7453,7 @@ async def _process_natural_language(
             update_operation(operation_id, "denied")
             log_audit(user_id, "download", None, "DENIED_SHARED_CONTEXT")
             return
-        if not plan.get("url"):
+        if not plan.get("url") and not plan.get("source_candidates"):
             await status_msg.edit_text("⚠️ I need a direct lawful file URL or an approved source result before I can retrieve an artifact. I will not guess an unofficial copy.")
             update_operation(operation_id, "rejected")
             log_audit(user_id, "download", None, "REJECTED_SOURCE_REQUIRED")

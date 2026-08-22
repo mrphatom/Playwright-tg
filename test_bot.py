@@ -3862,3 +3862,168 @@ def test_browser_failure_message_is_specific_and_safe():
     assert "automated-traffic challenge" in bot.browser_failure_message(RuntimeError("HTTP 418 automated challenge"))
     assert "Transparent browsing is required" in bot.browser_failure_message(PermissionError("explicit proxy routing is disabled for search providers"))
     assert "No unsafe action was executed" in bot.browser_failure_message(RuntimeError("unexpected provider failure"))
+
+
+def test_screenshot_request_stays_in_browser_check_mode(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "GOOGLE_CUSTOM_SEARCH_ENABLED", True)
+    plan = bot.parse_deterministic_web_request("Send a screenshot of google", user_id=42)
+
+    assert plan is not None
+    assert plan["mode"] == "check"
+    assert plan["screenshot_requested"] is True
+    assert plan["url"].startswith("https://www.google.com/")
+
+
+def test_named_search_provider_screenshot_targets_requested_provider():
+    import bot
+
+    plan = bot.parse_deterministic_web_request("Send a screenshot of DuckDuckGo", user_id=42)
+
+    assert plan is not None
+    assert plan["mode"] == "check"
+    assert plan["screenshot_requested"] is True
+    assert plan["url"].startswith("https://duckduckgo.com/")
+
+
+def test_song_title_and_artist_send_request_routes_to_download():
+    import bot
+
+    request = "Find Migraine by BoyWithuke and send it to me"
+
+    assert bot.is_artifact_download_request(request) is True
+    plan = bot.parse_deterministic_web_request(request, user_id=42)
+    assert plan is not None
+    assert plan["mode"] == "download"
+    assert plan["source_candidates"]
+
+
+def test_download_worker_accepts_source_candidates_without_primary_url(monkeypatch, tmp_path):
+    import bot
+
+    class FakeStatus:
+        def __init__(self):
+            self.messages = []
+
+        async def edit_text(self, text, **_kwargs):
+            self.messages.append(text)
+
+    class FakeBot:
+        def __init__(self):
+            self.documents = []
+
+        async def send_document(self, **kwargs):
+            self.documents.append(kwargs)
+
+    fake_bot = FakeBot()
+
+    class FakeContext:
+        bot = fake_bot
+
+    artifact_path = tmp_path / "song.mp3"
+    artifact_path.write_bytes(b"test audio")
+    status = FakeStatus()
+
+    monkeypatch.setattr(bot, "download_policy_for_user", lambda _user_id: {"allowed": True, "tier": "pro", "max_bytes": 1000, "daily_limit": 2})
+    monkeypatch.setattr(bot, "count_download_jobs_since", lambda *_args: 0)
+    monkeypatch.setattr(bot, "get_last_download_job_at", lambda *_args: None)
+    monkeypatch.setattr(bot, "consume_quota", lambda *_args: (True, 1, 100))
+    monkeypatch.setattr(bot, "create_download_job", lambda *_args: None)
+    monkeypatch.setattr(bot, "finish_download_job", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bot, "update_operation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+
+    async def resolve_source(*_args, **_kwargs):
+        return "https://downloads.example/song.mp3"
+
+    async def stream_source(*_args, **_kwargs):
+        return {"path": str(artifact_path), "filename": "song.mp3", "size": 10, "source_url": "https://downloads.example/song.mp3", "source_host": "downloads.example", "content_type": "audio/mpeg"}
+
+    monkeypatch.setattr(bot, "_resolve_direct_download_source", resolve_source)
+    monkeypatch.setattr(bot, "_stream_download_artifact", stream_source)
+    bot.active_download_jobs.clear()
+
+    asyncio.run(bot._deliver_download_artifact(
+        FakeContext(),
+        status,
+        {"mode": "download", "url": "", "source_candidates": ["https://downloads.example/results"]},
+        42,
+        42,
+        "op_download_source_candidate_only",
+    ))
+
+    assert len(fake_bot.documents) == 1
+    assert "Delivered" in status.messages[-1]
+
+
+def test_unified_processor_hands_source_candidate_download_to_worker(monkeypatch):
+    import bot
+
+    class FakeStatus:
+        def __init__(self):
+            self.messages = []
+
+        async def edit_text(self, text, **_kwargs):
+            self.messages.append(text)
+
+    class FakeMessage:
+        text = "Find a song by an artist and send it to me"
+        caption = None
+        chat_id = 42
+        message_id = 101
+        business_connection_id = None
+
+        def __init__(self):
+            self.status = FakeStatus()
+
+        async def reply_text(self, text, **_kwargs):
+            self.status.messages.append(text)
+            return self.status
+
+    message = FakeMessage()
+    update = SimpleNamespace(
+        message=message,
+        effective_user=SimpleNamespace(id=42),
+        effective_chat=SimpleNamespace(id=42, type="private"),
+        channel_post=None,
+    )
+    context = SimpleNamespace(bot=SimpleNamespace())
+    delivered = []
+
+    async def fake_parse(*_args, **_kwargs):
+        return {"mode": "download", "url": "", "source_candidates": ["https://downloads.example/results"], "request": message.text, "actions": []}
+
+    async def fake_deliver(*args, **kwargs):
+        delivered.append((args, kwargs))
+
+    monkeypatch.setattr(bot, "private_chat_micro_reply", lambda _text: None)
+    monkeypatch.setattr(bot, "_send_delayed_thinking_feedback", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(bot, "parse_natural_language_intent", fake_parse)
+    monkeypatch.setattr(bot, "record_contact_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "extract_reply_context", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "build_native_grey_context", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(bot, "create_operation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "remember_chat_turn", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "update_operation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "log_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "_deliver_download_artifact", fake_deliver)
+
+    asyncio.run(bot._process_natural_language(update, context))
+
+    assert delivered, "source-candidate-only download plan never reached the worker"
+
+
+def test_native_chat_contract_describes_file_delivery_without_false_media_denial():
+    import bot
+
+    prompt = bot.build_chat_prompt(
+        "Find a song and send it to me",
+        [],
+        native_context=bot.build_native_grey_context(42, 42, "chat", request_text="Find a song and send it to me"),
+    )
+
+    assert "lawful file retrieval" in prompt
+    assert "Never claim" in prompt
+    assert "cannot stream" in prompt
