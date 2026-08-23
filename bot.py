@@ -2491,6 +2491,10 @@ def source_candidates_for_request(user_text: str, primary_url: str = "", user_id
         ordered = [primary_url, *artifact_discovery_source_candidates(user_text, user_id, primary_url)]
     elif primary_url:
         ordered = [primary_url]
+        if is_onion_url(primary_url):
+            parsed_primary = urlparse(primary_url)
+            alternate_scheme = "http" if parsed_primary.scheme.lower() == "https" else "https"
+            ordered.append(parsed_primary._replace(scheme=alternate_scheme).geturl())
     elif is_live_web_lookup_request(user_text):
         ordered = public_search_source_candidates(user_text)
     else:
@@ -4358,6 +4362,8 @@ async def run_browser_task_with_retry(url: str, actions: list[str], user_id: int
 def browser_failure_message(exc: BaseException, requested_url: str = "") -> str:
     """Return a useful, safe explanation without exposing provider internals."""
     text = str(exc or "").lower()
+    if is_onion_url(requested_url) and any(marker in text for marker in ("no safe source", "socks", "connection refused", "name not resolved", "dns", "net::err")):
+        return "The allowlisted onion host was authorized, but the Tor connection could not complete. Verify that Tor is running and its configured SOCKS proxy is reachable; GreyAI did not use an unsafe direct fallback."
     if "explicit proxy routing is disabled" in text or "tor_route_unavailable" in text:
         return "Transparent browsing is required for this provider, so GreyAI blocked the proxy/Tor route instead of bypassing its controls."
     if "429" in text or "too many requests" in text or "rate limit" in text:

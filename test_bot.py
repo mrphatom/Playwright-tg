@@ -802,6 +802,28 @@ def test_subreddit_request_reaches_interpreter_fallback_without_gemini(monkeypat
     assert plan["interval_seconds"] == 3600
 
 
+def test_onion_source_candidates_try_both_http_and_https(monkeypatch):
+    import bot
+
+    host = "examplehiddenservice.onion"
+    monkeypatch.setattr(bot, "route_url_allowed", lambda _url, user_id=None: True)
+
+    candidates = bot.source_candidates_for_request(
+        "Check the hidden service",
+        "https://" + host + "/",
+        user_id=42,
+    )
+
+    assert candidates == ["https://" + host + "/", "http://" + host + "/"]
+
+
+def test_onion_failure_message_explains_missing_route_or_source_candidates():
+    import bot
+
+    assert "Tor" in bot.browser_failure_message(RuntimeError("no safe source candidates"), "https://examplehiddenservice.onion")
+    assert "Tor" in bot.browser_failure_message(RuntimeError("net::ERR_SOCKS_CONNECTION_FAILED"), "https://examplehiddenservice.onion")
+
+
 def test_allowlisted_onion_plan_injects_tor_proxy_action(monkeypatch):
     import bot
 
