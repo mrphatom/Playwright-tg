@@ -2318,10 +2318,24 @@ def is_onion_url(url: str) -> bool:
 
 
 def onion_host_allowed(url: str) -> bool:
-    if not is_onion_url(url) or not TOR_ONION_ALLOWLIST:
+    """Authorize an onion host from environment or persisted admin policies."""
+    if not is_onion_url(url):
         return False
     hostname = (urlparse(url).hostname or "").rstrip(".").lower()
-    return any(domain_pattern_matches(hostname, pattern) for pattern in TOR_ONION_ALLOWLIST)
+    try:
+        policies = list_domain_policies()
+    except Exception:
+        logger.warning("onion_domain_policy_read_failed", exc_info=True)
+        policies = []
+    if any(
+        row.get("effect") == "deny" and domain_pattern_matches(hostname, row.get("pattern", ""))
+        for row in policies
+    ):
+        return False
+    allow_patterns = list(TOR_ONION_ALLOWLIST) + [
+        row["pattern"] for row in policies if row.get("effect") == "allow"
+    ]
+    return any(domain_pattern_matches(hostname, pattern) for pattern in allow_patterns)
 
 
 def user_can_use_onion(user_id: int) -> bool:
@@ -2560,6 +2574,8 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
         return None
 
     url = str(raw_plan.get("url", "")).strip()
+    if url and not url.lower().startswith(("http://", "https://")) and is_onion_url("https://" + url):
+        url = "https://" + url
     discovered_url = bool(raw_plan.get("discover_url", False))
     request = str(raw_plan.get("request", "")).strip()[:500]
     if mode == "search":

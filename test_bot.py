@@ -492,6 +492,16 @@ def test_crypto_source_candidates_are_ordered_and_allowlisted(monkeypatch):
     assert any("coinmarketcap.com/search" in candidate for candidate in candidates)
 
 
+def test_runtime_allowdomain_rule_authorizes_onion_host(monkeypatch):
+    import bot
+
+    host = "examplehiddenservice.onion"
+    monkeypatch.setattr(bot, "TOR_ONION_ALLOWLIST", [])
+    monkeypatch.setattr(bot, "list_domain_policies", lambda: [{"pattern": host, "effect": "allow"}])
+
+    assert bot.onion_host_allowed("https://" + host + "/") is True
+
+
 def test_green_tier_cannot_use_onion_but_paid_governed_accounts_can(monkeypatch):
     import bot
     monkeypatch.setattr(bot, "TOR_ONION_ACCESS_ENABLED", True)
@@ -790,6 +800,24 @@ def test_subreddit_request_reaches_interpreter_fallback_without_gemini(monkeypat
     assert plan["mode"] == "watch"
     assert plan["url"] == "https://www.reddit.com/r/forhire"
     assert plan["interval_seconds"] == 3600
+
+
+def test_normalize_plan_accepts_bare_allowlisted_onion_hostname(monkeypatch):
+    import bot
+
+    host = "examplehiddenservice.onion"
+    monkeypatch.setattr(bot, "TOR_ONION_ACCESS_ENABLED", True)
+    monkeypatch.setattr(bot, "TOR_PROXY_SERVER", "socks5://127.0.0.1:9050")
+    monkeypatch.setattr(bot, "TOR_ONION_ALLOWLIST", [host])
+    monkeypatch.setattr(bot, "user_can_use_onion", lambda _user_id: True)
+
+    plan = bot.normalize_natural_language_plan(
+        {"mode": "check", "url": host, "request": "summarize the page", "actions": []},
+        user_id=42,
+    )
+
+    assert plan is not None
+    assert plan["url"] == "https://" + host
 
 
 def test_deterministic_web_fallback_handles_check_and_watch(monkeypatch):
