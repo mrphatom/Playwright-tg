@@ -802,6 +802,24 @@ def test_subreddit_request_reaches_interpreter_fallback_without_gemini(monkeypat
     assert plan["interval_seconds"] == 3600
 
 
+def test_allowlisted_onion_plan_injects_tor_proxy_action(monkeypatch):
+    import bot
+
+    host = "examplehiddenservice.onion"
+    monkeypatch.setattr(bot, "TOR_ONION_ACCESS_ENABLED", True)
+    monkeypatch.setattr(bot, "TOR_PROXY_SERVER", "socks5://127.0.0.1:9050")
+    monkeypatch.setattr(bot, "TOR_ONION_ALLOWLIST", [host])
+    monkeypatch.setattr(bot, "user_can_use_onion", lambda _user_id: True)
+
+    plan = bot.normalize_natural_language_plan(
+        {"mode": "check", "url": "https://" + host, "request": "summarize the page", "actions": []},
+        user_id=42,
+    )
+
+    assert plan is not None
+    assert "proxy:tor" in plan["actions"]
+
+
 def test_normalize_plan_accepts_bare_allowlisted_onion_hostname(monkeypatch):
     import bot
 

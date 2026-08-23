@@ -2634,6 +2634,8 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
                 actions = []
     elif mode == "watch" and not actions:
         return None
+    if is_onion_url(url) and "proxy:tor" not in actions:
+        actions.insert(0, "proxy:tor")
 
     plan = {
         "mode": mode,
