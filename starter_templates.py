@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import ast
 import re
-from html import escape as html_escape
 import zipfile
+from html import escape as html_escape
 from pathlib import Path
 
 from api_contract import DEFAULT_GREY_PUBLIC_BASE_URL
