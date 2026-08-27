@@ -156,7 +156,7 @@ def test_discord_client_registers_native_pairing_commands(platform_db):
     import discord_bot
 
     client = discord_bot.create_discord_bot()
-    assert {command.name for command in client.tree.get_commands()} >= {"pair", "unpair", "help", "ask", "check", "status", "settings", "grey", "sessions"}
+    assert {command.name for command in client.tree.get_commands()} >= {"pair", "unpair", "start", "help", "ask", "check", "status", "health", "settings", "grey", "sessions", "support", "paysupport", "terms", "crypto", "upgrade", "referral", "dashboard", "report", "appeal"}
 
 
 def test_discord_account_and_sessions_summaries_are_scoped_to_shared_user(monkeypatch):
@@ -219,6 +219,40 @@ def test_repair_after_discord_unpair_creates_a_new_active_link(platform_db):
     assert second_pairing is not None
     assert second_pairing["telegram_user_id"] == 202
     assert cp.get_discord_pairing("discord-repair")["telegram_user_id"] == 202
+
+
+def test_discord_account_commands_create_owner_scoped_report_and_appeal(platform_db, monkeypatch):
+    import asyncio
+
+    import discord_bot
+
+    monkeypatch.setattr(discord_bot, "_authenticate_interaction", lambda interaction: asyncio.sleep(0, result=42))
+
+    class Response:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, content, **kwargs):
+            self.messages.append((content, kwargs))
+
+    report_interaction = SimpleNamespace(response=Response())
+    asyncio.run(discord_bot.report_command(report_interaction, "The check result was stale."))
+    assert report_interaction.response.messages[0][0].startswith("Report opened:")
+    assert cp.list_reports("open", 10)
+
+    appeal_interaction = SimpleNamespace(response=Response())
+    asyncio.run(discord_bot.appeal_command(appeal_interaction, "Please review my account status."))
+    assert appeal_interaction.response.messages[0][0].startswith("Appeal opened:")
+    assert cp.list_appeals("open", 10)
+
+
+def test_discord_account_command_helpers_keep_payment_and_secret_boundaries(platform_db, monkeypatch):
+    import discord_bot
+
+    monkeypatch.delenv("CRYPTO_CHECKOUT_URL", raising=False)
+    assert "not enabled" in discord_bot.crypto_account_text().lower()
+    assert "Telegram Stars" in discord_bot.upgrade_account_text()
+    assert "secret" not in discord_bot.referral_account_text(42).lower()
 
 
 def test_discord_private_dm_uses_canonical_telegram_conversation_scope():

@@ -47,13 +47,19 @@ from control_plane import (
     canonical_telegram_user_id_for_discord,
     consume_account_pairing_challenge,
     create_account_pairing_challenge,
+    create_appeal,
+    create_dashboard_login_token,
+    create_report,
     ensure_platform_identity,
     get_discord_pairing,
+    get_or_create_referral_code,
+    get_referral_stats,
     get_user,
     is_allowed_user,
     record_contact_log,
     revoke_account_pairing,
 )
+from platform_contracts import GreyRequest, Platform
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 DISCORD_ENABLED = os.getenv("DISCORD_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -212,6 +218,8 @@ async def handle_discord_message(message: discord.Message) -> None:
         return
 
     chat_id = discord_conversation_id(message, owner_id=owner_id)
+    request = GreyRequest(Platform.DISCORD, owner_id, chat_id, text, message.guild is None, source_message_id=str(message.id))
+    text = request.text
     record_contact_log(owner_id, chat_id, "discord_message", text, int(message.id), getattr(message.reference, "message_id", None), metadata={"source": "discord", "guild_id": str(message.guild.id) if message.guild else None})
     reply_context = None
     referenced = getattr(message.reference, "resolved", None)
@@ -358,6 +366,8 @@ async def handle_discord_interaction(interaction: discord.Interaction, text: str
         await interaction.response.send_message("Tell GreyAI what you want to ask or check.", ephemeral=True)
         return
     chat_id = int(owner_id if interaction.guild is None else (interaction.channel_id or interaction.user.id))
+    request = GreyRequest(Platform.DISCORD, owner_id, chat_id, text, interaction.guild is None)
+    text = request.text
     if not interaction.response.is_done():
         await interaction.response.defer(thinking=True, ephemeral=interaction.guild is not None)
     try:
@@ -385,6 +395,100 @@ async def handle_discord_interaction(interaction: discord.Interaction, text: str
     except Exception:
         grey.logger.exception("discord_interaction_failed")
         await interaction.edit_original_response(content="GreyAI could not complete that request. No unsafe action was executed.")
+
+
+def _discord_plan_value(name: str, default: Any = "") -> Any:
+    plans = getattr(grey, "PLAN_BENEFITS", {})
+    return plans.get(name, default) if isinstance(plans, dict) else default
+
+
+def upgrade_account_text() -> str:
+    pro_stars = getattr(grey, "PRO_PLAN_STARS", 750)
+    max_stars = getattr(grey, "MAX_PLAN_STARS", 1000)
+    pro = "\n".join(f"• {str(item)[:240]}" for item in _discord_plan_value("pro", [])) or "Configured Pro features"
+    maximum = "\n".join(f"• {str(item)[:240]}" for item in _discord_plan_value("max", [])) or "Configured Max features"
+    return _safe_text(
+        f"**GreyAI plans**\n\n**Pro — {pro_stars} Telegram Stars / 30 days**\n{pro}\n\n"
+        f"**Max — {max_stars} Telegram Stars / 30 days**\n{maximum}\n\n"
+        "Payment checkout remains Telegram-owned. Use `/upgrade` in GreyAI’s private Telegram chat to choose a plan."
+    )
+
+
+def referral_account_text(owner_id: int) -> str:
+    code = get_or_create_referral_code(int(owner_id))
+    stats = get_referral_stats(int(owner_id))
+    counts = stats.get("counts", {})
+    return _safe_text(
+        "**Your GreyAI referral**\n\n"
+        f"Link: https://t.me/GreyBrowserBot?start={code}\n\n"
+        f"Pending: {counts.get('pending', 0)} · Qualified: {counts.get('qualified', 0)}\n"
+        f"Reward quota units: {stats.get('reward_units', 0)}\n\n"
+        "A referral qualifies after the invited account completes a verified Pro purchase."
+    )
+
+
+def crypto_account_text() -> str:
+    checkout = os.getenv("CRYPTO_CHECKOUT_URL", "").strip()
+    if not checkout.startswith("https://"):
+        return "Crypto checkout is not enabled. Use Telegram `/upgrade` for Telegram Stars or contact the administrator."
+    return _safe_text(
+        f"External crypto checkout: {checkout}\n\n"
+        "Complete payment only on the configured HTTPS provider page. Never send a wallet seed phrase or private key."
+    )
+
+
+def support_account_text() -> str:
+    return "Support: use `/report` for an issue, `/appeal` for an account review, or `/paysupport` for a payment issue."
+
+
+def payment_support_account_text() -> str:
+    return "Payment support: include the invoice date, Telegram payment receipt, and a short description. Do not send passwords, API keys, or card details."
+
+
+def terms_account_text() -> str:
+    return "GreyAI provides authorized conversation and web operations subject to account permissions, plan limits, domain policy, third-party availability, and the site’s own security controls. GreyAI does not bypass CAPTCHAs, anti-bot systems, paywalls, DRM, or access restrictions."
+
+
+async def report_command(interaction: discord.Interaction, description: str) -> None:
+    owner_id = await _authenticate_interaction(interaction)
+    if owner_id is None:
+        return
+    text = _safe_text(description, 4000)
+    if not text:
+        await interaction.response.send_message("Describe the issue after `/report`.", ephemeral=True)
+        return
+    report_id = create_report(owner_id, "discord_report", text)
+    await interaction.response.send_message(f"Report opened: `{report_id}`. An administrator can review it.", ephemeral=True)
+
+
+async def appeal_command(interaction: discord.Interaction, message: str) -> None:
+    owner_id = await _authenticate_interaction(interaction)
+    if owner_id is None:
+        return
+    text = _safe_text(message, 4000)
+    if not text:
+        await interaction.response.send_message("Describe why you are requesting review after `/appeal`.", ephemeral=True)
+        return
+    appeal_id = create_appeal(owner_id, text)
+    await interaction.response.send_message(f"Appeal opened: `{appeal_id}`. An administrator can review it.", ephemeral=True)
+
+
+async def _send_account_text(interaction: discord.Interaction, text: str) -> None:
+    owner_id = await _authenticate_interaction(interaction)
+    if owner_id is not None:
+        await interaction.response.send_message(_safe_text(text), ephemeral=True)
+
+
+async def dashboard_command(interaction: discord.Interaction) -> None:
+    owner_id = await _authenticate_interaction(interaction)
+    if owner_id is None:
+        return
+    token = create_dashboard_login_token(owner_id)
+    base_url = os.getenv("DASHBOARD_BASE_URL", "https://playwright-tg-mrphatom.fly.dev").rstrip("/")
+    await interaction.response.send_message(
+        f"Your secure dashboard link (single-use, expires soon):\n{base_url}/login?token={token}",
+        ephemeral=True,
+    )
 
 
 def _row_value(row: Any, key: str, default: Any = "") -> Any:
@@ -505,6 +609,10 @@ def create_discord_bot() -> commands.Bot:
     async def unpair_command(interaction: discord.Interaction) -> None:
         await unpair_account(interaction)
 
+    @client.tree.command(name="start", description="Show how to connect and use GreyAI")
+    async def start_command(interaction: discord.Interaction) -> None:
+        await interaction.response.send_message("GreyAI is available for paired accounts. Use `/pair` in this private Discord DM, then confirm the code in GreyAI’s private Telegram chat.", ephemeral=True)
+
     @client.tree.command(name="help", description="Show GreyAI Discord capabilities")
     async def help_command(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("GreyAI supports paired chat, read-only web checks, and more shared capabilities as they are enabled. Use `/pair` to connect your Telegram account.", ephemeral=True)
@@ -532,6 +640,50 @@ def create_discord_bot() -> commands.Bot:
         owner_id = await _authenticate_interaction(interaction)
         if owner_id is not None:
             await interaction.response.send_message(_safe_text(grey.build_health_report()), ephemeral=True)
+
+    @client.tree.command(name="health", description="Show GreyAI service health")
+    async def health_command(interaction: discord.Interaction) -> None:
+        await _send_account_text(interaction, grey.build_health_report())
+
+    @client.tree.command(name="support", description="Show GreyAI support options")
+    async def support_command(interaction: discord.Interaction) -> None:
+        await _send_account_text(interaction, support_account_text())
+
+    @client.tree.command(name="paysupport", description="Show payment support guidance")
+    async def paysupport_command(interaction: discord.Interaction) -> None:
+        await _send_account_text(interaction, payment_support_account_text())
+
+    @client.tree.command(name="terms", description="Show GreyAI terms and security boundaries")
+    async def terms_command(interaction: discord.Interaction) -> None:
+        await _send_account_text(interaction, terms_account_text())
+
+    @client.tree.command(name="crypto", description="Show configured crypto checkout status")
+    async def crypto_command(interaction: discord.Interaction) -> None:
+        await _send_account_text(interaction, crypto_account_text())
+
+    @client.tree.command(name="upgrade", description="Compare GreyAI plans")
+    async def upgrade_command(interaction: discord.Interaction) -> None:
+        await _send_account_text(interaction, upgrade_account_text())
+
+    @client.tree.command(name="referral", description="Show your GreyAI referral link")
+    async def referral_command(interaction: discord.Interaction) -> None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is not None:
+            await interaction.response.send_message(referral_account_text(owner_id), ephemeral=True)
+
+    @client.tree.command(name="dashboard", description="Create a secure GreyAI dashboard link")
+    async def dashboard_link_command(interaction: discord.Interaction) -> None:
+        await dashboard_command(interaction)
+
+    @client.tree.command(name="report", description="Open a support or safety report")
+    @app_commands.describe(description="What happened; do not include credentials or payment secrets")
+    async def report_slash_command(interaction: discord.Interaction, description: str) -> None:
+        await report_command(interaction, description)
+
+    @client.tree.command(name="appeal", description="Open an account review appeal")
+    @app_commands.describe(message="Why you are requesting review; do not include credentials")
+    async def appeal_slash_command(interaction: discord.Interaction, message: str) -> None:
+        await appeal_command(interaction, message)
 
     @client.tree.command(name="ask", description="Ask GreyAI a question or start an authorized task")
     @app_commands.describe(prompt="Your natural-language question or task")
