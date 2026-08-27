@@ -213,6 +213,100 @@ async def confirm_pairing_code(telegram_user_id: int, code: str) -> dict[str, An
     return consume_account_pairing_challenge(code, int(telegram_user_id))
 
 
+def discord_download_policy_message(owner_id: int) -> str:
+    policy = getattr(grey, "download_policy_for_user")(int(owner_id))
+    if policy.get("allowed"):
+        return f"File retrieval is available on your {str(policy.get('tier', 'current')).title()} entitlement."
+    reason = str(policy.get("reason") or "policy")
+    if reason == "free_plan":
+        return "File retrieval is unavailable on the Free plan. Use `/upgrade` to view Pro and Max benefits."
+    if reason == "disabled":
+        return "File retrieval is temporarily disabled while GreyAI checks its configuration."
+    if reason == "account_status":
+        return "Your account is not currently eligible for file retrieval."
+    return "This file-retrieval request is not permitted."
+
+
+class _DiscordDownloadStatus:
+    def __init__(self, editor):
+        self._editor = editor
+
+    async def edit_text(self, text: str, **_: Any) -> None:
+        await self._editor(_safe_text(text))
+
+
+async def _execute_discord_download(
+    owner_id: int,
+    chat_id: int,
+    text: str,
+    plan: dict[str, Any],
+    status_edit,
+    send_file,
+) -> None:
+    policy = getattr(grey, "download_policy_for_user")(int(owner_id))
+    if not policy.get("allowed"):
+        await status_edit(discord_download_policy_message(owner_id))
+        return
+    source_candidates = [str(item).strip() for item in (plan.get("source_candidates") or []) if str(item).strip()]
+    source_url = str(plan.get("url") or (source_candidates[0] if source_candidates else "")).strip().rstrip(".,;!?)")
+    source_candidates = list(dict.fromkeys(([source_url] if source_url else []) + source_candidates))[:5]
+    if not source_candidates:
+        source_candidates = [str(item).strip() for item in getattr(grey, "source_candidates_for_request")(text, "", user_id=owner_id) if str(item).strip()][:5]
+    if not source_candidates:
+        await status_edit("I could not identify an approved file source for that request.")
+        return
+    operation_id = uuid.uuid4().hex[:12]
+    getattr(grey, "create_operation")(operation_id, int(owner_id), int(chat_id), "discord_download", source_candidates[0])
+    downloaded_path = None
+    status = _DiscordDownloadStatus(status_edit)
+    try:
+        await status.edit_text("📥 Download queued. GreyAI is resolving and validating an approved artifact…")
+        artifact = None
+        last_error = None
+        for candidate in source_candidates:
+            try:
+                if not getattr(grey, "route_url_allowed")(candidate, int(owner_id)):
+                    continue
+                direct_url = await getattr(grey, "_resolve_direct_download_source")(
+                    candidate,
+                    int(owner_id),
+                    text,
+                    getattr(grey, "build_native_grey_context")(owner_id, chat_id, "agent", request_text=text, operation_id=operation_id),
+                    status_msg=status,
+                    operation_id=operation_id,
+                )
+                if not direct_url:
+                    continue
+                artifact = await getattr(grey, "_stream_download_artifact")(direct_url, int(owner_id), policy, status_msg=status)
+                break
+            except Exception as exc:
+                last_error = exc
+        if not artifact:
+            raise last_error or RuntimeError("no_direct_artifact_found")
+        downloaded_path = artifact["path"]
+        await status.edit_text(f"🔍 Validated `{artifact['filename']}`. Sending it privately…")
+        await send_file(downloaded_path, artifact["filename"], f"✅ GreyAI file delivery\nSource: {artifact.get('source_host', 'approved source')}\nOperation: {operation_id}")
+        getattr(grey, "update_operation")(operation_id, "succeeded")
+        await status.edit_text(f"✅ Delivered `{artifact['filename']}` successfully.")
+    except Exception as exc:
+        getattr(grey, "update_operation")(operation_id, "failed")
+        grey.logger.info("discord_download_failed operation_id=%s error_type=%s", operation_id, type(exc).__name__)
+        await status.edit_text("❌ File retrieval failed safely. No artifact was delivered. Please try an approved source again later.")
+    finally:
+        if downloaded_path:
+            Path(downloaded_path).unlink(missing_ok=True)
+
+
+async def _run_discord_message_download(message: discord.Message, status: discord.Message, owner_id: int, chat_id: int, text: str, plan: dict[str, Any]) -> None:
+    async def edit(value: str) -> None:
+        await status.edit(content=value)
+
+    async def send_file(path: str, filename: str, caption: str) -> None:
+        await message.author.send(content=caption, file=discord.File(path, filename=filename[:80]))
+
+    await _execute_discord_download(owner_id, chat_id, text, plan, edit, send_file)
+
+
 async def handle_discord_message(message: discord.Message) -> None:
     if message.author.bot or not guild_is_enabled(message.guild):
         return
@@ -255,8 +349,11 @@ async def handle_discord_message(message: discord.Message) -> None:
             await status.edit(content=_safe_text(reply))
             grey.remember_chat_turn(chat_id, text, reply, owner_id, int(message.id), reply_context.get("message_id") if reply_context else None, assistant_message_id=int(status.id))
             return
+        if plan.get("mode") in {"fetch", "download"}:
+            await _run_discord_message_download(message, status, owner_id, chat_id, text, plan)
+            return
         if plan.get("mode") != "check":
-            await status.edit(content="This Discord adapter slice currently supports paired chat and read-only web checks. The remaining GreyAI modes are being connected to the same shared service boundary.")
+            await status.edit(content="This Discord request needs a GreyAI capability that is not yet exposed on Discord. No browser action was executed.")
             return
         await _run_check(message, status, owner_id, chat_id, text, plan)
     except grey.TextProviderUnavailable:
@@ -393,10 +490,19 @@ async def handle_discord_interaction(interaction: discord.Interaction, text: str
             await interaction.edit_original_response(content=_safe_text(reply))
             grey.remember_chat_turn(chat_id, text, reply, owner_id, None, assistant_message_id=None)
             return
+        if plan.get("mode") in {"fetch", "download"}:
+            async def edit(value: str) -> None:
+                await interaction.edit_original_response(content=_safe_text(value))
+
+            async def send_file(path: str, filename: str, caption: str) -> None:
+                await interaction.user.send(content=caption, file=discord.File(path, filename=filename[:80]))
+
+            await _execute_discord_download(owner_id, chat_id, text, plan, edit, send_file)
+            return
         if plan.get("mode") == "check":
             await _run_interaction_check(interaction, owner_id, text, plan)
             return
-        await interaction.edit_original_response(content="That GreyAI mode is not yet exposed through this Discord interaction. Use a normal Discord message for the same request while the remaining platform adapters are connected.")
+        await interaction.edit_original_response(content="That GreyAI mode is not yet exposed through this Discord interaction. No browser action was executed.")
     except grey.TextProviderUnavailable:
         await interaction.edit_original_response(content="GreyAI’s language providers are temporarily unavailable. No browser action was executed.")
     except grey.QueueRejected:
@@ -945,6 +1051,11 @@ def create_discord_bot() -> commands.Bot:
         if task:
             task.cancel()
         await interaction.response.send_message(f"Schedule `{_safe_text(schedule_id, 80)}` cancelled.", ephemeral=True)
+
+    @client.tree.command(name="fetch", description="Retrieve an authorized file or artifact")
+    @app_commands.describe(request="Approved URL or bounded natural-language file request")
+    async def fetch_command(interaction: discord.Interaction, request: str) -> None:
+        await handle_discord_interaction(interaction, f"fetch {request}")
 
     @client.tree.command(name="ask", description="Ask GreyAI a question or start an authorized task")
     @app_commands.describe(prompt="Your natural-language question or task")

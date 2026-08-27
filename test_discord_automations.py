@@ -90,3 +90,18 @@ def test_discord_command_registry_includes_monitoring_surfaces(platform_db):
     client = discord_bot.create_discord_bot()
     names = {command.name for command in client.tree.get_commands()}
     assert {"watch", "watchers", "stopwatch", "schedule", "schedules", "unschedule"} <= names
+
+
+def test_discord_command_registry_includes_fetch(platform_db):
+    import discord_bot
+
+    client = discord_bot.create_discord_bot()
+    assert "fetch" in {command.name for command in client.tree.get_commands()}
+
+
+def test_discord_download_policy_message_is_redacted_and_plan_gated(monkeypatch):
+    import discord_bot
+
+    monkeypatch.setattr(discord_bot.grey, "download_policy_for_user", lambda _owner: {"allowed": False, "reason": "free_plan"})
+    assert "Free plan" in discord_bot.discord_download_policy_message(42)
+    assert "token" not in discord_bot.discord_download_policy_message(42).lower()
