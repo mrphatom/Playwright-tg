@@ -11,8 +11,10 @@ import importlib
 import os
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -49,15 +51,26 @@ from control_plane import (
     create_account_pairing_challenge,
     create_appeal,
     create_dashboard_login_token,
+    create_discord_schedule,
+    create_discord_watcher,
     create_report,
+    deactivate_discord_schedule,
+    deactivate_discord_watcher,
     ensure_platform_identity,
     get_discord_pairing,
+    get_discord_pairing_for_telegram,
     get_or_create_referral_code,
     get_referral_stats,
     get_user,
     is_allowed_user,
+    list_all_discord_schedules,
+    list_all_discord_watchers,
+    list_discord_schedules,
+    list_discord_watchers,
     record_contact_log,
     revoke_account_pairing,
+    update_discord_schedule_next_run,
+    update_discord_watcher_health,
 )
 from platform_contracts import GreyRequest, Platform
 
@@ -596,6 +609,184 @@ class DiscordSettingsView(discord.ui.View):
             await interaction.response.edit_message(content=_sessions_summary(self.owner_id), view=DiscordSessionsView(self.owner_id))
 
 
+_DISCORD_CLIENT: commands.Bot | None = None
+_DISCORD_WATCHER_TASKS: dict[str, asyncio.Task[Any]] = {}
+_DISCORD_SCHEDULE_TASKS: dict[str, asyncio.Task[Any]] = {}
+
+
+def parse_discord_watch_spec(url: str, interval_seconds: int, *actions: str) -> dict[str, Any] | None:
+    normalized = str(url or "").strip().rstrip(".,;!?)")
+    if not normalized.lower().startswith(("http://", "https://")):
+        normalized = "https://" + normalized
+    if not normalized or len(normalized) > 2048 or not getattr(grey, "is_valid_url")(normalized) or not getattr(grey, "is_domain_allowed")(normalized):
+        return None
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    safe_actions = [str(item).strip()[:500] for item in actions if str(item).strip()][:20]
+    return {"url": normalized, "interval_seconds": max(30, min(int(interval_seconds), 86400)), "actions": safe_actions}
+
+
+def parse_discord_schedule_spec(schedule_time: str, timezone_name: str, days: str, urls: str, summary_prompt: str, delivery_mode: str = "combined") -> dict[str, Any] | None:
+    config = getattr(grey, "normalize_schedule_config")({
+        "schedule_time": str(schedule_time or "").strip(),
+        "timezone": str(timezone_name or "UTC").strip(),
+        "days": str(days or "daily").strip(),
+        "urls": [item.strip() for item in str(urls or "").split(",") if item.strip()][:10],
+        "summary_prompt": str(summary_prompt or "").strip()[:500],
+        "delivery_mode": str(delivery_mode or "combined").strip().lower(),
+    })
+    if not config:
+        return None
+    return {"config": config, "next_run_at": getattr(grey, "calculate_next_schedule_run")(config).isoformat()}
+
+
+def _discord_private_user(client: commands.Bot, owner_id: int):
+    pairing = get_discord_pairing_for_telegram(int(owner_id))
+    if not pairing:
+        return None
+    discord_id = str(pairing.get("discord_user_id") or "")
+    if not discord_id.isdigit():
+        return None
+    return client.get_user(int(discord_id))
+
+
+async def _discord_private_delivery(client: commands.Bot | None, owner_id: int, content: str, file_path: str | None = None) -> bool:
+    if client is None:
+        return False
+    user = _discord_private_user(client, owner_id)
+    if user is None:
+        try:
+            pairing = get_discord_pairing_for_telegram(int(owner_id))
+            if pairing and str(pairing.get("discord_user_id", "")).isdigit():
+                user = await client.fetch_user(int(pairing["discord_user_id"]))
+        except Exception:
+            user = None
+    if user is None:
+        return False
+    try:
+        kwargs: dict[str, Any] = {}
+        if file_path and os.path.exists(file_path):
+            kwargs["file"] = discord.File(file_path, filename=Path(file_path).name[:80])
+        await user.send(_safe_text(content), **kwargs)
+        return True
+    except Exception:
+        grey.logger.exception("discord_private_delivery_failed")
+        return False
+
+
+async def _discord_watcher_worker(record: dict[str, Any]) -> None:
+    watcher_id = str(record["watcher_id"])
+    owner_id = int(record["owner_user_id"])
+    try:
+        while True:
+            screenshot_path = None
+            try:
+                result = await getattr(grey, "run_browser_task_with_source_fallback")(
+                    [record["url"]], record.get("actions", []), owner_id, f"discord_watcher_{watcher_id}", attempts=1
+                )
+                extracted = "\n\n".join(str(item or "") for item in result.get("extracted", []))
+                result_hash = __import__("hashlib").sha256((extracted or str(result.get("title") or record["url"])).encode()).hexdigest()
+                update_discord_watcher_health(watcher_id, True, result_hash=result_hash)
+                screenshot_path = result.get("screenshot")
+                if result.get("condition_met"):
+                    await _discord_private_delivery(
+                        _DISCORD_CLIENT,
+                        owner_id,
+                        f"**Watcher alert `{watcher_id}`**\n\n{_format_result(result)}",
+                        screenshot_path,
+                    )
+                    deactivate_discord_watcher(watcher_id, owner_id)
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                update_discord_watcher_health(watcher_id, False, error=type(exc).__name__)
+                watcher_state = next((row for row in list_discord_watchers(owner_id, active_only=False) if row.get("watcher_id") == watcher_id), None)
+                failures = int(watcher_state.get("consecutive_failures", 0)) if watcher_state else 1
+                if failures == 1 or failures % 5 == 0:
+                    await _discord_private_delivery(_DISCORD_CLIENT, owner_id, f"Watcher `{watcher_id}` failed and will retry. Failure count: {failures}.")
+            finally:
+                if screenshot_path and os.path.exists(screenshot_path):
+                    Path(screenshot_path).unlink(missing_ok=True)
+            await asyncio.sleep(max(30, min(int(record["interval_seconds"]), 86400)))
+    except asyncio.CancelledError:
+        deactivate_discord_watcher(watcher_id, owner_id)
+    finally:
+        _DISCORD_WATCHER_TASKS.pop(watcher_id, None)
+
+
+async def _discord_schedule_worker(record: dict[str, Any]) -> None:
+    schedule_id = str(record["schedule_id"])
+    owner_id = int(record["owner_user_id"])
+    config = dict(record.get("config") or {})
+    try:
+        while True:
+            next_run = datetime.fromisoformat(str(record["next_run_at"]))
+            delay = max(0, (next_run - datetime.now(next_run.tzinfo)).total_seconds())
+            await asyncio.sleep(delay)
+            sections: list[str] = []
+            for url in config.get("urls", [])[:10]:
+                try:
+                    result = await getattr(grey, "run_browser_task_with_retry")(
+                        url, [f"ai_extract:{config.get('summary_prompt', 'Summarize the latest important updates.') }"], owner_id, f"discord_schedule_{schedule_id}"
+                    )
+                    sections.append(_format_result(result))
+                except Exception:
+                    sections.append(f"Could not summarize {url}.")
+            if sections:
+                await _discord_private_delivery(_DISCORD_CLIENT, owner_id, f"**Scheduled GreyAI briefing `{schedule_id}`**\n\n" + "\n\n".join(sections))
+            next_run = getattr(grey, "calculate_next_schedule_run")(config)
+            record["next_run_at"] = next_run.isoformat()
+            update_discord_schedule_next_run(schedule_id, record["next_run_at"])
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        update_discord_schedule_next_run(schedule_id, record.get("next_run_at", ""), type(exc).__name__)
+        grey.logger.exception("discord_schedule_worker_failed")
+    finally:
+        _DISCORD_SCHEDULE_TASKS.pop(schedule_id, None)
+
+
+def start_discord_watcher(record: dict[str, Any]) -> None:
+    watcher_id = str(record["watcher_id"])
+    if watcher_id not in _DISCORD_WATCHER_TASKS or _DISCORD_WATCHER_TASKS[watcher_id].done():
+        _DISCORD_WATCHER_TASKS[watcher_id] = asyncio.create_task(_discord_watcher_worker(record))
+
+
+def start_discord_schedule(record: dict[str, Any]) -> None:
+    schedule_id = str(record["schedule_id"])
+    if schedule_id not in _DISCORD_SCHEDULE_TASKS or _DISCORD_SCHEDULE_TASKS[schedule_id].done():
+        _DISCORD_SCHEDULE_TASKS[schedule_id] = asyncio.create_task(_discord_schedule_worker(record))
+
+
+async def restore_discord_automations(client: commands.Bot) -> None:
+    global _DISCORD_CLIENT
+    _DISCORD_CLIENT = client
+    for record in list_all_discord_watchers():
+        start_discord_watcher(record)
+    for record in list_all_discord_schedules():
+        start_discord_schedule(record)
+
+
+def _format_discord_watcher_list(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "You have no active Discord watchers."
+    return "**Active Discord watchers**\n\n" + "\n\n".join(
+        f"`{row['watcher_id']}` · every {row['interval_seconds']}s · {'healthy' if not row.get('last_error') else 'degraded'}\n{row['url']}"
+        for row in rows[:20]
+    )
+
+
+def _format_discord_schedule_list(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "You have no active Discord schedules."
+    return "**Active Discord schedules**\n\n" + "\n".join(
+        f"`{row['schedule_id']}` · {row['config'].get('schedule_time')} {row['config'].get('timezone')} · next {row['next_run_at']}"
+        for row in rows[:20]
+    )
+
+
 def create_discord_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -685,6 +876,76 @@ def create_discord_bot() -> commands.Bot:
     async def appeal_slash_command(interaction: discord.Interaction, message: str) -> None:
         await appeal_command(interaction, message)
 
+    @client.tree.command(name="watch", description="Monitor an approved page for a condition")
+    @app_commands.describe(url="Approved HTTP(S) URL", interval_seconds="Polling interval from 30 to 86400 seconds", condition="Optional condition such as condition_contains:Stock")
+    async def watch_command(interaction: discord.Interaction, url: str, interval_seconds: int = 60, condition: str = "") -> None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is None:
+            return
+        spec = parse_discord_watch_spec(url, interval_seconds, condition)
+        if spec is None:
+            await interaction.response.send_message("That watcher URL or policy is invalid. Use an approved HTTP(S) URL and a 30–86400 second interval.", ephemeral=True)
+            return
+        watcher_id = create_discord_watcher(owner_id, interaction.guild.id if interaction.guild else None, int(interaction.channel_id), spec["url"], spec["actions"], spec["interval_seconds"])
+        record = next(row for row in list_discord_watchers(owner_id) if row["watcher_id"] == watcher_id)
+        start_discord_watcher(record)
+        await interaction.response.send_message(f"Watcher `{watcher_id}` started for `{spec['url']}` every {spec['interval_seconds']} seconds.", ephemeral=interaction.guild is not None)
+
+    @client.tree.command(name="watchers", description="List your active Discord watchers")
+    async def watchers_command(interaction: discord.Interaction) -> None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is not None:
+            await interaction.response.send_message(_format_discord_watcher_list(list_discord_watchers(owner_id)), ephemeral=True)
+
+    @client.tree.command(name="stopwatch", description="Stop one of your Discord watchers")
+    @app_commands.describe(watcher_id="Watcher ID from /watchers")
+    async def stopwatch_command(interaction: discord.Interaction, watcher_id: str) -> None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is None:
+            return
+        if not deactivate_discord_watcher(watcher_id, owner_id):
+            await interaction.response.send_message("Watcher not found or already stopped.", ephemeral=True)
+            return
+        task = _DISCORD_WATCHER_TASKS.pop(str(watcher_id), None)
+        if task:
+            task.cancel()
+        await interaction.response.send_message(f"Watcher `{_safe_text(watcher_id, 80)}` stopped.", ephemeral=True)
+
+    @client.tree.command(name="schedule", description="Schedule a recurring GreyAI briefing")
+    @app_commands.describe(schedule_time="24-hour local time, for example 08:00", timezone_name="IANA timezone, for example Europe/London", days="daily, weekdays, weekends, or comma-separated weekdays", urls="Comma-separated approved HTTP(S) URLs", summary_prompt="Bounded briefing instruction", delivery_mode="combined or separate")
+    async def schedule_command(interaction: discord.Interaction, schedule_time: str, timezone_name: str, days: str, urls: str, summary_prompt: str, delivery_mode: str = "combined") -> None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is None:
+            return
+        parsed = parse_discord_schedule_spec(schedule_time, timezone_name, days, urls, summary_prompt, delivery_mode)
+        if parsed is None:
+            await interaction.response.send_message("Invalid schedule. Check the time, IANA timezone, day pattern, approved URLs, and summary text.", ephemeral=True)
+            return
+        schedule_id = create_discord_schedule(owner_id, interaction.guild.id if interaction.guild else None, int(interaction.channel_id), parsed["config"], parsed["next_run_at"])
+        record = next(row for row in list_discord_schedules(owner_id) if row["schedule_id"] == schedule_id)
+        start_discord_schedule(record)
+        await interaction.response.send_message(f"Schedule `{schedule_id}` created. Next run: `{parsed['next_run_at']}`.", ephemeral=interaction.guild is not None)
+
+    @client.tree.command(name="schedules", description="List your active Discord schedules")
+    async def schedules_command(interaction: discord.Interaction) -> None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is not None:
+            await interaction.response.send_message(_format_discord_schedule_list(list_discord_schedules(owner_id)), ephemeral=True)
+
+    @client.tree.command(name="unschedule", description="Cancel one of your Discord schedules")
+    @app_commands.describe(schedule_id="Schedule ID from /schedules")
+    async def unschedule_command(interaction: discord.Interaction, schedule_id: str) -> None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is None:
+            return
+        if not deactivate_discord_schedule(schedule_id, owner_id):
+            await interaction.response.send_message("Schedule not found or already cancelled.", ephemeral=True)
+            return
+        task = _DISCORD_SCHEDULE_TASKS.pop(str(schedule_id), None)
+        if task:
+            task.cancel()
+        await interaction.response.send_message(f"Schedule `{_safe_text(schedule_id, 80)}` cancelled.", ephemeral=True)
+
     @client.tree.command(name="ask", description="Ask GreyAI a question or start an authorized task")
     @app_commands.describe(prompt="Your natural-language question or task")
     async def ask_command(interaction: discord.Interaction, prompt: str) -> None:
@@ -697,9 +958,12 @@ def create_discord_bot() -> commands.Bot:
 
     @client.event
     async def on_ready() -> None:
+        global _DISCORD_CLIENT
+        _DISCORD_CLIENT = client
         if not getattr(client, "_grey_synced", False):
             await client.tree.sync()
             client._grey_synced = True
+        await restore_discord_automations(client)
         grey.logger.info("GreyAI Discord adapter ready as %s", client.user)
 
     @client.event

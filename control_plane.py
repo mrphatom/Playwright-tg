@@ -129,6 +129,38 @@ def init_platform_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_account_pairings_telegram ON account_pairings(telegram_user_id, status);
             CREATE INDEX IF NOT EXISTS idx_account_pairings_discord ON account_pairings(discord_user_id, status);
 
+            CREATE TABLE IF NOT EXISTS discord_watchers (
+                watcher_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                guild_id INTEGER,
+                channel_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                actions_json TEXT NOT NULL DEFAULT '[]',
+                interval_seconds INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_checked_at TEXT,
+                last_error TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                last_result_hash TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_discord_watchers_owner ON discord_watchers(owner_user_id, is_active, created_at);
+            CREATE INDEX IF NOT EXISTS idx_discord_watchers_channel ON discord_watchers(channel_id, is_active);
+
+            CREATE TABLE IF NOT EXISTS discord_schedules (
+                schedule_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                guild_id INTEGER,
+                channel_id INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                next_run_at TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_discord_schedules_owner ON discord_schedules(owner_user_id, is_active, next_run_at);
+            CREATE INDEX IF NOT EXISTS idx_discord_schedules_due ON discord_schedules(is_active, next_run_at);
+
             CREATE TABLE IF NOT EXISTS user_settings (
                 telegram_user_id INTEGER PRIMARY KEY,
                 persistent_login_enabled INTEGER NOT NULL DEFAULT 0,
@@ -2222,3 +2254,192 @@ def list_contact_logs(owner_user_id: int, chat_id: int | None = None, limit: int
                ORDER BY created_at DESC, contact_id DESC LIMIT ?""",
             (int(owner_user_id), int(chat_id), bounded_limit),
         ).fetchall()
+
+
+# Discord-native durable automation records. These remain separate from Telegram's
+# chat_id-shaped tables until a shared delivery migration is proven safe.
+def create_discord_watcher(
+    owner_user_id: int,
+    guild_id: int | None,
+    channel_id: int,
+    url: str,
+    actions: list[str],
+    interval_seconds: int,
+) -> str:
+    owner = int(owner_user_id)
+    channel = int(channel_id)
+    if owner <= 0 or channel <= 0:
+        raise ValueError("owner and channel IDs must be positive")
+    safe_url = str(url or "").strip()[:2048]
+    if not safe_url.startswith(("https://", "http://")):
+        raise ValueError("watcher URL must use HTTP(S)")
+    interval = max(30, min(int(interval_seconds), 86400))
+    watcher_id = "dw_" + secrets.token_urlsafe(7)
+    now = utc_now()
+    with _connect() as connection:
+        connection.execute(
+            """INSERT INTO discord_watchers
+               (watcher_id, owner_user_id, guild_id, channel_id, url, actions_json, interval_seconds, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (watcher_id, owner, int(guild_id) if guild_id is not None else None, channel, safe_url, json.dumps([str(item)[:500] for item in actions[:20]]), interval, now),
+        )
+        connection.commit()
+    return watcher_id
+
+
+def list_discord_watchers(owner_user_id: int, active_only: bool = True) -> list[dict[str, Any]]:
+    predicates = ["owner_user_id = ?"]
+    params: list[Any] = [int(owner_user_id)]
+    if active_only:
+        predicates.append("is_active = 1")
+    with _connect() as connection:
+        rows = connection.execute(
+            f"""SELECT watcher_id, owner_user_id, guild_id, channel_id, url, actions_json,
+                       interval_seconds, is_active, created_at, last_checked_at, last_error,
+                       consecutive_failures, last_result_hash
+                FROM discord_watchers WHERE {' AND '.join(predicates)}
+                ORDER BY created_at DESC LIMIT 50""",
+            tuple(params),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            actions = json.loads(row["actions_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            actions = []
+        result.append({
+            "watcher_id": row["watcher_id"],
+            "owner_user_id": int(row["owner_user_id"]),
+            "guild_id": int(row["guild_id"]) if row["guild_id"] is not None else None,
+            "channel_id": int(row["channel_id"]),
+            "url": row["url"],
+            "actions": actions[:20] if isinstance(actions, list) else [],
+            "interval_seconds": int(row["interval_seconds"]),
+            "is_active": bool(row["is_active"]),
+            "created_at": row["created_at"],
+            "last_checked_at": row["last_checked_at"],
+            "last_error": row["last_error"],
+            "consecutive_failures": int(row["consecutive_failures"] or 0),
+            "last_result_hash": row["last_result_hash"],
+        })
+    return result
+
+
+def deactivate_discord_watcher(watcher_id: str, owner_user_id: int) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE discord_watchers SET is_active = 0 WHERE watcher_id = ? AND owner_user_id = ? AND is_active = 1",
+            (str(watcher_id)[:100], int(owner_user_id)),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def update_discord_watcher_health(watcher_id: str, success: bool, error: str | None = None, result_hash: str | None = None) -> None:
+    with _connect() as connection:
+        row = connection.execute("SELECT consecutive_failures FROM discord_watchers WHERE watcher_id = ?", (str(watcher_id),)).fetchone()
+        previous = int(row[0] or 0) if row else 0
+        connection.execute(
+            """UPDATE discord_watchers SET last_checked_at = ?, last_error = ?,
+               consecutive_failures = ?, last_result_hash = COALESCE(?, last_result_hash)
+               WHERE watcher_id = ?""",
+            (utc_now(), str(error or "")[:500] or None, 0 if success else previous + 1, str(result_hash or "")[:128] or None, str(watcher_id)),
+        )
+        connection.commit()
+
+
+def create_discord_schedule(
+    owner_user_id: int,
+    guild_id: int | None,
+    channel_id: int,
+    config: dict[str, Any],
+    next_run_at: str,
+) -> str:
+    owner = int(owner_user_id)
+    channel = int(channel_id)
+    if owner <= 0 or channel <= 0:
+        raise ValueError("owner and channel IDs must be positive")
+    schedule_id = "ds_" + secrets.token_urlsafe(7)
+    safe_config = dict(config or {})
+    safe_config["urls"] = [str(item)[:2048] for item in safe_config.get("urls", [])[:10]]
+    now = utc_now()
+    with _connect() as connection:
+        connection.execute(
+            """INSERT INTO discord_schedules
+               (schedule_id, owner_user_id, guild_id, channel_id, config_json, next_run_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (schedule_id, owner, int(guild_id) if guild_id is not None else None, channel, json.dumps(safe_config), str(next_run_at)[:80], now),
+        )
+        connection.commit()
+    return schedule_id
+
+
+def list_discord_schedules(owner_user_id: int, active_only: bool = True) -> list[dict[str, Any]]:
+    predicates = ["owner_user_id = ?"]
+    params: list[Any] = [int(owner_user_id)]
+    if active_only:
+        predicates.append("is_active = 1")
+    with _connect() as connection:
+        rows = connection.execute(
+            f"""SELECT schedule_id, owner_user_id, guild_id, channel_id, config_json,
+                       next_run_at, is_active, created_at, last_error
+                FROM discord_schedules WHERE {' AND '.join(predicates)}
+                ORDER BY next_run_at LIMIT 50""",
+            tuple(params),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            config = json.loads(row["config_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            config = {}
+        result.append({
+            "schedule_id": row["schedule_id"],
+            "owner_user_id": int(row["owner_user_id"]),
+            "guild_id": int(row["guild_id"]) if row["guild_id"] is not None else None,
+            "channel_id": int(row["channel_id"]),
+            "config": config if isinstance(config, dict) else {},
+            "next_run_at": row["next_run_at"],
+            "is_active": bool(row["is_active"]),
+            "created_at": row["created_at"],
+            "last_error": row["last_error"],
+        })
+    return result
+
+
+def deactivate_discord_schedule(schedule_id: str, owner_user_id: int) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE discord_schedules SET is_active = 0 WHERE schedule_id = ? AND owner_user_id = ? AND is_active = 1",
+            (str(schedule_id)[:100], int(owner_user_id)),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def update_discord_schedule_next_run(schedule_id: str, next_run_at: str, error: str | None = None) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE discord_schedules SET next_run_at = ?, last_error = ? WHERE schedule_id = ? AND is_active = 1",
+            (str(next_run_at)[:80], str(error or "")[:500] or None, str(schedule_id)[:100]),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def list_all_discord_watchers() -> list[dict[str, Any]]:
+    with _connect() as connection:
+        rows = connection.execute("SELECT owner_user_id FROM discord_watchers WHERE is_active = 1 GROUP BY owner_user_id").fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        result.extend(list_discord_watchers(int(row[0])))
+    return result
+
+
+def list_all_discord_schedules() -> list[dict[str, Any]]:
+    with _connect() as connection:
+        rows = connection.execute("SELECT owner_user_id FROM discord_schedules WHERE is_active = 1 GROUP BY owner_user_id").fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        result.extend(list_discord_schedules(int(row[0])))
+    return result
