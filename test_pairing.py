@@ -221,6 +221,15 @@ def test_repair_after_discord_unpair_creates_a_new_active_link(platform_db):
     assert cp.get_discord_pairing("discord-repair")["telegram_user_id"] == 202
 
 
+def test_discord_private_dm_uses_canonical_telegram_conversation_scope():
+    import discord_bot
+
+    message = SimpleNamespace(guild=None, channel=SimpleNamespace(id=987654321))
+
+    assert discord_bot.discord_conversation_id(message, owner_id=101) == 101
+    assert discord_bot.discord_conversation_id(message) == 987654321
+
+
 def test_unpaired_discord_message_never_reaches_interpreter(platform_db, monkeypatch):
     import asyncio
 

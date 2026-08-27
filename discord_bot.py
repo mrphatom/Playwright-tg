@@ -65,8 +65,10 @@ DISCORD_ALLOWED_GUILD_IDS = {
 DISCORD_MESSAGE_LIMIT = 1900
 
 
-def discord_conversation_id(message: discord.Message) -> int:
-    """Use the Discord channel Snowflake as the durable conversation scope."""
+def discord_conversation_id(message: discord.Message, owner_id: int | None = None) -> int:
+    """Use the canonical Telegram owner for DMs and a channel scope for guilds."""
+    if getattr(message, "guild", None) is None and owner_id is not None:
+        return int(owner_id)
     return int(message.channel.id)
 
 
@@ -209,7 +211,7 @@ async def handle_discord_message(message: discord.Message) -> None:
         await message.reply("Your paired GreyAI account is not currently permitted to use the service.", mention_author=False)
         return
 
-    chat_id = discord_conversation_id(message)
+    chat_id = discord_conversation_id(message, owner_id=owner_id)
     record_contact_log(owner_id, chat_id, "discord_message", text, int(message.id), getattr(message.reference, "message_id", None), metadata={"source": "discord", "guild_id": str(message.guild.id) if message.guild else None})
     reply_context = None
     referenced = getattr(message.reference, "resolved", None)
@@ -327,7 +329,7 @@ async def _run_interaction_check(interaction: discord.Interaction, owner_id: int
         await interaction.edit_original_response(content=f"Your GreyAI quota is exhausted ({used}/{limit}).")
         return
     url = str(plan.get("url") or "").strip()
-    chat_id = int(interaction.channel_id or interaction.user.id)
+    chat_id = int(owner_id if interaction.guild is None else (interaction.channel_id or interaction.user.id))
     candidates = grey.source_candidates_for_request(text, url, user_id=owner_id) if url else []
     candidates = list(dict.fromkeys([url, *candidates]))
     if not candidates:
@@ -355,7 +357,7 @@ async def handle_discord_interaction(interaction: discord.Interaction, text: str
     if not text:
         await interaction.response.send_message("Tell GreyAI what you want to ask or check.", ephemeral=True)
         return
-    chat_id = int(interaction.channel_id or interaction.user.id)
+    chat_id = int(owner_id if interaction.guild is None else (interaction.channel_id or interaction.user.id))
     if not interaction.response.is_done():
         await interaction.response.defer(thinking=True, ephemeral=interaction.guild is not None)
     try:
