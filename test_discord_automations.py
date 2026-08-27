@@ -134,3 +134,21 @@ def test_discord_attachment_kind_accepts_supported_audio_and_images_only():
     assert discord_bot.discord_attachment_kind("voice-note.ogg", "audio/ogg") == ("voice", "audio/ogg", ".ogg")
     assert discord_bot.discord_attachment_kind("screenshot.png", "image/png") == ("image", "image/png", ".png")
     assert discord_bot.discord_attachment_kind("payload.exe", "application/octet-stream") is None
+
+
+def test_discord_help_pages_are_bounded_and_role_aware(platform_db):
+    import discord_bot
+
+    cp.ensure_user(42)
+    pages = discord_bot.discord_help_pages(42)
+    assert pages
+    assert all(len(page) <= discord_bot.DISCORD_MESSAGE_LIMIT for page in pages)
+    assert any("/check" in page for page in pages)
+
+
+def test_discord_command_registry_includes_help_pagination_surface(platform_db):
+    import discord_bot
+
+    client = discord_bot.create_discord_bot()
+    assert "help" in {command.name for command in client.tree.get_commands()}
+    assert hasattr(discord_bot, "DiscordHelpView")

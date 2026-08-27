@@ -612,6 +612,56 @@ def create_discord_api_key(owner_id: int, name: str, scopes: list[str]) -> dict[
     return cp.create_api_key(int(owner_id), _safe_text(name, 80), scopes)
 
 
+def discord_help_pages(owner_id: int) -> list[str]:
+    try:
+        source_pages = list(getattr(grey, "build_help_pages")(int(owner_id)))
+    except Exception:
+        source_pages = ["/pair — connect your Telegram account\n/ask — chat or start an authorized GreyAI task\n/check — run a read-only web check\n/fetch — retrieve an approved artifact\n/settings — manage private account controls"]
+    pages: list[str] = []
+    for source in source_pages:
+        text = str(source or "").strip()
+        while len(text) > DISCORD_MESSAGE_LIMIT - 120:
+            split_at = text.rfind("\n", 0, DISCORD_MESSAGE_LIMIT - 120)
+            split_at = split_at if split_at > 200 else DISCORD_MESSAGE_LIMIT - 120
+            pages.append(text[:split_at].strip())
+            text = text[split_at:].strip()
+        if text:
+            pages.append(text)
+    return pages or ["GreyAI help is temporarily unavailable."]
+
+
+def discord_help_text(pages: list[str], page_index: int) -> str:
+    index = max(0, min(int(page_index), len(pages) - 1))
+    return _safe_text(f"**GreyAI command guide — page {index + 1}/{len(pages)}**\n\n{pages[index]}")
+
+
+class DiscordHelpView(discord.ui.View):
+    def __init__(self, owner_id: int, pages: list[str], page_index: int = 0):
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.pages = list(pages)
+        self.page_index = max(0, min(int(page_index), len(self.pages) - 1))
+        self.previous.disabled = self.page_index == 0
+        self.next.disabled = self.page_index >= len(self.pages) - 1
+
+    async def _move(self, interaction: discord.Interaction, delta: int) -> None:
+        if canonical_user_id(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message("Only the paired account owner can use this help viewer.", ephemeral=True)
+            return
+        self.page_index = max(0, min(self.page_index + delta, len(self.pages) - 1))
+        self.previous.disabled = self.page_index == 0
+        self.next.disabled = self.page_index >= len(self.pages) - 1
+        await interaction.response.edit_message(content=discord_help_text(self.pages, self.page_index), view=self)
+
+    @discord.ui.button(label="‹ Previous", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._move(interaction, -1)
+
+    @discord.ui.button(label="Next ›", style=discord.ButtonStyle.primary)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._move(interaction, 1)
+
+
 def _discord_plan_value(name: str, default: Any = "") -> Any:
     plans = getattr(grey, "PLAN_BENEFITS", {})
     return plans.get(name, default) if isinstance(plans, dict) else default
@@ -1008,7 +1058,11 @@ def create_discord_bot() -> commands.Bot:
 
     @client.tree.command(name="help", description="Show GreyAI Discord capabilities")
     async def help_command(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message("GreyAI supports paired chat, read-only web checks, and more shared capabilities as they are enabled. Use `/pair` to connect your Telegram account.", ephemeral=True)
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is None:
+            return
+        pages = discord_help_pages(owner_id)
+        await interaction.response.send_message(discord_help_text(pages, 0), ephemeral=True, view=DiscordHelpView(owner_id, pages))
 
     @client.tree.command(name="settings", description="Manage GreyAI account settings with private buttons")
     async def settings_command(interaction: discord.Interaction) -> None:
