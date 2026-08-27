@@ -17,6 +17,10 @@ Discord users begin with `/pair` in a private Discord DM. GreyAI returns a short
 
 Guild use is closed by default. An administrator must configure `DISCORD_ALLOWED_GUILD_IDS` with explicit server IDs before GreyAI responds in a server. Pairing and unpairing remain DM-only; sensitive handoff links, pairing codes, API keys, cookies, and saved-session details are never sent in public channels.
 
+For deployment, store `DISCORD_BOT_TOKEN` only in Fly.io or GitHub secret storage, set `DISCORD_ENABLED=true` only when the token is present, and enable Discord’s **Message Content Intent** in the Developer Portal for natural-language message handling. The current adapter uses Discord DMs by default; allowlisted guilds may use chat and task commands, while sensitive check results are sent to the paired user’s private DM. No Discord token is included in this repository or requested in chat.
+
+The current Discord-native commands are `/pair`, `/unpair`, `/grey`, `/settings`, `/sessions`, `/status`, `/ask`, `/check`, and `/help`. `/pair` and `/unpair` are DM-only. `/ask` and `/check` defer long work and reuse GreyAI’s canonical Telegram account for plan, role, quota, durable context, URL policy, queue, and browser execution. The adapter is intentionally feature-flagged and does not yet claim parity for every Telegram-only surface such as billing, advertising, administrative workflows, voice/media delivery, watchers, or schedules.
+
 ## Native Grey Intelligence
 
 GreyAI’s identity and operating context are owned by the application rather than by the model provider. The runtime maintains a versioned native registry containing Grey’s name, description, owner relationship, commands, capabilities, execution processes, plan benefits, limitations, and current maintenance state. The same registry is used by ordinary chat, natural-language interpretation, multimodal input, inline mode, groups, channels, Secretary Mode, administrative workflows, developer integrations, watchers, schedules, and Agentic execution.
