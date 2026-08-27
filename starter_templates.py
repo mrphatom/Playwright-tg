@@ -11,21 +11,21 @@ from api_contract import DEFAULT_GREY_PUBLIC_BASE_URL
 
 
 def _safe_project_name(raw: str | None) -> str:
-    value = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(raw or "greyai-telegram-integration").strip()).strip(".-_")
-    return (value.lower() or "greyai-telegram-integration")[:80]
+    value = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(raw or "greyai-cross-platform-integration").strip()).strip(".-_")
+    return (value.lower() or "greyai-cross-platform-integration")[:80]
 
 
 def _python_files(project_name: str, base_url: str) -> dict[str, str]:
     return {
         "README.md": f'''# {project_name}
 
-A minimal production-oriented Telegram bot that calls GreyAI's verified developer API.
+A minimal production-oriented Telegram or Discord integration that calls GreyAI’s verified developer API.
 
 ## What this starter does
 
-The bot listens for `/start`, `/help`, and `/check <url> [| extraction request]`. It sends a bounded HTTPS request to GreyAI's `POST /api/v1/check` endpoint and returns the extracted result. GreyAI applies the developer-key scope, account quota, per-key rate limit, URL/domain policy, SSRF protections, queue, timeout, and maintenance gates.
+The included Telegram example listens for `/start`, `/help`, and `/check <url> [| extraction request]`. It sends a bounded HTTPS request to GreyAI’s `POST /api/v1/check` endpoint and returns the extracted result. The same API contract can be called from a Discord adapter or another authorized application. GreyAI applies the developer-key scope, account quota, per-key rate limit, URL/domain policy, SSRF protections, queue, timeout, and maintenance gates.
 
-This starter does not contain a GreyAI key or Telegram token. Store both in environment variables or a secret manager.
+This starter does not contain a GreyAI key, Telegram token, or Discord token. Store credentials in environment variables or a secret manager.
 
 ## Setup
 
@@ -34,15 +34,16 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your Telegram token and GreyAI developer key.
+# Edit .env with your Telegram token and GreyAI developer key. Add Discord credentials only in a separate secret-managed adapter.
 python bot.py
 ```
 
-Create a GreyAI developer key with `/newkey greyai-telegram check`. The plaintext key is shown once. Never commit `.env` or print the key.
+Create a GreyAI developer key with `/newkey greyai-cross-platform check`. The plaintext key is shown once. Never commit `.env` or print the key.
 
 The exact live API contract is available at `{base_url}/api/v1/docs`.
 ''',
         ".env.example": f'''TELEGRAM_BOT_TOKEN=replace_with_your_telegram_bot_token
+# DISCORD_BOT_TOKEN=replace_with_your_discord_bot_token
 GREY_API_KEY=replace_with_your_greyai_developer_key
 GREY_API_BASE_URL={base_url}
 ''',
@@ -226,21 +227,21 @@ def build_landing_page_files(project_name: str | None, brief: str | None = None)
   </header>
   <main id="top">
     <section class="hero" aria-labelledby="hero-title">
-      <p class="eyebrow">A clearer way forward</p>
-      <h1 id="hero-title">Turn a good idea into a great first impression.</h1>
-      <p class="hero-copy">{escaped_brief}</p>
+      <p class="eyebrow">Telegram + Discord AI operations</p>
+      <h1 id="hero-title">Move from conversation to execution.</h1>
+      <p class="hero-copy">{escaped_brief or "GreyAI brings natural chat, authorized web work, monitoring, schedules, and human-controlled security handoffs to Telegram and Discord through one durable account."}</p>
       <div class="hero-actions">
         <a class="button button-primary" href="#contact">Start a conversation</a>
         <a class="button button-secondary" href="#features">Explore the details</a>
       </div>
     </section>
     <section id="features" class="feature-grid" aria-label="Highlights">
-      <article class="feature-card"><span class="feature-number">01</span><h2>Focused</h2><p>Clear hierarchy keeps attention on the action that matters.</p></article>
-      <article class="feature-card"><span class="feature-number">02</span><h2>Responsive</h2><p>A fluid layout stays comfortable on phones, tablets, and desktops.</p></article>
-      <article class="feature-card"><span class="feature-number">03</span><h2>Ready</h2><p>Clean HTML, CSS, and JavaScript give you a practical starting point.</p></article>
+      <article class="feature-card"><span class="feature-number">01</span><h2>Chat</h2><p>Natural conversation and durable account-scoped context across Telegram and Discord.</p></article>
+      <article class="feature-card"><span class="feature-number">02</span><h2>Execute</h2><p>Authorized research, monitoring, schedules, and bounded browser workflows with clear progress.</p></article>
+      <article class="feature-card"><span class="feature-number">03</span><h2>Control</h2><p>Private pairing, role-aware access, human security handoffs, and no secret-bearing generated source.</p></article>
     </section>
     <section id="contact" class="contact-card" aria-labelledby="contact-title">
-      <div><p class="eyebrow">Ready when you are</p><h2 id="contact-title">Let’s build something people remember.</h2></div>
+      <div><p class="eyebrow">Connect GreyAI</p><h2 id="contact-title">One assistant, two trusted surfaces.</h2></div>
       <a class="button button-primary" href="mailto:hello@example.com">Say hello</a>
     </section>
   </main>
@@ -287,7 +288,7 @@ h2 { font-size:clamp(1.7rem,3vw,2.5rem); }
   });
 });
 ''',
-        "README.md": f'''# {safe_name.replace("-", " ").title()}\n\nA dependency-free responsive landing page generated by GreyAI.\n\n## Files\n\n- `index.html` — semantic page structure\n- `styles.css` — responsive visual system\n- `script.js` — small progressive-enhancement interaction\n\nOpen `index.html` locally or serve this folder with any static web server. Review the content and replace the example contact address before publishing.\n''',
+        "README.md": f'''# {safe_name.replace("-", " ").title()}\n\nA dependency-free responsive GreyAI landing page for Telegram and Discord. Review the content and replace the example contact address before publishing.\n\n## Files\n\n- `index.html` — semantic page structure\n- `styles.css` — responsive visual system\n- `script.js` — small progressive-enhancement interaction\n\nOpen `index.html` locally or serve this folder with any static web server. Review the content and replace the example contact address before publishing.\n''',
     }
 
 

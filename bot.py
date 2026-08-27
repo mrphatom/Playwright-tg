@@ -68,6 +68,7 @@ from control_plane import (
     attribute_referral,
     calibrate_risk_decision,
     claim_queue_entry,
+    consume_account_pairing_challenge,
     confirm_ad_campaign,
     confirm_bulk_job,
     consume_quota,
@@ -4760,6 +4761,10 @@ async def post_init(application: Application):
         recovery_monitor_task = asyncio.create_task(automatic_recovery_worker(application))
         application.bot_data["recovery_monitor_task"] = recovery_monitor_task
     await configure_bot_profile(application.bot)
+    if os.getenv("DISCORD_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"} and os.getenv("DISCORD_BOT_TOKEN", "").strip():
+        from discord_bot import run_discord_bot
+        application.bot_data["discord_task"] = asyncio.create_task(run_discord_bot())
+        logger.info("Discord adapter task started")
 
 
 async def stop_browser_pool(application: Application):
@@ -4774,6 +4779,7 @@ async def stop_browser_pool(application: Application):
         maintenance_scheduler_task,
         recovery_monitor_task,
         application.bot_data.get("dashboard_task"),
+        application.bot_data.get("discord_task"),
         *application.bot_data.get("ephemeral_message_tasks", set()),
         *(task for user_watchers in active_watchers.values() for task in user_watchers.values()),
         *active_schedules.values(),
@@ -9838,6 +9844,29 @@ async def referrals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @restricted
+async def pair_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm a Discord pairing code from the authenticated Telegram private chat."""
+    message = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or getattr(chat, "type", "private") != "private":
+        if message:
+            await message.reply_text("For security, Discord pairing can only be confirmed in GreyAI’s private Telegram chat.")
+        return
+    code = str(context.args[0]).strip() if context.args else ""
+    if not code or len(code) > 128:
+        await message.reply_text("Send the one-time code exactly as shown by GreyAI in Discord: `/pair <code>`.")
+        return
+    pairing = consume_account_pairing_challenge(code, int(user.id))
+    if not pairing:
+        await message.reply_text("That pairing code is invalid, expired, already used, or the account is already paired. Start a new `/pair` request in Discord.")
+        log_audit(user.id, "account_pairing", None, "FAILED_CONFIRMATION")
+        return
+    await message.reply_text("✅ Telegram and Discord are now paired. Your GreyAI plan, role, limits, and durable context remain controlled by this Telegram account.")
+    log_audit(user.id, "account_pairing", None, "PAIRED_DISCORD_" + str(pairing["discord_user_id"]))
+
+
+@restricted
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     attribution = None
@@ -9872,6 +9901,7 @@ def main():
     )
     
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("pair", pair_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(settings:|session:delete:)"))

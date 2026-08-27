@@ -87,6 +87,48 @@ def init_platform_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
             CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 
+            CREATE TABLE IF NOT EXISTS platform_identities (
+                identity_id TEXT PRIMARY KEY,
+                platform TEXT NOT NULL CHECK (platform IN ('telegram', 'discord')),
+                platform_user_id TEXT NOT NULL,
+                username TEXT,
+                display_name TEXT,
+                canonical_telegram_user_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(platform, platform_user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_platform_identity_canonical ON platform_identities(canonical_telegram_user_id, status);
+
+            CREATE TABLE IF NOT EXISTS account_pairing_challenges (
+                challenge_id TEXT PRIMARY KEY,
+                code_hash TEXT NOT NULL UNIQUE,
+                requested_platform TEXT NOT NULL CHECK (requested_platform = 'discord'),
+                requested_platform_user_id TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 5,
+                consumed_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pairing_challenge_expiry ON account_pairing_challenges(expires_at, consumed_at);
+
+            CREATE TABLE IF NOT EXISTS account_pairings (
+                pairing_id TEXT PRIMARY KEY,
+                telegram_user_id INTEGER NOT NULL,
+                discord_user_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+                created_at TEXT NOT NULL,
+                last_confirmed_at TEXT NOT NULL,
+                revoked_at TEXT,
+                UNIQUE(telegram_user_id, status),
+                UNIQUE(discord_user_id, status)
+            );
+            CREATE INDEX IF NOT EXISTS idx_account_pairings_telegram ON account_pairings(telegram_user_id, status);
+            CREATE INDEX IF NOT EXISTS idx_account_pairings_discord ON account_pairings(discord_user_id, status);
+
             CREATE TABLE IF NOT EXISTS user_settings (
                 telegram_user_id INTEGER PRIMARY KEY,
                 persistent_login_enabled INTEGER NOT NULL DEFAULT 0,
@@ -587,6 +629,156 @@ def ensure_user(user_id: int, username: str | None = None, display_name: str | N
 def get_user(user_id: int) -> sqlite3.Row | None:
     with _connect() as connection:
         return connection.execute("SELECT * FROM users WHERE telegram_user_id = ?", (user_id,)).fetchone()
+
+
+def ensure_platform_identity(
+    platform: str,
+    platform_user_id: str,
+    username: str | None = None,
+    display_name: str | None = None,
+) -> dict[str, Any]:
+    """Register non-authoritative platform metadata without granting account access."""
+    normalized_platform = str(platform or "").strip().lower()
+    if normalized_platform not in {"telegram", "discord"}:
+        raise ValueError("unsupported_platform")
+    normalized_id = str(platform_user_id or "").strip()
+    if not normalized_id or len(normalized_id) > 80:
+        raise ValueError("invalid_platform_user_id")
+    now = utc_now()
+    identity_id = f"identity_{secrets.token_urlsafe(10)}"
+    with _connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO platform_identities
+                (identity_id, platform, platform_user_id, username, display_name, created_at, last_seen_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, platform_user_id) DO UPDATE SET
+                username = COALESCE(excluded.username, platform_identities.username),
+                display_name = COALESCE(excluded.display_name, platform_identities.display_name),
+                last_seen_at = excluded.last_seen_at,
+                updated_at = excluded.updated_at
+            """,
+            (identity_id, normalized_platform, normalized_id, str(username or "")[:120] or None, str(display_name or "")[:160] or None, now, now, now),
+        )
+        connection.commit()
+        row = connection.execute(
+            "SELECT * FROM platform_identities WHERE platform = ? AND platform_user_id = ?",
+            (normalized_platform, normalized_id),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("platform_identity_creation_failed")
+    return dict(row)
+
+
+def get_platform_identity(platform: str, platform_user_id: str) -> sqlite3.Row | None:
+    with _connect() as connection:
+        return connection.execute(
+            "SELECT * FROM platform_identities WHERE platform = ? AND platform_user_id = ? AND status = 'active'",
+            (str(platform or "").strip().lower(), str(platform_user_id or "").strip()),
+        ).fetchone()
+
+
+def get_discord_pairing(discord_user_id: str) -> dict[str, Any] | None:
+    normalized_id = str(discord_user_id or "").strip()
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT pairing_id, telegram_user_id, discord_user_id, created_at, last_confirmed_at
+            FROM account_pairings
+            WHERE discord_user_id = ? AND status = 'active'
+            """,
+            (normalized_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_account_pairing_challenge(discord_user_id: str, ttl_seconds: int = 600) -> str:
+    """Create a short-lived Discord-originated code; only its hash is stored."""
+    normalized_id = str(discord_user_id or "").strip()
+    if not normalized_id or len(normalized_id) > 80:
+        raise ValueError("invalid_discord_user_id")
+    ensure_platform_identity("discord", normalized_id)
+    if get_discord_pairing(normalized_id):
+        raise ValueError("discord_identity_already_paired")
+    raw_code = secrets.token_urlsafe(18)
+    now = utc_now()
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=max(60, min(int(ttl_seconds), 900)))).replace(microsecond=0).isoformat()
+    with _connect() as connection:
+        connection.execute(
+            "INSERT INTO account_pairing_challenges (challenge_id, code_hash, requested_platform, requested_platform_user_id, expires_at, created_at) VALUES (?, ?, 'discord', ?, ?, ?)",
+            (f"pair_{secrets.token_urlsafe(10)}", _token_hash(raw_code), normalized_id, expires_at, now),
+        )
+        connection.commit()
+    return raw_code
+
+
+def consume_account_pairing_challenge(code: str, telegram_user_id: int) -> dict[str, Any] | None:
+    """Atomically consume a valid code after the Telegram user authenticates in private chat."""
+    raw_code = str(code or "").strip()
+    if not raw_code or len(raw_code) > 128:
+        return None
+    telegram_id = int(telegram_user_id)
+    ensure_user(telegram_id)
+    now = utc_now()
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM account_pairing_challenges WHERE code_hash = ?",
+            (_token_hash(raw_code),),
+        ).fetchone()
+        if not row or row["consumed_at"] or row["expires_at"] <= now or int(row["attempt_count"]) >= int(row["max_attempts"]):
+            return None
+        discord_user_id = str(row["requested_platform_user_id"])
+        connection.execute(
+            "UPDATE account_pairing_challenges SET attempt_count = attempt_count + 1 WHERE challenge_id = ?",
+            (row["challenge_id"],),
+        )
+        existing_discord = connection.execute(
+            "SELECT telegram_user_id FROM account_pairings WHERE discord_user_id = ? AND status = 'active'",
+            (discord_user_id,),
+        ).fetchone()
+        existing_telegram = connection.execute(
+            "SELECT discord_user_id FROM account_pairings WHERE telegram_user_id = ? AND status = 'active'",
+            (telegram_id,),
+        ).fetchone()
+        if existing_discord or existing_telegram:
+            connection.commit()
+            return None
+        connection.execute(
+            "UPDATE account_pairing_challenges SET consumed_at = ? WHERE challenge_id = ? AND consumed_at IS NULL",
+            (now, row["challenge_id"]),
+        )
+        pairing_id = f"pairing_{secrets.token_urlsafe(10)}"
+        connection.execute(
+            "INSERT INTO account_pairings (pairing_id, telegram_user_id, discord_user_id, created_at, last_confirmed_at) VALUES (?, ?, ?, ?, ?)",
+            (pairing_id, telegram_id, discord_user_id, now, now),
+        )
+        connection.execute(
+            "UPDATE platform_identities SET canonical_telegram_user_id = ?, updated_at = ? WHERE platform = 'discord' AND platform_user_id = ?",
+            (telegram_id, now, discord_user_id),
+        )
+        connection.commit()
+    return {"pairing_id": pairing_id, "telegram_user_id": telegram_id, "discord_user_id": discord_user_id, "created_at": now}
+
+
+def revoke_account_pairing(discord_user_id: str) -> bool:
+    normalized_id = str(discord_user_id or "").strip()
+    now = utc_now()
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE account_pairings SET status = 'revoked', revoked_at = ? WHERE discord_user_id = ? AND status = 'active'",
+            (now, normalized_id),
+        )
+        connection.execute(
+            "UPDATE platform_identities SET canonical_telegram_user_id = NULL, status = 'active', updated_at = ? WHERE platform = 'discord' AND platform_user_id = ?",
+            (now, normalized_id),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+
+def canonical_telegram_user_id_for_discord(discord_user_id: str) -> int | None:
+    pairing = get_discord_pairing(discord_user_id)
+    return int(pairing["telegram_user_id"]) if pairing else None
 
 
 def get_user_settings(user_id: int) -> dict[str, Any]:

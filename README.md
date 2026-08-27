@@ -5,9 +5,17 @@
 ![Gemini AI](https://img.shields.io/badge/Google_Gemini-3.6_Flash-8E44AD?logo=googlegemini&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white)
 
-Playwright-tg is an asynchronous, AI-powered Telegram bot for authorized web automation. It fuses Playwright's headless browsing with Google Gemini 3.6 Flash, allowing you to control browser sessions, extract structured data via AI, schedule recurring web briefings, and run continuous background watchers—all via natural language messages or explicit commands in Telegram.
+Playwright-tg is an asynchronous, AI-powered GreyAI assistant for authorized web automation across Telegram and Discord. It fuses Playwright’s headless browsing with Google Gemini 3.6 Flash, allowing users to control browser sessions, extract structured data via AI, schedule recurring web briefings, and run continuous background watchers through natural-language messages or explicit commands.
 
 ---
+
+## Telegram and Discord surfaces
+
+GreyAI supports Telegram today and includes an optional Discord adapter backed by the same application-owned routing, browser, queue, plan, role, moderation, and durable-context services. Discord is disabled by default. To enable it, add a separate Discord bot token and set `DISCORD_ENABLED=true`; never reuse or paste the Telegram token into Discord configuration.
+
+Discord users begin with `/pair` in a private Discord DM. GreyAI returns a short-lived one-time code, and the user confirms it with `/pair <code>` in GreyAI’s private Telegram chat. The code is hashed at rest, expires automatically, is consumed once, and does not accept a raw Telegram ID as proof. The paired Telegram account remains authoritative for plan, role, quota, moderation status, and durable context. `/unpair` revokes the relationship without deleting either platform’s history.
+
+Guild use is closed by default. An administrator must configure `DISCORD_ALLOWED_GUILD_IDS` with explicit server IDs before GreyAI responds in a server. Pairing and unpairing remain DM-only; sensitive handoff links, pairing codes, API keys, cookies, and saved-session details are never sent in public channels.
 
 ## Native Grey Intelligence
 
@@ -84,6 +92,7 @@ Developers can ask GreyAI for a complete code example and then say “package th
 | Command | Purpose | Example |
 |---|---|---|
 | `/start` | Start GreyAI and receive your referral link | `/start` |
+| `/pair` | Confirm a Discord pairing code in private Telegram chat | `/pair <one-time-code>` |
 | `/help` | Show the in-Telegram feature and command guide | `/help` |
 | `/settings` | Open button-driven personal settings for sessions and challenge handoffs | `/settings` |
 | `/health` | View bot, browser, database, watcher, schedule, and resource health | `/health` |
