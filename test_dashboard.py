@@ -69,6 +69,50 @@ def test_dashboard_registers_developer_and_integration_routes(dashboard_db):
     assert "/api/status" in paths
     assert "/api/status/events" in paths
     assert "/api/admin/runtime" in paths
+    assert "/api/connections" in paths
+    assert "/api/connections/discord/revoke" in paths
+
+
+def test_dashboard_connections_handler_redacts_tokens_and_returns_owner_pairing(monkeypatch):
+    import asyncio
+    import json
+
+    pairing = {
+        "pairing_id": "pairing_1",
+        "telegram_user_id": 9001,
+        "discord_user_id": "123456",
+        "created_at": "2026-08-27T10:00:00+00:00",
+        "last_confirmed_at": "2026-08-27T10:01:00+00:00",
+    }
+    identity = {"username": "discord-user", "display_name": "Discord User"}
+    monkeypatch.setattr(dashboard, "_require_session", lambda request: (SimpleNamespace(), {"telegram_user_id": 9001}))
+    monkeypatch.setattr(dashboard, "get_discord_pairing_for_telegram", lambda user_id: pairing)
+    monkeypatch.setattr(dashboard, "get_platform_identity", lambda platform, user_id: identity)
+
+    response = asyncio.run(dashboard.connections_handler(SimpleNamespace()))
+    payload = json.loads(response.text)
+
+    assert payload["paired"] is True
+    assert payload["discord"]["user_id"] == "123456"
+    assert payload["discord"]["display_name"] == "Discord User"
+    assert "token" not in response.text.lower()
+    assert "pairing_id" not in response.text
+
+
+def test_dashboard_connections_revoke_requires_csrf_and_revokes_only_current_owner(monkeypatch):
+    import asyncio
+    import json
+
+    calls = []
+    monkeypatch.setattr(dashboard, "_require_session", lambda request: (SimpleNamespace(csrf_token="csrf"), {"telegram_user_id": 9001}))
+    monkeypatch.setattr(dashboard, "_require_csrf", lambda request, session: calls.append((request, session)))
+    monkeypatch.setattr(dashboard, "get_discord_pairing_for_telegram", lambda user_id: {"discord_user_id": "123456", "telegram_user_id": user_id})
+    monkeypatch.setattr(dashboard, "revoke_account_pairing", lambda discord_id: discord_id == "123456")
+
+    response = asyncio.run(dashboard.connections_revoke_handler(SimpleNamespace()))
+
+    assert json.loads(response.text) == {"ok": True, "revoked": True}
+    assert len(calls) == 1
 
 
 def test_public_status_payload_is_sanitized_and_timestamped(dashboard_db):
@@ -104,6 +148,9 @@ def test_dashboard_client_has_bounded_bootstrap_and_recovery_states():
     assert "Promise.allSettled" in dashboard.HTML
     assert "Dashboard data could not be loaded" in dashboard.HTML
     assert "setInterval(()=>refresh().catch(()=>{}),3000)" in dashboard.HTML
+    assert "Connections" in dashboard.HTML
+    assert "Disconnect Discord" in dashboard.HTML
+    assert "/api/connections" in dashboard.HTML
 
 
 def test_dashboard_uses_structured_responsive_surfaces_instead_of_raw_json():
@@ -266,6 +313,7 @@ def test_dashboard_registers_manual_challenge_handoff_routes(dashboard_db):
 
 def test_challenge_page_loads_fresh_registered_handoff(dashboard_db, monkeypatch):
     import asyncio
+
     import bot
 
     class Request(SimpleNamespace):
@@ -303,6 +351,7 @@ def test_challenge_page_rejects_unknown_or_malformed_token(dashboard_db, monkeyp
 
 def test_challenge_action_handler_rejects_unsafe_action(dashboard_db, monkeypatch):
     import asyncio
+
     import bot
 
     monkeypatch.setattr(bot, "manual_challenge_action", lambda _token, _body: asyncio.sleep(0, result=(False, "action_not_allowed")))

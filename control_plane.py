@@ -692,6 +692,20 @@ def get_discord_pairing(discord_user_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def get_discord_pairing_for_telegram(telegram_user_id: int) -> dict[str, Any] | None:
+    """Return the active Discord link owned by one canonical Telegram account."""
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT pairing_id, telegram_user_id, discord_user_id, created_at, last_confirmed_at
+            FROM account_pairings
+            WHERE telegram_user_id = ? AND status = 'active'
+            """,
+            (int(telegram_user_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def create_account_pairing_challenge(discord_user_id: str, ttl_seconds: int = 600) -> str:
     """Create a short-lived Discord-originated code; only its hash is stored."""
     normalized_id = str(discord_user_id or "").strip()
