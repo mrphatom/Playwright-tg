@@ -19,6 +19,45 @@ def platform_db(tmp_path, monkeypatch):
     return path
 
 
+def test_legacy_pairing_constraints_migrate_without_dropping_history(tmp_path, monkeypatch):
+    path = tmp_path / "legacy-pairing.db"
+    monkeypatch.setenv("DB_PATH", str(path))
+    monkeypatch.setenv("PUBLIC_MODE", "true")
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "9001")
+    monkeypatch.setenv("API_KEY_HASH_SECRET", "pairing-test-secret")
+    monkeypatch.setenv("SESSION_ENCRYPTION_KEY", base64.urlsafe_b64encode(b"pairing-test-session-secret-32bytes"[:32]).decode())
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE account_pairings (
+                pairing_id TEXT PRIMARY KEY,
+                telegram_user_id INTEGER NOT NULL,
+                discord_user_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+                created_at TEXT NOT NULL,
+                last_confirmed_at TEXT NOT NULL,
+                revoked_at TEXT,
+                UNIQUE(telegram_user_id, status),
+                UNIQUE(discord_user_id, status)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO account_pairings VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("legacy-revoked", 101, "legacy-discord", "revoked", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"),
+        )
+        connection.commit()
+
+    cp.init_platform_db()
+
+    with sqlite3.connect(path) as connection:
+        row = connection.execute("SELECT pairing_id, status FROM account_pairings WHERE pairing_id = ?", ("legacy-revoked",)).fetchone()
+        indexes = connection.execute("PRAGMA index_list(account_pairings)").fetchall()
+    assert row == ("legacy-revoked", "revoked")
+    assert any("active_telegram" in index[1] and index[2] for index in indexes)
+    assert any("active_discord" in index[1] and index[2] for index in indexes)
+
+
 def test_pairing_challenge_is_single_use_and_binds_the_authenticated_telegram_user(platform_db):
     telegram_user_id = 6411860985
     discord_user_id = "discord-1001"
@@ -56,6 +95,43 @@ def test_pairing_rejects_replacing_an_active_identity_without_unpairing(platform
     with pytest.raises(ValueError, match="discord_identity_already_paired"):
         cp.create_account_pairing_challenge("discord-202", ttl_seconds=600)
     assert cp.get_discord_pairing("discord-202")["telegram_user_id"] == 101
+
+
+def test_pairing_challenge_issuance_is_rate_limited_and_replaces_stale_pending_codes(platform_db, monkeypatch):
+    monkeypatch.setenv("PAIRING_CHALLENGE_COOLDOWN_SECONDS", "5")
+    first = cp.create_account_pairing_challenge("discord-throttle")
+    with pytest.raises(ValueError, match="pairing_challenge_rate_limited"):
+        cp.create_account_pairing_challenge("discord-throttle")
+
+    with sqlite3.connect(platform_db) as connection:
+        connection.execute(
+            "UPDATE account_pairing_challenges SET created_at = '2000-01-01T00:00:00+00:00' WHERE requested_platform_user_id = ?",
+            ("discord-throttle",),
+        )
+        connection.commit()
+    second = cp.create_account_pairing_challenge("discord-throttle")
+    assert cp.consume_account_pairing_challenge(first, 401) is None
+    assert cp.consume_account_pairing_challenge(second, 401) is not None
+
+
+def test_concurrent_pairing_confirmation_has_one_winner_and_no_database_error(platform_db):
+    from concurrent.futures import ThreadPoolExecutor
+
+    cp.ensure_platform_identity("discord", "discord-race")
+    code = cp.create_account_pairing_challenge("discord-race")
+
+    def consume(user_id):
+        try:
+            return ("ok", cp.consume_account_pairing_challenge(code, user_id))
+        except Exception as exc:  # the security contract forbids leaking a DB race
+            return ("error", type(exc).__name__)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(consume, (401, 402)))
+
+    assert all(kind == "ok" for kind, _ in outcomes)
+    assert sum(result is not None for _, result in outcomes) == 1
+    assert cp.get_discord_pairing("discord-race") is not None
 
 
 def test_pairing_expiry_and_revoke_are_durable(platform_db):
@@ -152,11 +228,87 @@ def test_discord_server_access_is_closed_by_default(platform_db):
     assert discord_bot.guild_is_enabled(Guild()) is False
 
 
+def test_discord_guild_scope_requires_an_explicit_channel_allowlist(monkeypatch):
+    import discord_bot
+
+    class Guild:
+        id = 123456789
+
+    monkeypatch.setattr(discord_bot, "DISCORD_ALLOWED_GUILD_IDS", {123456789})
+    monkeypatch.setattr(discord_bot, "DISCORD_ALLOWED_CHANNEL_IDS", set())
+    assert discord_bot.discord_context_is_enabled(Guild(), 987) is False
+
+    monkeypatch.setattr(discord_bot, "DISCORD_ALLOWED_CHANNEL_IDS", {987})
+    assert discord_bot.discord_context_is_enabled(Guild(), 987) is True
+    assert discord_bot.discord_context_is_enabled(Guild(), 988) is False
+    assert discord_bot.discord_context_is_enabled(None, 988) is True
+
+
+def test_discord_pairing_issuance_audits_without_storing_the_code(platform_db):
+    import asyncio
+
+    import discord_bot
+
+    class Response:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, content, **kwargs):
+            self.messages.append((content, kwargs))
+
+    interaction = SimpleNamespace(
+        guild=None,
+        user=SimpleNamespace(id=4555, name="pairer", display_name="Pairer"),
+        response=Response(),
+    )
+    asyncio.run(discord_bot.start_pairing(interaction))
+
+    content = interaction.response.messages[0][0]
+    assert "/pair " in content
+    code = content.split("/pair ", 1)[1].split("`", 1)[0].strip()
+    with sqlite3.connect(platform_db) as connection:
+        challenge = connection.execute("SELECT code_hash FROM account_pairing_challenges WHERE requested_platform_user_id = ?", ("4555",)).fetchone()
+        audit = connection.execute(
+            "SELECT action, outcome, metadata_json FROM security_audit_events WHERE actor_platform = 'discord' AND actor_id = ? ORDER BY created_at DESC LIMIT 1",
+            ("4555",),
+        ).fetchone()
+    assert challenge is not None and challenge[0] != code
+    assert audit == ("pairing_challenge_issuance", "success", '{"ttl_seconds":"600"}')
+    assert code not in audit[2]
+
+
 def test_discord_client_registers_native_pairing_commands(platform_db):
     import discord_bot
 
     client = discord_bot.create_discord_bot()
     assert {command.name for command in client.tree.get_commands()} >= {"pair", "unpair", "start", "help", "ask", "check", "status", "health", "settings", "grey", "sessions", "support", "paysupport", "terms", "crypto", "upgrade", "referral", "dashboard", "report", "appeal"}
+
+
+def test_discord_unpair_confirmation_is_owner_bound_and_audited(monkeypatch):
+    import asyncio
+
+    import discord_bot
+
+    events = []
+    monkeypatch.setattr(discord_bot, "revoke_account_pairing", lambda discord_id: True)
+    monkeypatch.setattr(discord_bot, "record_security_audit", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    class Response:
+        def __init__(self):
+            self.edits = []
+
+        async def edit_message(self, **kwargs):
+            self.edits.append(kwargs)
+
+        async def send_message(self, *args, **kwargs):
+            raise AssertionError("a paired owner should not receive a denial")
+
+    view = discord_bot.UnpairConfirmationView("discord-owner")
+    interaction = SimpleNamespace(user=SimpleNamespace(id="discord-owner"), response=Response())
+    asyncio.run(view.children[0].callback(interaction))
+
+    assert interaction.response.edits == [{"content": "The Telegram↔Discord pairing was revoked.", "view": None}]
+    assert events == [(('discord', 'discord-owner', 'pairing_revocation', 'success'), {})]
 
 
 def test_discord_account_and_sessions_summaries_are_scoped_to_shared_user(monkeypatch):
@@ -219,6 +371,30 @@ def test_repair_after_discord_unpair_creates_a_new_active_link(platform_db):
     assert second_pairing is not None
     assert second_pairing["telegram_user_id"] == 202
     assert cp.get_discord_pairing("discord-repair")["telegram_user_id"] == 202
+
+
+def test_pairing_can_be_revoked_and_repaired_repeatedly_without_losing_history(platform_db):
+    cp.ensure_user(101)
+    cp.ensure_user(202)
+    cp.ensure_user(303)
+    cp.ensure_platform_identity("discord", "discord-repeat")
+
+    first = cp.create_account_pairing_challenge("discord-repeat")
+    assert cp.consume_account_pairing_challenge(first, 101) is not None
+    assert cp.revoke_account_pairing("discord-repeat") is True
+
+    second = cp.create_account_pairing_challenge("discord-repeat")
+    assert cp.consume_account_pairing_challenge(second, 202) is not None
+    assert cp.revoke_account_pairing("discord-repeat") is True
+
+    third = cp.create_account_pairing_challenge("discord-repeat")
+    assert cp.consume_account_pairing_challenge(third, 303) is not None
+    with sqlite3.connect(platform_db) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM account_pairings WHERE discord_user_id = ? AND status = 'revoked'",
+            ("discord-repeat",),
+        ).fetchone()[0]
+    assert count == 2
 
 
 def test_discord_account_commands_create_owner_scoped_report_and_appeal(platform_db, monkeypatch):

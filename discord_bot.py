@@ -73,6 +73,7 @@ from control_plane import (
     list_discord_schedules,
     list_discord_watchers,
     record_contact_log,
+    record_security_audit,
     revoke_account_pairing,
     update_discord_schedule_next_run,
     update_discord_watcher_health,
@@ -84,6 +85,11 @@ DISCORD_ENABLED = os.getenv("DISCORD_ENABLED", "false").strip().lower() in {"1",
 DISCORD_ALLOWED_GUILD_IDS = {
     int(value.strip())
     for value in os.getenv("DISCORD_ALLOWED_GUILD_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+DISCORD_ALLOWED_CHANNEL_IDS = {
+    int(value.strip())
+    for value in os.getenv("DISCORD_ALLOWED_CHANNEL_IDS", "").split(",")
     if value.strip().isdigit()
 }
 DISCORD_MESSAGE_LIMIT = 1900
@@ -108,6 +114,13 @@ def canonical_user_id(discord_user_id: str | int) -> int | None:
 def guild_is_enabled(guild: discord.Guild | None) -> bool:
     """Allow DMs by default; guilds require an explicit allowlist entry."""
     return guild is None or int(guild.id) in DISCORD_ALLOWED_GUILD_IDS
+
+
+def discord_context_is_enabled(guild: discord.Guild | None, channel_id: int | None) -> bool:
+    """Require both guild and channel scope for non-DM Discord traffic."""
+    if guild is None:
+        return True
+    return guild_is_enabled(guild) and bool(DISCORD_ALLOWED_CHANNEL_IDS) and int(channel_id or 0) in DISCORD_ALLOWED_CHANNEL_IDS
 
 
 def _safe_text(value: Any, limit: int = DISCORD_MESSAGE_LIMIT) -> str:
@@ -171,8 +184,10 @@ async def start_pairing(interaction: discord.Interaction) -> None:
             message = "This Discord account is already paired. Use `/unpair` first if you want to replace it."
         else:
             message = "I could not create a pairing challenge. Please try again shortly."
+        record_security_audit("discord", discord_id, "pairing_challenge_issuance", "denied", metadata={"reason": str(exc)})
         await interaction.response.send_message(message, ephemeral=True)
         return
+    record_security_audit("discord", discord_id, "pairing_challenge_issuance", "success", metadata={"ttl_seconds": 600})
     await interaction.response.send_message(_pairing_instructions(code), ephemeral=True)
 
 
@@ -201,6 +216,7 @@ class UnpairConfirmationView(discord.ui.View):
             await interaction.response.send_message("Only the Discord account owner can confirm this action.", ephemeral=True)
             return
         revoked = revoke_account_pairing(self.discord_user_id)
+        record_security_audit("discord", self.discord_user_id, "pairing_revocation", "success" if revoked else "already_revoked")
         await interaction.response.edit_message(content="The Telegram↔Discord pairing was revoked." if revoked else "The pairing was already revoked.", view=None)
         self.stop()
 
@@ -366,7 +382,7 @@ async def _process_discord_text_request(message: discord.Message, status: discor
 
 
 async def handle_discord_attachment(message: discord.Message) -> None:
-    if message.author.bot or not guild_is_enabled(message.guild):
+    if message.author.bot or not discord_context_is_enabled(message.guild, getattr(message.channel, "id", None)):
         return
     owner_id = canonical_user_id(str(message.author.id))
     if owner_id is None or not get_user(owner_id) or not is_allowed_user(owner_id):
@@ -398,7 +414,7 @@ async def handle_discord_attachment(message: discord.Message) -> None:
 
 
 async def handle_discord_message(message: discord.Message) -> None:
-    if message.author.bot or not guild_is_enabled(message.guild):
+    if message.author.bot or not discord_context_is_enabled(message.guild, getattr(message.channel, "id", None)):
         return
     text = _safe_text(message.content, 4000)
     if not text:
@@ -505,8 +521,8 @@ class _InteractionResponseShim:
 
 
 async def _authenticate_interaction(interaction: discord.Interaction) -> int | None:
-    if not guild_is_enabled(interaction.guild):
-        await interaction.response.send_message("GreyAI is not enabled in this server. An administrator must add its server ID to the GreyAI guild allowlist.", ephemeral=True)
+    if not discord_context_is_enabled(interaction.guild, getattr(interaction, "channel_id", None)):
+        await interaction.response.send_message("GreyAI is not enabled in this Discord context. An administrator must allowlist both the server and channel, or use a private DM.", ephemeral=True)
         return None
     ensure_platform_identity("discord", str(interaction.user.id), interaction.user.name, interaction.user.display_name)
     owner_id = canonical_user_id(interaction.user.id)

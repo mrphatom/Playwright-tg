@@ -122,9 +122,7 @@ def init_platform_db() -> None:
                 status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
                 created_at TEXT NOT NULL,
                 last_confirmed_at TEXT NOT NULL,
-                revoked_at TEXT,
-                UNIQUE(telegram_user_id, status),
-                UNIQUE(discord_user_id, status)
+                    revoked_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_account_pairings_telegram ON account_pairings(telegram_user_id, status);
             CREATE INDEX IF NOT EXISTS idx_account_pairings_discord ON account_pairings(discord_user_id, status);
@@ -246,6 +244,19 @@ def init_platform_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_developer_audit_owner_time ON developer_audit_events(owner_user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_developer_audit_key_time ON developer_audit_events(key_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS security_audit_events (
+                event_id TEXT PRIMARY KEY,
+                actor_platform TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                canonical_user_id INTEGER,
+                action TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_security_audit_actor_time ON security_audit_events(actor_platform, actor_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_security_audit_user_time ON security_audit_events(canonical_user_id, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS operations (
                 operation_id TEXT PRIMARY KEY,
@@ -537,6 +548,7 @@ def init_platform_db() -> None:
             """
         )
         _migrate_users_role_constraint(connection)
+        _migrate_account_pairing_constraints(connection)
         connection.execute(
             "INSERT OR IGNORE INTO maintenance_state (singleton_id, mode, message, reason, updated_at) VALUES (1, 'operational', '', '', ?)",
             (utc_now(),),
@@ -559,6 +571,58 @@ def init_platform_db() -> None:
             pass
         connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_telegram_id ON conversation_turns(owner_user_id, chat_id, telegram_message_id, turn_id DESC)")
         connection.commit()
+
+
+def _migrate_account_pairing_constraints(connection: sqlite3.Connection) -> None:
+    """Replace legacy status-inclusive uniqueness with active-only unique indexes.
+
+    Pairing history is append-only: multiple revoked records for the same
+    Telegram or Discord identity are valid, while at most one active record
+    may exist for each identity. Older deployments encoded the status in a
+    table-level UNIQUE constraint, which made the second revoke fail with an
+    IntegrityError. The rebuild is idempotent and preserves every row.
+    """
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'account_pairings'"
+    ).fetchone()
+    schema = (row[0] if row else "").lower()
+    has_legacy_unique = "unique(telegram_user_id, status)" in schema or "unique(discord_user_id, status)" in schema
+    if has_legacy_unique:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute("BEGIN")
+            connection.execute(
+                """
+                CREATE TABLE account_pairings_migrating (
+                    pairing_id TEXT PRIMARY KEY,
+                    telegram_user_id INTEGER NOT NULL,
+                    discord_user_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+                    created_at TEXT NOT NULL,
+                    last_confirmed_at TEXT NOT NULL,
+                    revoked_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO account_pairings_migrating SELECT pairing_id, telegram_user_id, discord_user_id, status, created_at, last_confirmed_at, revoked_at FROM account_pairings"
+            )
+            connection.execute("DROP TABLE account_pairings")
+            connection.execute("ALTER TABLE account_pairings_migrating RENAME TO account_pairings")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_account_pairings_active_telegram ON account_pairings(telegram_user_id) WHERE status = 'active'"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_account_pairings_active_discord ON account_pairings(discord_user_id) WHERE status = 'active'"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_account_pairings_telegram ON account_pairings(telegram_user_id, status)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_account_pairings_discord ON account_pairings(discord_user_id, status)")
 
 
 def _migrate_users_role_constraint(connection: sqlite3.Connection) -> None:
@@ -747,9 +811,28 @@ def create_account_pairing_challenge(discord_user_id: str, ttl_seconds: int = 60
     if get_discord_pairing(normalized_id):
         raise ValueError("discord_identity_already_paired")
     raw_code = secrets.token_urlsafe(18)
-    now = utc_now()
-    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=max(60, min(int(ttl_seconds), 900)))).replace(microsecond=0).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.replace(microsecond=0).isoformat()
+    expires_at = (now_dt + timedelta(seconds=max(60, min(int(ttl_seconds), 900)))).replace(microsecond=0).isoformat()
+    cooldown_seconds = max(5, min(int(os.getenv("PAIRING_CHALLENGE_COOLDOWN_SECONDS", "30")), 300))
+    cooldown_started_at = (now_dt - timedelta(seconds=cooldown_seconds)).replace(microsecond=0).isoformat()
     with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "DELETE FROM account_pairing_challenges WHERE expires_at <= ? OR consumed_at IS NOT NULL",
+            (now,),
+        )
+        recent = connection.execute(
+            "SELECT 1 FROM account_pairing_challenges WHERE requested_platform_user_id = ? AND created_at >= ? LIMIT 1",
+            (normalized_id, cooldown_started_at),
+        ).fetchone()
+        if recent:
+            connection.commit()
+            raise ValueError("pairing_challenge_rate_limited")
+        connection.execute(
+            "DELETE FROM account_pairing_challenges WHERE requested_platform_user_id = ? AND consumed_at IS NULL",
+            (normalized_id,),
+        )
         connection.execute(
             "INSERT INTO account_pairing_challenges (challenge_id, code_hash, requested_platform, requested_platform_user_id, expires_at, created_at) VALUES (?, ?, 'discord', ?, ?, ?)",
             (f"pair_{secrets.token_urlsafe(10)}", _token_hash(raw_code), normalized_id, expires_at, now),
@@ -767,6 +850,7 @@ def consume_account_pairing_challenge(code: str, telegram_user_id: int) -> dict[
     ensure_user(telegram_id)
     now = utc_now()
     with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT * FROM account_pairing_challenges WHERE code_hash = ?",
             (_token_hash(raw_code),),
@@ -789,10 +873,13 @@ def consume_account_pairing_challenge(code: str, telegram_user_id: int) -> dict[
         if existing_discord or existing_telegram:
             connection.commit()
             return None
-        connection.execute(
+        consumed = connection.execute(
             "UPDATE account_pairing_challenges SET consumed_at = ? WHERE challenge_id = ? AND consumed_at IS NULL",
             (now, row["challenge_id"]),
         )
+        if consumed.rowcount != 1:
+            connection.commit()
+            return None
         pairing_id = f"pairing_{secrets.token_urlsafe(10)}"
         connection.execute(
             "INSERT INTO account_pairings (pairing_id, telegram_user_id, discord_user_id, created_at, last_confirmed_at) VALUES (?, ?, ?, ?, ?)",
@@ -1018,6 +1105,27 @@ def _api_key_scopes(row: sqlite3.Row) -> list[str]:
     except (TypeError, json.JSONDecodeError):
         scopes = []
     return sorted({str(scope) for scope in scopes if str(scope) in API_KEY_SCOPES})
+
+
+def record_security_audit(actor_platform: str, actor_id: str, action: str, outcome: str, canonical_user_id: int | None = None, metadata: dict[str, Any] | None = None) -> str:
+    """Record a bounded security event without accepting token/code fields."""
+    clean_platform = str(actor_platform or "unknown").strip().lower()[:32]
+    clean_actor = str(actor_id or "unknown").strip()[:120]
+    clean_action = str(action or "unknown").strip()[:80]
+    clean_outcome = str(outcome or "unknown").strip()[:80]
+    safe_metadata = {
+        str(key)[:40]: str(value)[:160]
+        for key, value in (metadata or {}).items()
+        if str(key)[:40] in {"reason", "ttl_seconds", "source"}
+    }
+    event_id = "security_audit_" + secrets.token_urlsafe(8)
+    with _connect() as connection:
+        connection.execute(
+            "INSERT INTO security_audit_events (event_id, actor_platform, actor_id, canonical_user_id, action, outcome, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (event_id, clean_platform, clean_actor, canonical_user_id, clean_action, clean_outcome, json.dumps(safe_metadata, separators=(",", ":")), utc_now()),
+        )
+        connection.commit()
+    return event_id
 
 
 def record_developer_audit(actor_user_id: int | None, owner_user_id: int | None, key_id: str | None, action: str, outcome: str, metadata: dict[str, Any] | None = None) -> str:
