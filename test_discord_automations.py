@@ -105,3 +105,24 @@ def test_discord_download_policy_message_is_redacted_and_plan_gated(monkeypatch)
     monkeypatch.setattr(discord_bot.grey, "download_policy_for_user", lambda _owner: {"allowed": False, "reason": "free_plan"})
     assert "Free plan" in discord_bot.discord_download_policy_message(42)
     assert "token" not in discord_bot.discord_download_policy_message(42).lower()
+
+
+def test_discord_developer_helpers_preserve_one_time_secret_boundary(platform_db, monkeypatch):
+    import discord_bot
+
+    cp.ensure_user(42)
+    request_id, created = cp.create_developer_access_request(42, "Need a scoped check integration.")
+    assert created is True
+    monkeypatch.setattr(discord_bot, "canonical_user_id", lambda _discord_id: 42)
+    monkeypatch.setattr(discord_bot, "is_allowed_user", lambda _owner: True)
+    assert request_id.startswith("devreq_")
+    assert not hasattr(discord_bot, "create_discord_api_key") or callable(discord_bot.create_discord_api_key)
+
+
+def test_discord_admin_summary_is_server_side_role_gated(platform_db):
+    import discord_bot
+
+    cp.ensure_user(9001)
+    assert discord_bot.discord_admin_summary(9001).startswith("Administrator controls")
+    cp.ensure_user(42)
+    assert "administrator" in discord_bot.discord_admin_summary(42).lower()

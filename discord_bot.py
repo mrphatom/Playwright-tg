@@ -20,6 +20,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import control_plane as cp
+
 
 def _grey_runtime_module():
     """Resolve GreyAI's live runtime without creating a duplicate module namespace.
@@ -514,6 +516,24 @@ async def handle_discord_interaction(interaction: discord.Interaction, text: str
     except Exception:
         grey.logger.exception("discord_interaction_failed")
         await interaction.edit_original_response(content="GreyAI could not complete that request. No unsafe action was executed.")
+
+
+def discord_admin_summary(owner_id: int) -> str:
+    if not cp.is_admin(int(owner_id)):
+        return "Administrator controls require an active administrator role on the canonical Telegram account."
+    analytics = cp.get_admin_analytics(10)
+    return _safe_text(
+        "Administrator controls\n\n"
+        f"Top users: {len(analytics.get('top_users', []))}\n"
+        f"Banned users: {len(analytics.get('banned_users', []))}\n"
+        f"Suspicious accounts awaiting review: {len(analytics.get('suspicious_users', []))}\n"
+        f"Most risky accounts: {len(analytics.get('most_risky_users', []))}\n\n"
+        "Use the restricted Discord admin commands for scoped searches, moderation, reports, plans, and maintenance."
+    )
+
+
+def create_discord_api_key(owner_id: int, name: str, scopes: list[str]) -> dict[str, Any]:
+    return cp.create_api_key(int(owner_id), _safe_text(name, 80), scopes)
 
 
 def _discord_plan_value(name: str, default: Any = "") -> Any:
@@ -1051,6 +1071,170 @@ def create_discord_bot() -> commands.Bot:
         if task:
             task.cancel()
         await interaction.response.send_message(f"Schedule `{_safe_text(schedule_id, 80)}` cancelled.", ephemeral=True)
+
+    async def _require_developer(interaction: discord.Interaction) -> int | None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is None:
+            return None
+        if not cp.is_developer(owner_id):
+            await interaction.response.send_message("Developer access is not enabled for the canonical Telegram account.", ephemeral=True)
+            return None
+        return owner_id
+
+    async def _require_admin(interaction: discord.Interaction) -> int | None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is None:
+            return None
+        if not cp.is_admin(owner_id):
+            await interaction.response.send_message("This Discord command requires the canonical administrator role.", ephemeral=True)
+            return None
+        return owner_id
+
+    @client.tree.command(name="devrequest", description="Request developer access from an administrator")
+    @app_commands.describe(message="Why you need developer access")
+    async def devrequest_command(interaction: discord.Interaction, message: str) -> None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is None:
+            return
+        request_id, created = cp.create_developer_access_request(owner_id, message)
+        await interaction.response.send_message(f"Developer request `{request_id}` {'created' if created else 'already open'}. An administrator must review it in GreyAI.", ephemeral=True)
+
+    @client.tree.command(name="newkey", description="Create a scoped developer API key")
+    @app_commands.describe(name="Human-readable key name", scopes="Comma-separated scopes; currently check")
+    async def newkey_command(interaction: discord.Interaction, name: str, scopes: str = "check") -> None:
+        owner_id = await _require_developer(interaction)
+        if owner_id is None:
+            return
+        try:
+            key = create_discord_api_key(owner_id, name, [item.strip() for item in scopes.split(",") if item.strip()])
+        except (PermissionError, ValueError) as exc:
+            await interaction.response.send_message(f"API key creation was rejected: {_safe_text(exc, 240)}", ephemeral=True)
+            return
+        try:
+            await interaction.user.send(content=f"GreyAI API key created: `{key['key']}`\nScopes: `{', '.join(key['scopes'])}`\nThis secret is shown once. Store it securely and never post it in Discord.")
+            await interaction.response.send_message(f"Key `{key['key_id']}` created. I sent the secret only to your Discord DM; it will not be shown again.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("The key was not delivered because your Discord DMs are closed. No secret is shown in a server channel; revoke the key and create a new one after enabling DMs.", ephemeral=True)
+
+    @client.tree.command(name="devkeys", description="List your developer API keys without secrets")
+    async def devkeys_command(interaction: discord.Interaction) -> None:
+        owner_id = await _require_developer(interaction)
+        if owner_id is not None:
+            rows = cp.list_api_keys(owner_id)
+            body = "No API keys." if not rows else "\n".join(f"`{row['key_id']}` · {row['name']} · {row['status']} · scopes: {', '.join(row['scopes'])}" for row in rows[:50])
+            await interaction.response.send_message(_safe_text(body), ephemeral=True)
+
+    @client.tree.command(name="revokekey", description="Revoke one of your developer API keys")
+    @app_commands.describe(key_id="Key ID from /devkeys")
+    async def revokekey_command(interaction: discord.Interaction, key_id: str) -> None:
+        owner_id = await _require_developer(interaction)
+        if owner_id is not None:
+            revoked = cp.revoke_api_key(key_id, owner_id, is_requester_admin=cp.is_admin(owner_id))
+            await interaction.response.send_message("API key revoked." if revoked else "Key not found or not owned by this account.", ephemeral=True)
+
+    @client.tree.command(name="developerstats", description="View your developer usage summary")
+    async def developerstats_command(interaction: discord.Interaction) -> None:
+        owner_id = await _require_developer(interaction)
+        if owner_id is not None:
+            events = cp.list_developer_events(owner_id, limit=25)
+            await interaction.response.send_message(f"Developer events recorded: {len(events)}. Active keys: {len([row for row in cp.list_api_keys(owner_id) if row['status'] == 'active'])}.", ephemeral=True)
+
+    @client.tree.command(name="admin", description="View restricted administrator controls")
+    async def admin_command(interaction: discord.Interaction) -> None:
+        owner_id = await _require_admin(interaction)
+        if owner_id is not None:
+            await interaction.response.send_message(discord_admin_summary(owner_id), ephemeral=True)
+
+    @client.tree.command(name="admin_user", description="Search canonical GreyAI users")
+    @app_commands.describe(query="Telegram ID, username, or display name")
+    async def admin_user_command(interaction: discord.Interaction, query: str) -> None:
+        if await _require_admin(interaction) is None:
+            return
+        rows = cp.search_users(query, 25)
+        text = "No matching users." if not rows else "\n".join(f"{row['telegram_user_id']} · @{row['username'] or '-'} · {row['role']} · {row['status']} · {row['plan']}" for row in rows)
+        await interaction.response.send_message(_safe_text(text), ephemeral=True)
+
+    @client.tree.command(name="ban", description="Ban a canonical GreyAI user")
+    @app_commands.describe(user_id="Telegram user ID", reason="Audit reason")
+    async def ban_command(interaction: discord.Interaction, user_id: int, reason: str = "administrator action") -> None:
+        actor = await _require_admin(interaction)
+        if actor is None:
+            return
+        target = cp.get_user(user_id)
+        if target and target["role"] == cp.ROLE_ADMIN:
+            await interaction.response.send_message("Administrator accounts cannot be banned through Discord.", ephemeral=True)
+            return
+        cp.ensure_user(user_id)
+        cp.set_user_status(user_id, cp.STATUS_BANNED, _safe_text(reason, 500))
+        cp.record_admin_action(actor, "ban_user", user_id, _safe_text(reason, 500))
+        await interaction.response.send_message(f"User `{user_id}` banned and the action was recorded.", ephemeral=True)
+
+    @client.tree.command(name="unban", description="Restore a canonical GreyAI user")
+    @app_commands.describe(user_id="Telegram user ID")
+    async def unban_command(interaction: discord.Interaction, user_id: int) -> None:
+        actor = await _require_admin(interaction)
+        if actor is None:
+            return
+        cp.set_user_status(user_id, cp.STATUS_ACTIVE, "administrator restored access")
+        cp.record_admin_action(actor, "unban_user", user_id, "administrator restored access")
+        await interaction.response.send_message(f"User `{user_id}` unbanned.", ephemeral=True)
+
+    @client.tree.command(name="banned", description="List banned canonical GreyAI users")
+    async def banned_command(interaction: discord.Interaction) -> None:
+        if await _require_admin(interaction) is None:
+            return
+        rows = cp.list_users_by_status(cp.STATUS_BANNED, 100)
+        text = "No banned users." if not rows else "\n".join(f"{row['telegram_user_id']} · {row['status_reason'] or 'no reason'}" for row in rows[:50])
+        await interaction.response.send_message(_safe_text(text), ephemeral=True)
+
+    @client.tree.command(name="analytics", description="View restricted GreyAI usage and risk analytics")
+    async def analytics_command(interaction: discord.Interaction) -> None:
+        if await _require_admin(interaction) is None:
+            return
+        data = cp.get_admin_analytics(10)
+        await interaction.response.send_message(_safe_text(f"Top users: {len(data['top_users'])}\nTop referrers: {len(data['top_referrers'])}\nSuspicious users: {len(data['suspicious_users'])}\nMost risky users: {len(data['most_risky_users'])}"), ephemeral=True)
+
+    @client.tree.command(name="grantplan", description="Grant Pro or Max to a canonical user")
+    @app_commands.describe(user_id="Telegram user ID", plan="pro or max", duration_days="1 to 365 days")
+    async def grantplan_command(interaction: discord.Interaction, user_id: int, plan: str, duration_days: int = 30) -> None:
+        actor = await _require_admin(interaction)
+        if actor is None:
+            return
+        try:
+            grant = cp.grant_plan_entitlement(user_id, plan.lower(), duration_days)
+        except (ValueError, TypeError) as exc:
+            await interaction.response.send_message(f"Plan grant rejected: {_safe_text(exc, 200)}", ephemeral=True)
+            return
+        cp.record_admin_action(actor, "grant_plan", user_id, f"{plan.lower()} plan granted", {"expires_at": grant["expires_at"]})
+        await interaction.response.send_message(f"Granted `{plan.lower()}` to `{user_id}` until `{grant['expires_at']}` UTC.", ephemeral=True)
+
+    @client.tree.command(name="maintenance", description="Update GreyAI maintenance status")
+    @app_commands.describe(mode="operational, scheduled, degraded, or hard_maintenance", message="Public status message", reason="Internal audit reason")
+    async def maintenance_command(interaction: discord.Interaction, mode: str, message: str, reason: str = "Administrator status update") -> None:
+        actor = await _require_admin(interaction)
+        if actor is None:
+            return
+        try:
+            state = cp.set_maintenance_state(mode.lower(), _safe_text(message, 1000), _safe_text(reason, 1000), actor, metadata={"source": "discord_command"})
+        except ValueError as exc:
+            await interaction.response.send_message(f"Maintenance update rejected: {_safe_text(exc, 200)}", ephemeral=True)
+            return
+        await interaction.response.send_message(f"GreyAI maintenance state is now `{state['mode']}`.", ephemeral=True)
+
+    @client.tree.command(name="maintenance_status", description="View GreyAI maintenance status")
+    async def maintenance_status_command(interaction: discord.Interaction) -> None:
+        owner = await _authenticate_interaction(interaction)
+        if owner is not None:
+            state = cp.get_maintenance_state()
+            await interaction.response.send_message(_safe_text(f"Status: {state['mode']}\nMessage: {state.get('message') or '—'}\nReason: {state.get('reason') or '—'}"), ephemeral=True)
+
+    @client.tree.command(name="maintenance_log", description="View recent GreyAI maintenance events")
+    async def maintenance_log_command(interaction: discord.Interaction) -> None:
+        if await _require_admin(interaction) is None:
+            return
+        rows = cp.list_maintenance_events(20)
+        text = "No maintenance events." if not rows else "\n\n".join(f"{row['created_at']} · {row['mode']}\n{row['message'][:240]}\nReason: {row['reason'][:240]}" for row in rows)
+        await interaction.response.send_message(_safe_text(text), ephemeral=True)
 
     @client.tree.command(name="fetch", description="Retrieve an authorized file or artifact")
     @app_commands.describe(request="Approved URL or bounded natural-language file request")
