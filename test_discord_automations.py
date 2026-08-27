@@ -152,3 +152,20 @@ def test_discord_command_registry_includes_help_pagination_surface(platform_db):
     client = discord_bot.create_discord_bot()
     assert "help" in {command.name for command in client.tree.get_commands()}
     assert hasattr(discord_bot, "DiscordHelpView")
+
+
+def test_generated_starter_contains_discord_companion(tmp_path):
+    from starter_templates import build_telegram_bot_starter_archive
+
+    archive_path = build_telegram_bot_starter_archive("cross-platform-starter", "https://example.com", output_dir=tmp_path)
+    import zipfile
+
+    with zipfile.ZipFile(archive_path) as archive:
+        names = set(archive.namelist())
+        assert "cross-platform-starter/discord_bot.py" in names
+        requirements = archive.read("cross-platform-starter/requirements.txt").decode()
+        env_example = archive.read("cross-platform-starter/.env.example").decode()
+        readme = archive.read("cross-platform-starter/README.md").decode()
+        assert "discord.py" in requirements
+        assert "DISCORD_BOT_TOKEN" in env_example
+        assert "Discord" in readme

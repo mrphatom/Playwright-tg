@@ -19,11 +19,11 @@ def _python_files(project_name: str, base_url: str) -> dict[str, str]:
     return {
         "README.md": f'''# {project_name}
 
-A minimal production-oriented Telegram or Discord integration that calls GreyAI’s verified developer API.
+A minimal production-oriented Telegram and Discord integration that calls GreyAI’s verified developer API.
 
 ## What this starter does
 
-The included Telegram example listens for `/start`, `/help`, and `/check <url> [| extraction request]`. It sends a bounded HTTPS request to GreyAI’s `POST /api/v1/check` endpoint and returns the extracted result. The same API contract can be called from a Discord adapter or another authorized application. GreyAI applies the developer-key scope, account quota, per-key rate limit, URL/domain policy, SSRF protections, queue, timeout, and maintenance gates.
+The included Telegram example listens for `/start`, `/help`, and `/check <url> [| extraction request]`. The included Discord example exposes `/check` and natural-language messages. Both send bounded HTTPS requests to GreyAI’s `POST /api/v1/check` endpoint and return the extracted result. GreyAI applies the developer-key scope, account quota, per-key rate limit, URL/domain policy, SSRF protections, queue, timeout, and maintenance gates.
 
 This starter does not contain a GreyAI key, Telegram token, or Discord token. Store credentials in environment variables or a secret manager.
 
@@ -34,9 +34,12 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your Telegram token and GreyAI developer key. Add Discord credentials only in a separate secret-managed adapter.
+# Edit .env with your Telegram token and GreyAI developer key. Store the Discord token in a secret manager.
 python bot.py
+# In a second process or deployment, run: python discord_bot.py
 ```
+
+The Telegram and Discord examples are separate transports that share the same GreyAI API key contract. Configure the Discord Developer Portal message-content intent before using natural-language Discord messages.
 
 Create a GreyAI developer key with `/newkey greyai-cross-platform check`. The plaintext key is shown once. Never commit `.env` or print the key.
 
@@ -48,7 +51,7 @@ GREY_API_KEY=replace_with_your_greyai_developer_key
 GREY_API_BASE_URL={base_url}
 ''',
         ".gitignore": ".env\n.venv/\n__pycache__/\n*.pyc\n",
-        "requirements.txt": "python-telegram-bot==22.8\naiohttp>=3.9,<4\npython-dotenv>=1.0,<2\n",
+        "requirements.txt": "python-telegram-bot==22.8\ndiscord.py==2.7.1\naiohttp>=3.9,<4\npython-dotenv>=1.0,<2\n",
         "bot.py": '''from __future__ import annotations
 
 import logging
@@ -128,6 +131,59 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 ''',
+        "discord_bot.py": '''from __future__ import annotations
+
+import os
+
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
+
+load_dotenv()
+DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+GREY_API_KEY = os.environ["GREY_API_KEY"]
+GREY_API_BASE_URL = os.getenv("GREY_API_BASE_URL", "https://playwright-tg-mrphatom.fly.dev").rstrip("/")
+
+
+async def grey_check(url: str, extract: str) -> dict:
+    headers = {"Authorization": f"Bearer {GREY_API_KEY}", "Content-Type": "application/json"}
+    payload = {"url": url[:2048], "extract": extract[:500]}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=110)) as session:
+        async with session.post(f"{GREY_API_BASE_URL}/api/v1/check", json=payload, headers=headers) as response:
+            data = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(str(data.get("error", "grey_api_request_failed")))
+            return data
+
+
+intents = discord.Intents.default()
+intents.message_content = True
+client = commands.Bot(command_prefix="!", intents=intents)
+
+
+@client.tree.command(name="check", description="Run an authorized GreyAI read-only web check")
+@app_commands.describe(url="Approved HTTP(S) URL", extract="Bounded extraction request")
+async def check(interaction: discord.Interaction, url: str, extract: str = "Summarize the important facts on this page.") -> None:
+    await interaction.response.defer(thinking=True, ephemeral=interaction.guild is not None)
+    try:
+        data = await grey_check(url, extract)
+        text = "\\n\\n".join(str(item)[:3000] for item in (data.get("extracted") or ["No extracted result returned."])[:8])
+        await interaction.edit_original_response(content=text[:1900])
+    except Exception:
+        await interaction.edit_original_response(content="GreyAI could not complete this approved read-only check. No unsafe fallback was attempted.")
+
+
+@client.event
+async def on_ready() -> None:
+    await client.tree.sync()
+    print(f"Connected as {client.user}")
+
+
+if __name__ == "__main__":
+    client.run(DISCORD_BOT_TOKEN)
+'''
     }
 
 
