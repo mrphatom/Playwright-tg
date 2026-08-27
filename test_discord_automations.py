@@ -126,3 +126,11 @@ def test_discord_admin_summary_is_server_side_role_gated(platform_db):
     assert discord_bot.discord_admin_summary(9001).startswith("Administrator controls")
     cp.ensure_user(42)
     assert "administrator" in discord_bot.discord_admin_summary(42).lower()
+
+
+def test_discord_attachment_kind_accepts_supported_audio_and_images_only():
+    import discord_bot
+
+    assert discord_bot.discord_attachment_kind("voice-note.ogg", "audio/ogg") == ("voice", "audio/ogg", ".ogg")
+    assert discord_bot.discord_attachment_kind("screenshot.png", "image/png") == ("image", "image/png", ".png")
+    assert discord_bot.discord_attachment_kind("payload.exe", "application/octet-stream") is None
