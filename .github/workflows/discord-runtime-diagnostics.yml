@@ -25,7 +25,7 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
           set -o pipefail
-          flyctl logs --app playwright-tg-mrphatom --no-tail --lines 400 2>&1 \
+          flyctl logs --app playwright-tg-mrphatom --no-tail 2>&1 \
             | grep -Ei 'discord|gateway|login|intent|privileged|exception|error|traceback|connection|close|shard|ready' \
             | sed -E 's/(token|authorization|password|secret|api[_-]?key)[=:][^[:space:]]+/\1=[REDACTED]/gi' \
             | tail -n 200
