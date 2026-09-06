@@ -1,0 +1,31 @@
+name: Discord Runtime Diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Fly CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Inspect Fly machine state
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl status --app playwright-tg-mrphatom
+          flyctl machine list --app playwright-tg-mrphatom
+
+      - name: Collect filtered runtime gateway logs
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -o pipefail
+          flyctl logs --app playwright-tg-mrphatom --no-tail --lines 400 2>&1 \
+            | grep -Ei 'discord|gateway|login|intent|privileged|exception|error|traceback|connection|close|shard|ready' \
+            | sed -E 's/(token|authorization|password|secret|api[_-]?key)[=:][^[:space:]]+/\1=[REDACTED]/gi' \
+            | tail -n 200
