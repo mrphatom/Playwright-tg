@@ -1421,5 +1421,11 @@ async def run_discord_bot() -> None:
     client = create_discord_bot()
     try:
         await client.start(DISCORD_BOT_TOKEN)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Keep a Discord gateway failure isolated from Telegram and the dashboard.
+        # Log only the exception class; never include token-bearing exception text.
+        grey.logger.error("discord_gateway_start_failed error_type=%s", type(exc).__name__)
     finally:
         await client.close()
