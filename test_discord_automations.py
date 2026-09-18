@@ -99,6 +99,14 @@ def test_discord_command_registry_includes_fetch(platform_db):
     assert "fetch" in {command.name for command in client.tree.get_commands()}
 
 
+def test_discord_command_registry_includes_domain_policy_commands(platform_db):
+    import discord_bot
+
+    client = discord_bot.create_discord_bot()
+    names = {command.name for command in client.tree.get_commands()}
+    assert {"domains", "blacklistdomain", "unblacklistdomain", "allowonion"} <= names
+
+
 def test_discord_download_policy_message_is_redacted_and_plan_gated(monkeypatch):
     import discord_bot
 
@@ -144,6 +152,16 @@ def test_discord_help_pages_are_bounded_and_role_aware(platform_db):
     assert pages
     assert all(len(page) <= discord_bot.DISCORD_MESSAGE_LIMIT for page in pages)
     assert any("/check" in page for page in pages)
+
+
+def test_discord_help_mentions_blacklist_and_onion_policy(platform_db):
+    import discord_bot
+
+    cp.ensure_user(42)
+    pages = discord_bot.discord_help_pages(42)
+    rendered = "\n".join(pages).lower()
+    assert "blacklist" in rendered
+    assert ".onion" in rendered
 
 
 def test_discord_command_registry_includes_help_pagination_surface(platform_db):

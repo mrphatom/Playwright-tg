@@ -244,8 +244,10 @@ GREY_COMMAND_CATALOG = (
     ("disablegreyai", "disable GreyAI in a group"),
     ("domains", "view domain policy"),
     ("allowdomain", "allow an explicit .onion host pattern for Tor"),
-    ("disallowdomain", "blacklist an ordinary web or onion domain pattern"),
-    ("resetdomain", "remove a runtime domain override"),
+    ("blacklistdomain", "blacklist an ordinary web or onion domain pattern"),
+    ("unblacklistdomain", "remove a runtime blacklist rule"),
+    ("disallowdomain", "legacy alias for blacklistdomain"),
+    ("resetdomain", "legacy alias for unblacklistdomain"),
     ("check", "run an authorized browser check"),
     ("fetch", "fetch an authorized page or permitted artifact"),
     ("watch", "create a persistent web monitor"),
@@ -538,9 +540,11 @@ async def configure_bot_profile(bot) -> None:
         BotCommand("enablegreyai", "Enable GreyAI in a group"),
         BotCommand("disablegreyai", "Disable GreyAI in a group"),
         BotCommand("domains", "View the domain policy"),
-        BotCommand("allowdomain", "Allow a domain or subdomain pattern"),
-        BotCommand("disallowdomain", "Deny a domain or subdomain pattern"),
-        BotCommand("resetdomain", "Remove a runtime domain override"),
+        BotCommand("allowdomain", "Allow an explicit .onion host for Tor"),
+        BotCommand("blacklistdomain", "Block an ordinary web or onion domain"),
+        BotCommand("unblacklistdomain", "Remove a runtime blacklist rule"),
+        BotCommand("disallowdomain", "Legacy alias for blacklistdomain"),
+        BotCommand("resetdomain", "Legacy alias for unblacklistdomain"),
         BotCommand("health", "Check service and browser health"),
         BotCommand("check", "Run a secure browser check"),
         BotCommand("watch", "Monitor a page until a condition is met"),
@@ -6531,7 +6535,7 @@ async def withdraw_stars_command(update: Update, context: ContextTypes.DEFAULT_T
 @admin_only
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /banned, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /announce <message>, /dm <id> <message>, /massdm <ids> | <message>, /massrole <users|developers|admins> | <message>, /massban <ids> | <reason>, /massunban <ids>, /massappeals <resolved|denied> <ids> | <resolution>, /confirmbulk <job_id> <token>, /analytics, /stars, /starsbalance, /withdrawstars, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>, /allowchannel <channel_id>, /disallowchannel <channel_id>, /allowdomain <pattern>, /disallowdomain <pattern>, /resetdomain <pattern>, /domains"
+        "Admin controls: /admin_user <id|username>, /ban <id> <reason>, /unban <id>, /banned, /reports, /appeals, /review <report_id> <status> <resolution>, /resolveappeal <appeal_id> <status> <resolution>, /announce <message>, /dm <id> <message>, /massdm <ids> | <message>, /massrole <users|developers|admins> | <message>, /massban <ids> | <reason>, /massunban <ids>, /massappeals <resolved|denied> <ids> | <resolution>, /confirmbulk <job_id> <token>, /analytics, /stars, /starsbalance, /withdrawstars, /devrequests, /grantdeveloper <id>, /denydeveloper <id>, /revokedeveloper <id>, /allowchannel <channel_id>, /disallowchannel <channel_id>, /domains, /blacklistdomain <pattern>, /unblacklistdomain <pattern>, /allowdomain <host.onion|*.host.onion>"
     )
 
 
@@ -8058,7 +8062,7 @@ async def _deliver_download_artifact(
     source_url = str(plan.get("url") or (candidate_sources[0] if candidate_sources else "")).strip().rstrip(".,;!?)")
     parsed = urlparse(source_url)
     if parsed.username or parsed.password or parsed.scheme not in {"http", "https"} or not route_url_allowed(source_url, user_id):
-        await status_msg.edit_text("⛔ This file source is not an approved HTTPS/allowlisted destination. Grey will not fetch private, credentialed, or unrestricted sources.")
+        await status_msg.edit_text("⛔ This file source is not a safe permitted destination. Grey will not fetch private, credentialed, blacklisted, or unrestricted sources.")
         update_operation(operation_id, "denied")
         log_audit(user_id, "download", parsed.hostname, "DENIED_SOURCE_POLICY")
         return
@@ -9689,6 +9693,7 @@ def build_help_sections(user_id: int | None = None) -> list[tuple[str, str]]:
         "/check <url> | actions — Run a secure browser workflow",
         "/watch <interval> <url> | condition — Monitor a page",
         "Natural language also works for browsing, current-fact verification, summaries, and permitted web retrieval.",
+        "Ordinary HTTP(S) is blacklist-controlled; .onion hosts are Tor-routed and explicit allowlist-only.",
     ]
     if download_allowed:
         web_lines.extend((
@@ -9771,7 +9776,11 @@ def build_help_sections(user_id: int | None = None) -> list[tuple[str, str]]:
             "Admins receive a durable alert when a Pro or Max subscription is successfully purchased.",
             "/devrequests, /grantdeveloper, /denydeveloper, /revokedeveloper",
             "/allowchannel <channel_id>, /disallowchannel <channel_id>",
-            "/allowdomain <domain|*.domain>, /disallowdomain <pattern>, /resetdomain <pattern>, /domains",
+            "/domains — view ordinary-web blacklist and onion allowlist status",
+            "/blacklistdomain <domain|*.domain> — block ordinary HTTP(S) or an onion host",
+            "/unblacklistdomain <pattern> — remove a runtime blacklist rule",
+            "/allowdomain <host.onion|*.host.onion> — allow an explicit Tor host only",
+            "/disallowdomain and /resetdomain remain backward-compatible aliases",
         ))))
     return sections
 
@@ -9916,6 +9925,8 @@ def main():
     app.add_handler(CommandHandler("allowchannel", allow_channel_command))
     app.add_handler(CommandHandler("disallowchannel", disallow_channel_command))
     app.add_handler(CommandHandler("allowdomain", allow_domain_command))
+    app.add_handler(CommandHandler("blacklistdomain", disallow_domain_command))
+    app.add_handler(CommandHandler("unblacklistdomain", reset_domain_command))
     app.add_handler(CommandHandler("disallowdomain", disallow_domain_command))
     app.add_handler(CommandHandler("resetdomain", reset_domain_command))
     app.add_handler(CommandHandler("domains", domains_command))

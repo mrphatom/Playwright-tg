@@ -4093,6 +4093,16 @@ def test_fetch_command_is_cataloged_and_direct_file_requests_parse_as_downloads(
     assert direct_plan["mode"] == "download"
 
 
+def test_domain_policy_commands_are_cataloged_for_blacklist_and_onion_allowlist():
+    import bot
+
+    catalog = dict(bot.GREY_COMMAND_CATALOG)
+    assert "blacklistdomain" in catalog
+    assert "unblacklistdomain" in catalog
+    assert ".onion" in catalog["allowdomain"]
+    assert "blacklist" in catalog["blacklistdomain"]
+
+
 def test_primary_artifact_site_gets_site_search_and_public_fallback_candidates(monkeypatch):
     import bot
 
@@ -4895,7 +4905,7 @@ def test_help_sections_retain_sensitive_content_for_admins(monkeypatch):
     assert "/grantplan <Telegram ID> <pro|max>" in text
     assert "/massban" in text
     assert "/maintenance <mode>" in text
-    assert "/allowdomain <domain|*.domain>" in text
+    assert "/allowdomain <host.onion|*.host.onion>" in text
 
 
 def test_login_requires_explicit_approval_before_browser_execution(monkeypatch):
