@@ -632,7 +632,7 @@ def discord_help_pages(owner_id: int) -> list[str]:
     try:
         source_pages = list(getattr(grey, "build_help_pages")(int(owner_id)))
     except Exception:
-        source_pages = ["/pair — connect your Telegram account\n/ask — chat or start an authorized GreyAI task\n/check — run a read-only web check\n/fetch — retrieve an approved artifact\n/settings — manage private account controls"]
+        source_pages = ["/pair — connect your Telegram account\n/ask — chat or start an authorized GreyAI task\n/check — run a read-only web check\n/fetch — retrieve a permitted artifact\n/domains — admin view of the ordinary-web blacklist and onion allowlist\n/blacklistdomain — admin block rule\n/unblacklistdomain — admin remove block rule\n/allowonion — admin allow an explicit .onion host\n/settings — manage private account controls"]
     pages: list[str] = []
     for source in source_pages:
         text = str(source or "").strip()
@@ -1108,6 +1108,61 @@ def create_discord_bot() -> commands.Bot:
     async def health_command(interaction: discord.Interaction) -> None:
         await _send_account_text(interaction, grey.build_health_report())
 
+    @client.tree.command(name="domains", description="View web blacklist and onion allowlist policy")
+    async def domains_command(interaction: discord.Interaction) -> None:
+        if await _require_admin(interaction) is not None:
+            await interaction.response.send_message(_safe_text(grey.format_domain_policy_listing()), ephemeral=True)
+
+    @client.tree.command(name="blacklistdomain", description="Block an ordinary web or onion domain pattern")
+    @app_commands.describe(pattern="Hostname or wildcard, for example example.com or *.blocked.example")
+    async def blacklistdomain_command(interaction: discord.Interaction, pattern: str) -> None:
+        actor = await _require_admin(interaction)
+        if actor is None:
+            return
+        try:
+            normalized = grey.set_domain_policy(pattern, "deny", actor)
+        except ValueError as exc:
+            await interaction.response.send_message(f"Invalid domain pattern: {_safe_text(exc, 200)}", ephemeral=True)
+            return
+        cp.record_admin_action(actor, "blacklist_domain", None, f"Blacklisted {normalized}", {"pattern": normalized})
+        await interaction.response.send_message(f"Blacklisted `{normalized}` for ordinary web and Tor routing.", ephemeral=True)
+
+    @client.tree.command(name="unblacklistdomain", description="Remove a runtime domain blacklist rule")
+    @app_commands.describe(pattern="Previously blacklisted hostname or wildcard")
+    async def unblacklistdomain_command(interaction: discord.Interaction, pattern: str) -> None:
+        actor = await _require_admin(interaction)
+        if actor is None:
+            return
+        try:
+            normalized = grey.remove_domain_policy(pattern)
+        except ValueError as exc:
+            await interaction.response.send_message(f"Invalid domain pattern: {_safe_text(exc, 200)}", ephemeral=True)
+            return
+        cp.record_admin_action(actor, "unblacklist_domain", None, f"Removed blacklist rule {normalized}", {"pattern": normalized})
+        await interaction.response.send_message(f"Removed the runtime blacklist rule for `{normalized}`.", ephemeral=True)
+
+    @client.tree.command(name="allowonion", description="Allow an explicit .onion host pattern for Tor")
+    @app_commands.describe(pattern=".onion hostname or wildcard, for example example.onion")
+    async def allowonion_command(interaction: discord.Interaction, pattern: str) -> None:
+        actor = await _require_admin(interaction)
+        if actor is None:
+            return
+        try:
+            normalized = grey.normalize_domain_pattern(pattern)
+        except ValueError as exc:
+            await interaction.response.send_message(f"Invalid domain pattern: {_safe_text(exc, 200)}", ephemeral=True)
+            return
+        if not normalized.endswith(".onion") and not normalized.startswith("*."):
+            await interaction.response.send_message("Only explicit `.onion` host patterns can be allowlisted for Tor.", ephemeral=True)
+            return
+        base = normalized[2:] if normalized.startswith("*.") else normalized
+        if not base.endswith(".onion"):
+            await interaction.response.send_message("Only explicit `.onion` host patterns can be allowlisted for Tor.", ephemeral=True)
+            return
+        grey.set_domain_policy(normalized, "allow", actor)
+        cp.record_admin_action(actor, "allow_onion_domain", None, f"Allowlisted onion host {normalized}", {"pattern": normalized})
+        await interaction.response.send_message(f"Allowlisted `{normalized}` for Tor. Tier, Tor, and safety checks still apply.", ephemeral=True)
+
     @client.tree.command(name="support", description="Show GreyAI support options")
     async def support_command(interaction: discord.Interaction) -> None:
         await _send_account_text(interaction, support_account_text())
@@ -1149,14 +1204,14 @@ def create_discord_bot() -> commands.Bot:
         await appeal_command(interaction, message)
 
     @client.tree.command(name="watch", description="Monitor an approved page for a condition")
-    @app_commands.describe(url="Approved HTTP(S) URL", interval_seconds="Polling interval from 30 to 86400 seconds", condition="Optional condition such as condition_contains:Stock")
+    @app_commands.describe(url="Safe public URL; ordinary web is blacklist-controlled and .onion is allowlist-only", interval_seconds="Polling interval from 30 to 86400 seconds", condition="Optional condition such as condition_contains:Stock")
     async def watch_command(interaction: discord.Interaction, url: str, interval_seconds: int = 60, condition: str = "") -> None:
         owner_id = await _authenticate_interaction(interaction)
         if owner_id is None:
             return
         spec = parse_discord_watch_spec(url, interval_seconds, condition)
         if spec is None:
-            await interaction.response.send_message("That watcher URL or policy is invalid. Use an approved HTTP(S) URL and a 30–86400 second interval.", ephemeral=True)
+            await interaction.response.send_message("That watcher URL or policy is invalid. Use a safe public URL (ordinary web is blacklist-controlled; .onion is allowlist-only) and a 30–86400 second interval.", ephemeral=True)
             return
         watcher_id = create_discord_watcher(owner_id, interaction.guild.id if interaction.guild else None, int(interaction.channel_id), spec["url"], spec["actions"], spec["interval_seconds"])
         record = next(row for row in list_discord_watchers(owner_id) if row["watcher_id"] == watcher_id)
@@ -1184,7 +1239,7 @@ def create_discord_bot() -> commands.Bot:
         await interaction.response.send_message(f"Watcher `{_safe_text(watcher_id, 80)}` stopped.", ephemeral=True)
 
     @client.tree.command(name="schedule", description="Schedule a recurring GreyAI briefing")
-    @app_commands.describe(schedule_time="24-hour local time, for example 08:00", timezone_name="IANA timezone, for example Europe/London", days="daily, weekdays, weekends, or comma-separated weekdays", urls="Comma-separated approved HTTP(S) URLs", summary_prompt="Bounded briefing instruction", delivery_mode="combined or separate")
+    @app_commands.describe(schedule_time="24-hour local time, for example 08:00", timezone_name="IANA timezone, for example Europe/London", days="daily, weekdays, weekends, or comma-separated weekdays", urls="Comma-separated safe public URLs; .onion hosts require allowlisting", summary_prompt="Bounded briefing instruction", delivery_mode="combined or separate")
     async def schedule_command(interaction: discord.Interaction, schedule_time: str, timezone_name: str, days: str, urls: str, summary_prompt: str, delivery_mode: str = "combined") -> None:
         owner_id = await _authenticate_interaction(interaction)
         if owner_id is None:
@@ -1393,7 +1448,7 @@ def create_discord_bot() -> commands.Bot:
         await handle_discord_interaction(interaction, prompt)
 
     @client.tree.command(name="check", description="Run an authorized read-only web check")
-    @app_commands.describe(url="Approved HTTPS URL", extract="What GreyAI should extract")
+    @app_commands.describe(url="Safe public HTTPS URL or explicitly allowlisted .onion URL", extract="What GreyAI should extract")
     async def check_command(interaction: discord.Interaction, url: str, extract: str = "Summarize the important facts on this page.") -> None:
         await handle_discord_interaction(interaction, f"Check {url} and {extract}")
 
