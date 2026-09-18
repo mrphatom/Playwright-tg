@@ -2,7 +2,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
+
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 compatibility for the Fly Playwright image.
+    class StrEnum(str, Enum):
+        """Backport the Python 3.11 StrEnum behavior needed by this project."""
+
+        def __str__(self) -> str:
+            return self.value
 from typing import Any
 
 MAX_REQUEST_TEXT = 4000
