@@ -406,18 +406,19 @@ def test_url_validation_strictness():
 def test_domain_policy_supports_exact_and_wildcard_patterns(monkeypatch):
     import bot
 
-    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["example.com"])
-    assert bot.is_domain_allowed("https://example.com") is True
-    assert bot.is_domain_allowed("https://docs.example.com") is True
-    assert bot.is_domain_allowed("https://other.example.net") is False
+    monkeypatch.setattr(bot, "BLACKLIST_DOMAINS", ["example.com"])
+    assert bot.is_domain_allowed("https://example.com") is False
+    assert bot.is_domain_allowed("https://docs.example.com") is False
+    assert bot.is_domain_allowed("https://other.example.net") is True
 
-    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
-    bot.set_domain_policy("*.widgets.example", "allow", 6411860985)
-    assert bot.is_domain_allowed("https://shop.widgets.example") is True
-    assert bot.is_domain_allowed("https://widgets.example") is False
+    monkeypatch.setattr(bot, "BLACKLIST_DOMAINS", [])
+    bot.set_domain_policy("*.widgets.example", "deny", 6411860985)
+    assert bot.is_domain_allowed("https://shop.widgets.example") is False
+    assert bot.is_domain_allowed("https://widgets.example") is True
     bot.set_domain_policy("widgets.example", "deny", 6411860985)
     assert bot.is_domain_allowed("https://shop.widgets.example") is False
     bot.remove_domain_policy("widgets.example")
+    bot.remove_domain_policy("*.widgets.example")
     assert bot.is_domain_allowed("https://shop.widgets.example") is True
 
 
@@ -429,11 +430,11 @@ def test_domain_policy_rejects_unsafe_patterns():
             bot.normalize_domain_pattern(pattern)
 
 
-def test_public_mode_requires_domain_allowlist(monkeypatch):
+def test_public_mode_does_not_reintroduce_an_ordinary_web_allowlist(monkeypatch):
     import bot
-    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    monkeypatch.setattr(bot, "BLACKLIST_DOMAINS", [])
     monkeypatch.setenv("PUBLIC_MODE", "true")
-    assert is_domain_allowed("https://example.com") is False
+    assert is_domain_allowed("https://example.com") is True
     monkeypatch.setenv("PUBLIC_MODE", "false")
     assert is_domain_allowed("https://example.com") is True
 
@@ -585,7 +586,7 @@ def test_natural_language_watch_plan_clamps_interval_and_uses_condition(monkeypa
 
 def test_natural_language_plan_rejects_invalid_or_disallowed_urls(monkeypatch):
     import bot
-    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["allowed.example"])
+    monkeypatch.setattr(bot, "BLACKLIST_DOMAINS", ["blocked.example"])
 
     assert normalize_natural_language_plan({
         "mode": "check",
@@ -1479,14 +1480,15 @@ def test_restricted_handler_fails_closed_without_allowlist(monkeypatch):
 
 
 def test_domain_whitelist_filtering(monkeypatch):
-    """Verify domain whitelist correctly permits or blocks URLs."""
+    """Verify ordinary web access is controlled by a domain blacklist."""
     import bot
-    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", ["github.com", "amazon.com"])
+    monkeypatch.setattr(bot, "BLACKLIST_DOMAINS", ["malicious-site.com"])
     
     assert is_domain_allowed("https://github.com/login") is True
     assert is_domain_allowed("https://sub.github.com/page") is True
     assert is_domain_allowed("https://amazon.com/dp/123") is True
     assert is_domain_allowed("https://malicious-site.com") is False
+    assert is_domain_allowed("https://other-site.com") is True
 
 
 

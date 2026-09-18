@@ -243,8 +243,8 @@ GREY_COMMAND_CATALOG = (
     ("enablegreyai", "enable GreyAI in a group"),
     ("disablegreyai", "disable GreyAI in a group"),
     ("domains", "view domain policy"),
-    ("allowdomain", "allow a domain or subdomain pattern"),
-    ("disallowdomain", "deny a domain or subdomain pattern"),
+    ("allowdomain", "allow an explicit .onion host pattern for Tor"),
+    ("disallowdomain", "blacklist an ordinary web or onion domain pattern"),
     ("resetdomain", "remove a runtime domain override"),
     ("check", "run an authorized browser check"),
     ("fetch", "fetch an authorized page or permitted artifact"),
@@ -587,8 +587,10 @@ async def configure_bot_profile(bot) -> None:
         logger.exception("telegram_bot_profile_configuration_failed")
 
 
-# Domain Whitelist (Comma separated domains, e.g. "github.com,amazon.com". Leave empty to allow all)
-ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAINS", "").split(",") if d.strip()]
+# Ordinary HTTP(S) blacklist. URL validation, private-IP blocking, and redirect checks still apply.
+BLACKLIST_DOMAINS = [d.strip().lower() for d in os.getenv("BLACKLIST_DOMAINS", "").split(",") if d.strip()]
+# Read-only compatibility alias; new deployments must use BLACKLIST_DOMAINS.
+ALLOWED_DOMAINS = []
 
 # Proxies
 PROXY_SERVER = os.getenv("PROXY_SERVER")
@@ -1923,14 +1925,7 @@ def is_domain_allowed(url: str) -> bool:
         policies = list_domain_policies()
         if any(row["effect"] == "deny" and domain_pattern_matches(hostname, row["pattern"]) for row in policies):
             return False
-        allow_patterns = list(ALLOWED_DOMAINS) + [
-            row["pattern"] for row in policies if row["effect"] == "allow"
-        ]
-        if public_mode() and not allow_patterns:
-            return False
-        if not allow_patterns:
-            return True
-        return any(domain_pattern_matches(hostname, pattern) for pattern in allow_patterns)
+        return not any(domain_pattern_matches(hostname, pattern) for pattern in BLACKLIST_DOMAINS)
     except (ValueError, TypeError):
         return False
 
@@ -6386,9 +6381,9 @@ async def devrequest_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def format_domain_policy_listing() -> str:
-    lines = ["GreyAI domain policy", "", "Environment allow patterns:"]
-    if ALLOWED_DOMAINS:
-        lines.extend(f"  • {pattern}" for pattern in ALLOWED_DOMAINS)
+    lines = ["GreyAI domain policy", "", "Environment blacklist patterns (ordinary HTTP(S)):"]
+    if BLACKLIST_DOMAINS:
+        lines.extend(f"  • {pattern}" for pattern in BLACKLIST_DOMAINS)
     else:
         lines.append("  • (none)")
     lines.extend(["", "Runtime overrides:"])
@@ -6402,7 +6397,7 @@ def format_domain_policy_listing() -> str:
         lines.append("  • (none)")
     lines.extend([
         "",
-        "Use /allowdomain <domain|*.domain>, /disallowdomain <domain|*.domain>, or /resetdomain <pattern>.",
+        "Use /disallowdomain <domain|*.domain> to block ordinary web domains; /allowdomain is reserved for explicit .onion hosts. Use /resetdomain <pattern> to remove a runtime rule.",
     ])
     return "\n".join(lines)
 
@@ -6410,13 +6405,16 @@ def format_domain_policy_listing() -> str:
 @admin_only
 async def allow_domain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        return await update.message.reply_text("Usage: /allowdomain <domain|*.domain>")
+        return await update.message.reply_text("Usage: /allowdomain <onion-domain|*.onion-domain> (for explicit Tor hosts)")
     try:
-        pattern = set_domain_policy(context.args[0], "allow", update.effective_user.id)
+        pattern = normalize_domain_pattern(context.args[0])
     except ValueError as exc:
         return await update.message.reply_text(f"Invalid domain pattern: {exc}")
+    if not pattern.endswith(".onion") and not pattern.startswith("*.onion"):
+        return await update.message.reply_text("Ordinary HTTP(S) uses a blacklist now. Use /disallowdomain to block it; /allowdomain is only for explicit .onion hosts.")
+    set_domain_policy(pattern, "allow", update.effective_user.id)
     log_audit(update.effective_user.id, "/allowdomain", None, f"ALLOWED_{pattern}")
-    await update.message.reply_text(f"✅ Domain pattern allowed: {pattern}. The apex domain and matching subdomains pass the existing URL safety checks.")
+    await update.message.reply_text(f"✅ Onion host pattern allowlisted: {pattern}. Tor access, tier, and URL safety checks still apply.")
 
 
 @admin_only
@@ -6428,7 +6426,7 @@ async def disallow_domain_command(update: Update, context: ContextTypes.DEFAULT_
     except ValueError as exc:
         return await update.message.reply_text(f"Invalid domain pattern: {exc}")
     log_audit(update.effective_user.id, "/disallowdomain", None, f"DENIED_{pattern}")
-    await update.message.reply_text(f"⛔ Domain pattern denied: {pattern}. Deny rules take precedence over environment and runtime allow rules.")
+    await update.message.reply_text(f"⛔ Domain pattern blacklisted: {pattern}. This blocks ordinary HTTP(S) and also overrides any onion allowlist entry.")
 
 
 @admin_only
@@ -10010,4 +10008,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

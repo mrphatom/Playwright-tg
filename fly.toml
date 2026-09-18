@@ -94,7 +94,7 @@ primary_region = "iad"
   TOR_ONION_ALLOWLIST = ""
   
   PUBLIC_MODE = "true"
-  ALLOWED_DOMAINS = "github.com,githubusercontent.com,raw.githubusercontent.com,amazon.com,news.ycombinator.com,google.com,coinmarketcap.com,duckduckgo.com,bing.com,brave.com,startpage.com,x.com,reddit.com,archive.org,freemusicarchive.org,pypi.org,files.pythonhosted.org,npmjs.com,registry.npmjs.org,crates.io,static.crates.io,rubygems.org,sourceforge.net,codeberg.org,gitlab.com,releases.ubuntu.com,cdimage.debian.org,download.docker.com,python.org,docs.python.org,developer.mozilla.org,w3.org"
+  BLACKLIST_DOMAINS = ""
   DASHBOARD_BASE_URL = "https://playwright-tg-mrphatom.fly.dev"
   PORT = "8080"
   
@@ -144,7 +144,6 @@ primary_region = "iad"
     method = "GET"
     path = "/"
   
-
 
 
 

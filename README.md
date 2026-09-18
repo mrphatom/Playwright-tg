@@ -50,7 +50,7 @@ The adaptive layer is deliberately bounded and application-owned. It combines th
 - **🧠 Durable Conversation Memory:** Conversation turns and contact interactions are stored in SQLite by authorized owner and chat, so Gemini key failover, process restarts, and long gaps do not erase context. The prompt loads a bounded recent window from the durable log, while the underlying history remains available for future retrieval.
 - **↩️ Telegram Reply Context:** When a user replies to an earlier GreyAI or contact message, Grey reads the replied-to text, author, and message ID automatically in normal, group, channel, and Secretary Mode flows.
 - **🎙️ Multimodal Telegram Input:** Send voice notes for transcription or photos/screenshots for visual identification, OCR, and image-aware answers. Captions and interpreted media can enter either chat mode or the authorized browser-agent path.
-- **🔎 Website Discovery and Live Lookup:** Say “go to Google News and summarize it”, “search for Apple and tell me the current iPhone price”, “find the latest headlines”, or “check availability” without manually typing a URL. When configured, generic searches use the approved Google Custom Search JSON API instead of scraping Google Search HTML. Direct website tasks still use the governed Playwright agent path, with domain allowlisting and SSRF-safe URL validation. Ordinary educational questions such as “How does Google search work?” remain conversational.
+- **🔎 Website Discovery and Live Lookup:** Say “go to Google News and summarize it”, “search for Apple and tell me the current iPhone price”, “find the latest headlines”, or “check availability” without manually typing a URL. When configured, generic searches use the approved Google Custom Search JSON API instead of scraping Google Search HTML. Direct website tasks still use the governed Playwright agent path, with the ordinary-web blacklist and SSRF-safe URL validation. `.onion` tasks remain explicit-host allowlist-only through Tor. Ordinary educational questions such as “How does Google search work?” remain conversational.
 - **🧭 Intelligent Site Navigation:** Grey can inspect a page’s visible search fields, links, buttons, headings, and labels; search within the selected site; follow a relevant read-only result; handle client-rendered navigation with bounded waits; and extract from the resulting detail page. The same planner is domain-general, so it is not hard-coded to CoinMarketCap, Google, or any single website. For example, a Bitcoin-price request can open an approved market-data source, search for Bitcoin, click the Bitcoin result, and return the price and source URL instead of sending a full-page screenshot.
 - **🧠 AI-Powered Extraction:** Query webpages using conversational prompts instead of fragile CSS selectors. Grey returns extracted text first and only sends a screenshot when explicitly requested or when extraction is unusable.
 - **🛡️ Standards-Compliant Browsing:** Grey uses transparent browser behavior with bounded waits, retries, caching, and rate-aware backoff. It does not mask webdriver identity, remove advertisements, bypass CAPTCHAs, defeat anti-bot systems, or evade platform security controls. If a site requires login, consent, CAPTCHA, or manual review, Grey reports that limitation instead of attempting to circumvent it.
@@ -59,7 +59,7 @@ The adaptive layer is deliberately bounded and application-owned. It combines th
 - **⚙️ Button-Driven Settings:** `/settings` opens a personal settings panel. Persistent login and automatic encrypted session saving are paired and can be toggled together; manual challenge handoff can be enabled or disabled; saved sessions can be deleted and active handoffs cancelled from buttons without command arguments.
 - **🔒 AES-Encrypted Sessions:** Login to sites once and save your session. Your cookies and tokens are encrypted at rest inside a local SQLite database.
 - **⚡ Persistent Browser Pooling:** Maintains a warm background Chromium instance. Commands launch isolated tabs in milliseconds.
-- **🛡️ Enterprise Security:** Role-aware authorization, rate limiting, server-side quotas, SSRF-resistant URL validation, encrypted sessions, strict command timeouts, audit records, and a required domain allowlist in public mode.
+- **🛡️ Enterprise Security:** Role-aware authorization, rate limiting, server-side quotas, SSRF-resistant URL validation, encrypted sessions, strict command timeouts, audit records, an administrator-managed ordinary-web blacklist, and explicit `.onion` allowlisting through Tor.
 - **👥 Public User Lifecycle:** Persistent user records, user/developer/admin roles, active/limited/suspended/banned states, administrator search, ban/unban, role management, reports, and appeals.
 - **🧩 Developer Mode:** Admin-granted developer access, Telegram approval requests, scoped one-time API keys, revocation, per-key rate limits, integration endpoints, and auditable developer activity.
 - **💳 Entitlements:** Telegram Stars Pro upgrade flow with pre-checkout validation, idempotent receipts, durable entitlements, and an optional external HTTPS crypto checkout adapter.
@@ -220,23 +220,23 @@ The time must be in the future and use `YYYY-MM-DD HH:MM IANA/Timezone`. Before 
 
 Browser tasks are admitted to a bounded priority queue. The response includes an estimated wait when work is queued. Chat replies, status reads, and maintenance commands bypass the browser queue. If an unhandled application failure reaches the global error boundary, GreyAI records a sanitized snapshot, enters hard maintenance, pauses browser work, sends a safe incident notice through the notification outbox, and alerts administrators with the incident and snapshot identifiers. Recovery should be performed by an administrator after reviewing the logs and can be published with `/maintenance operational | Service restored | Incident resolved`.
 
-### Versatile domain allowlist
+### Ordinary-web blacklist and Tor allowlist
 
-The public-mode allowlist is no longer limited to a small hard-coded set. It combines deployment-seeded patterns from `ALLOWED_DOMAINS` with persistent administrator-managed runtime policies. An exact pattern such as `example.com` allows the apex domain and its subdomains for backward compatibility. A wildcard pattern such as `*.example.com` allows subdomains but not the apex domain. A deny rule always takes precedence over environment and runtime allow rules.
+Ordinary HTTP(S) access is blacklist-based. `BLACKLIST_DOMAINS` contains exact or wildcard host patterns that Grey must not visit; when it is empty, any otherwise safe public HTTPS/HTTP host is eligible. Runtime deny rules from `/disallowdomain` add to that blacklist without redeploying. URL validation, private-IP/SSRF protections, redirects, rate limits, and plan gates still apply. `.onion` access is the exception: it remains explicit allowlist-only through `TOR_ONION_ALLOWLIST` or an administrator’s `/allowdomain` rule and still requires Tor and an eligible account tier.
 
-Administrators can expand access without redeploying:
-
-```text
-/allowdomain docs.python.org
-/allowdomain *.wikipedia.org
-/domains
-```
-
-They can block a host or family of subdomains immediately:
+Administrators can block ordinary hosts without redeploying:
 
 ```text
 /disallowdomain tracking.example.com
 /disallowdomain *.untrusted.example
+/domains
+```
+
+For an explicit `.onion` host, administrators can add a Tor allowlist rule:
+
+```text
+/allowdomain examplehiddenservice.onion
+/allowdomain *.examplehiddenservice.onion
 ```
 
 `/resetdomain <pattern>` removes the runtime override and returns to the deployment-seeded policy. Every mutation is normalized, parameterized, administrator-only, and written to the audit log. Patterns cannot contain paths, ports, credentials, IP addresses, or arbitrary wildcards. These controls expand the hostname policy only; HTTPS validation, private-network and SSRF blocking, quotas, timeouts, concurrency limits, and user authorization remain mandatory.
@@ -297,8 +297,8 @@ They can block a host or family of subdomains immediately:
    QUEUE_POLL_SECONDS=1
    QUEUE_ETA_FLOOR_SECONDS=5
    ALLOWED_TELEGRAM_USERS=123456789,987654321
-   # Seed domains; administrators can add exact hosts or *.subdomain patterns at runtime.
-   ALLOWED_DOMAINS=github.com,amazon.com,news.ycombinator.com,google.com,coinmarketcap.com,duckduckgo.com,bing.com,brave.com,startpage.com,reddit.com
+   # Ordinary HTTP(S) blacklist; administrators can add exact hosts or *.subdomain patterns at runtime.
+   BLACKLIST_DOMAINS=
    DUCKDUCKGO_ENABLED=true
    BING_SEARCH_ENABLED=true
    BRAVE_SEARCH_ENABLED=true
@@ -423,7 +423,7 @@ Log in once and reuse the state safely.
 
 ## 🌐 Public Release Configuration
 
-Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and replace the starter `ALLOWED_DOMAINS` list with the domains you are prepared to permit. Public mode rejects private and loopback IP targets and refuses to operate with an empty domain allowlist. Search-provider fallbacks remain allowlist-controlled; the Fly deployment runs Tor privately on loopback for public fallback, and `.onion` hosts remain unavailable to Green/free and Pro users.
+Public mode is enabled only when `PUBLIC_MODE=true`. Before opening the bot to outside users, set a strong `SESSION_ENCRYPTION_KEY`, configure `ADMIN_TELEGRAM_IDS`, set `DASHBOARD_BASE_URL`, and populate `BLACKLIST_DOMAINS` with hosts Grey must not visit. Public mode still rejects private and loopback IP targets; an empty ordinary-web blacklist is valid. Search-provider fallbacks use the same blacklist and URL-safety checks, while the Fly deployment runs Tor privately on loopback and `.onion` hosts remain explicit allowlist-only and unavailable to Green/free and Pro users.
 
 Users can request a one-time dashboard link with `/dashboard`, create an invite link with `/referral`, compare Pro and Max benefits with `/upgrade` and select either plan using Telegram buttons, or use `/upgrade pro` and `/upgrade max` for direct invoices. They can also purchase access using Telegram Stars, submit `/report` and `/appeal` tickets, request developer access with `/devrequest`, and use ordinary natural-language messages for the existing browser, watcher, schedule, session, chat, and developer-management capabilities. Ordinary conversation is routed directly to the chat path; browser-like wording, named-site requests, schedules, watchers, and management actions remain on the task path. Administrators can use `/admin`, `/admin_user`, `/ban`, `/unban`, `/grantadmin`, `/revokeadmin`, `/reports`, `/appeals`, `/referrals`, `/review`, `/resolveappeal`, `/devrequests`, `/grantdeveloper`, `/denydeveloper`, `/revokedeveloper`, `/adcreate`, `/confirmad`, `/adlist`, `/cancelad`, and `/resumead` for the advertising campaign workflow.
 
@@ -489,7 +489,7 @@ Content-Type: application/json
 }
 ```
 
-The response contains an operation ID, page title, validated URL, and redacted extraction results. It does not contain browser cookies, saved sessions, credentials, screenshots, or internal stack traces. The API enforces the same public-mode domain allowlist, SSRF protections, platform quota, browser timeout, and concurrency controls as Telegram commands. Each key also has a configurable per-minute limit, defaulting to 30 requests and capped server-side at 120.
+The response contains an operation ID, page title, validated URL, and redacted extraction results. It does not contain browser cookies, saved sessions, credentials, screenshots, or internal stack traces. The API enforces the same ordinary-web blacklist, explicit `.onion` allowlist, SSRF protections, platform quota, browser timeout, and concurrency controls as Telegram commands. Each key also has a configurable per-minute limit, defaulting to 30 requests and capped server-side at 120.
 
 Developers can ask Grey directly for a verified integration example with natural language, such as “give me Python code to integrate my GreyAI API key,” or use the administrator-approved `/help` and `/newkey` flows. Grey returns examples from the application-owned API contract rather than asking Gemini to invent an endpoint. Developers can manage keys through the authenticated dashboard at `GET /api/v1/keys`, `POST /api/v1/keys`, and `DELETE /api/v1/keys/{key_id}`. Usage is available at `GET /api/v1/developer/stats`. The owner-scoped developer event feed is available in Telegram through `/devevents [after_event_id]`; use the last returned event ID as the next cursor. Dashboard mutations require the existing secure session and CSRF token; bearer keys do not grant dashboard privileges. The only currently enabled bearer-key scope is `check`; watcher, schedule, session, login, form-filling, screenshot, and arbitrary Telegram endpoints are not part of the public API contract.
 
