@@ -41,3 +41,9 @@ def test_request_rejects_empty_or_oversized_untrusted_text():
         GreyRequest(platform=Platform.DISCORD, owner_user_id=42, conversation_id=42, text=" ", private=True)
     with pytest.raises(ValueError, match="text"):
         GreyRequest(platform=Platform.DISCORD, owner_user_id=42, conversation_id=42, text="x" * 4001, private=True)
+
+
+def test_platform_enum_keeps_string_semantics_for_older_python_runtimes():
+    assert str(Platform.TELEGRAM) == "telegram"
+    assert str(Platform.DISCORD) == "discord"
+    assert Platform.TELEGRAM == "telegram"
