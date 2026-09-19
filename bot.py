@@ -3395,7 +3395,7 @@ def parse_deterministic_login_request(user_text: str) -> dict[str, Any] | None:
     """Build a consent-gated login pipeline without sending credentials to an LLM."""
     text = str(user_text or "").strip()
     lowered = text.lower()
-    if not re.search(r"\b(?:login|log\s+in(?:to)?|sign\s+in(?:to)?)\b", lowered):
+    if not re.search(r"\b(?:login|log(?:\s+me)?\s+in(?:to)?|sign(?:\s+me)?\s+in(?:to)?|get\s+me\s+in)\b", lowered):
         return None
     if re.search(
         r"\b(?:bypass|circumvent|evade|defeat|solve|avoid)\b.{0,60}\b(?:captcha|anti[- ]?bot|bot\s+detection|automated\s+traffic|challenge)\b"
@@ -3434,17 +3434,17 @@ def parse_deterministic_login_request(user_text: str) -> dict[str, Any] | None:
         if named_site:
             url_match = SimpleNamespace(group=lambda _index=0: named_hosts[named_site.group(0).lower()])
     username_match = re.search(
-        r"\b(?:username|user\s*name|email|e-mail)\s*(?:is|:|=)?\s*[\"'‘’“”]?([^\s,;\"'‘’“”]+)[\"'‘’“”]?",
+        r"\b(?:username|user\s*name|email|e-mail|handle|user\s*id|account\s*name|login)\s*(?:is|:|=)?\s*[\"'‘’“”]?([^\s,;\"'‘’“”]+)[\"'‘’“”]?",
         text,
         flags=re.IGNORECASE,
     )
     password_match = re.search(
-        r"\b(?:password|passcode)\s*(?:is|:|=)?\s*(?:[\"'‘’“”]([^\"'‘’“”]+)[\"'‘’“”]|([^\s,;]+))",
+        r"\b(?:password|passcode|pass|pwd|secret|passphrase)\s*(?:is|:|=)?\s*(?:[\"'‘’“”]([^\"'‘’“”]+)[\"'‘’“”]|([^\s,;]+))",
         text,
         flags=re.IGNORECASE,
     )
     if not url_match or not username_match or not password_match:
-        if re.search(r"\b(?:password|passcode)\b", lowered):
+        if re.search(r"\b(?:password|passcode|passphrase|secret|pwd)\b", lowered):
             return {"mode": "login_blocked", "reason": "credentials_not_parsed"}
         return None
 
@@ -3452,7 +3452,12 @@ def parse_deterministic_login_request(user_text: str) -> dict[str, Any] | None:
     username = username_match.group(1).strip().rstrip(".,;!?)")
     password = (password_match.group(1) or password_match.group(2) or "").strip().rstrip(".,;!?)").strip("\"'‘’“”")
     consent_granted = consent_granted or bool(
-        re.search(r"\b(?:use|using|fill|enter|type)\b.{0,80}\b(?:username|user\s*name|email|password|passcode)\b", lowered)
+        re.search(
+            r"\b(?:use|using|fill|enter|type)\b.{0,100}\b(?:username|user\s*name|email|e-mail|password|passcode|pass|pwd|secret|passphrase)\b"
+            r"|\b(?:use|fill|enter|type)\b.{0,40}\b(?:them|these|those|details|credentials)\b"
+            r"|\b(?:go\s+ahead|proceed|do\s+it|carry\s+on)\b",
+            lowered,
+        )
     )
     if not username or not password or not is_valid_url(url) or not is_domain_allowed(url):
         return None
@@ -3495,17 +3500,30 @@ def parse_deterministic_login_request(user_text: str) -> dict[str, Any] | None:
 
 def login_credentials_present(user_text: str) -> bool:
     """Detect credential labels so malformed credential requests never reach the LLM."""
-    return bool(re.search(r"\b(?:password|passcode)\s*(?:is|:|=)?", str(user_text or ""), flags=re.IGNORECASE))
+    return bool(re.search(r"\b(?:password|passcode|passphrase|secret|pwd)\s*(?:is|:|=)?", str(user_text or ""), flags=re.IGNORECASE))
 
 
 def parse_deterministic_manual_handoff_request(user_text: str) -> dict[str, Any] | None:
     """Parse an explicit user-requested browser handoff, independent of CAPTCHA detection."""
     text = str(user_text or "").strip()
     lowered = text.lower()
-    if not re.search(r"\b(?:manual\s+handoff|handoff|hand\s+the\s+browser|let\s+me\s+take\s+over)\b", lowered):
+    if not re.search(r"\b(?:manual\s+handoff|handoff|hand\s+the\s+browser|let\s+me\s+take\s+over|let\s+me\s+control|take\s+over|give\s+me\s+control)\b", lowered):
         return None
     url_match = re.search(r"https?://[^\s,]+", text, flags=re.IGNORECASE)
-    url = url_match.group(0).rstrip(".,;!?)") if url_match else "https://example.com/"
+    if url_match:
+        url = url_match.group(0).rstrip(".,;!?)")
+    else:
+        named_site = re.search(r"\b(?:x|twitter|linkedin|github|google|facebook|instagram)\b", lowered)
+        named_hosts = {
+            "x": "https://x.com/i/flow/login",
+            "twitter": "https://x.com/i/flow/login",
+            "linkedin": "https://www.linkedin.com/login",
+            "github": "https://github.com/login",
+            "google": "https://accounts.google.com/",
+            "facebook": "https://www.facebook.com/login",
+            "instagram": "https://www.instagram.com/accounts/login/",
+        }
+        url = named_hosts.get(named_site.group(0).lower(), "https://example.com/") if named_site else "https://example.com/"
     if not is_valid_url(url) or not is_domain_allowed(url):
         return None
     return {"mode": "manual_handoff_start", "url": url}
@@ -3825,7 +3843,7 @@ async def parse_natural_language_intent(
         return handoff_plan
 
     login_plan = parse_deterministic_login_request(user_text)
-    if re.search(r"\b(?:login|log\s+in(?:to)?|sign\s+in(?:to)?)\b", str(user_text or ""), flags=re.IGNORECASE):
+    if re.search(r"\b(?:login|log(?:\s+me)?\s+in(?:to)?|sign(?:\s+me)?\s+in(?:to)?|get\s+me\s+in)\b", str(user_text or ""), flags=re.IGNORECASE):
         return login_plan or {"mode": "login_blocked", "reason": "credentials_not_parsed"}
     if login_credentials_present(user_text):
         return {"mode": "login_blocked", "reason": "credentials_not_parsed"}

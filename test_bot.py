@@ -1632,6 +1632,48 @@ def test_login_parser_blocks_unparsed_password_input_before_model_fallback():
     assert bot.parse_deterministic_login_request("please login with password: secret") is not None
 
 
+def test_login_parser_understands_natural_aliases_and_reordered_credentials():
+    import bot
+
+    plan = bot.parse_deterministic_login_request(
+        "I need you to sign me into my X account. The pass is 'multi word placeholder' and my handle is alice_42; go ahead."
+    )
+
+    assert plan is not None
+    assert plan["mode"] == "login"
+    assert plan["url"] == "https://x.com/i/flow/login"
+    assert "type_username:alice_42" in plan["actions"]
+    assert "type_password:multi word placeholder" in plan["actions"]
+    assert plan["consent_granted"] is True
+
+
+def test_manual_handoff_parser_understands_takeover_language_and_named_site():
+    import bot
+
+    plan = bot.parse_deterministic_manual_handoff_request(
+        "Open X and let me control the browser for a moment"
+    )
+
+    assert plan == {
+        "mode": "manual_handoff_start",
+        "url": "https://x.com/i/flow/login",
+    }
+
+
+def test_login_parser_handles_conversational_login_and_secret_synonyms():
+    import bot
+
+    plan = bot.parse_deterministic_login_request(
+        "My X login is alice_42 and my secret is 'multi word placeholder'; use them to get me in."
+    )
+
+    assert plan is not None
+    assert plan["url"] == "https://x.com/i/flow/login"
+    assert "type_username:alice_42" in plan["actions"]
+    assert "type_password:multi word placeholder" in plan["actions"]
+    assert plan["consent_granted"] is True
+
+
 def test_multimodal_handlers_exist_for_voice_and_photo_updates():
     import bot
 
