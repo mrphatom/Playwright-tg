@@ -1597,6 +1597,41 @@ def test_chat_history_drops_agent_acceptance_receipts_and_adjacent_duplicates():
     assert prepared[-1]["text"] == "The headlines are updated."
 
 
+def test_manual_handoff_request_is_parsed_without_waiting_for_captcha():
+    import bot
+
+    plan = bot.parse_deterministic_manual_handoff_request(
+        "open a manual handoff for https://x.com/i/flow/login so I can test it"
+    )
+
+    assert plan == {
+        "mode": "manual_handoff_start",
+        "url": "https://x.com/i/flow/login",
+    }
+
+
+def test_login_parser_supports_log_into_x_and_keeps_credentials_out_of_model_path():
+    import bot
+
+    plan = bot.parse_deterministic_login_request(
+        "log into X using username test_user and password 'test-password-123'; I authorize GreyAI to log in"
+    )
+
+    assert plan is not None
+    assert plan["mode"] == "login"
+    assert plan["url"] == "https://x.com/i/flow/login"
+    assert plan["consent_granted"] is True
+    assert "type_username:test_user" in plan["actions"]
+    assert any(action.startswith("type_password:") for action in plan["actions"])
+
+
+def test_login_parser_blocks_unparsed_password_input_before_model_fallback():
+    import bot
+
+    assert bot.login_credentials_present("please login with password: secret") is True
+    assert bot.parse_deterministic_login_request("please login with password: secret") is not None
+
+
 def test_multimodal_handlers_exist_for_voice_and_photo_updates():
     import bot
 
