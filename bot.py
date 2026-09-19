@@ -2380,6 +2380,19 @@ def public_search_source_candidates(user_text: str) -> list[str]:
     return candidates
 
 
+def search_source_candidates_for_query(query: str, user_id: int | None = None) -> list[str]:
+    """Return policy-checked browser search sources for a query."""
+    clean_query = re.sub(r"\s+", " ", str(query or "").strip())[:500]
+    if not clean_query:
+        return []
+    candidates = public_search_source_candidates(clean_query)
+    return [
+        candidate
+        for candidate in dict.fromkeys(candidates)
+        if route_url_allowed(candidate, user_id)
+    ]
+
+
 DOWNLOAD_REQUEST_ACTION_TERMS = ("download", "get", "fetch", "retrieve", "send", "attach", "find", "search", "look for")
 DOWNLOAD_REQUEST_ARTIFACT_TERMS = ("file", "song", "music", "track", "movie", "film", "video", "app", "application", "archive", "zip", "pdf", "document", "installer", "book", "image", "photo")
 
@@ -2500,7 +2513,7 @@ def source_candidates_for_request(user_text: str, primary_url: str = "", user_id
             alternate_scheme = "http" if parsed_primary.scheme.lower() == "https" else "https"
             ordered.append(parsed_primary._replace(scheme=alternate_scheme).geturl())
     elif is_live_web_lookup_request(user_text):
-        ordered = public_search_source_candidates(user_text)
+        ordered = search_source_candidates_for_query(user_text, user_id)
     else:
         ordered = []
     for candidate in ordered:
@@ -3070,11 +3083,71 @@ def extract_reply_context(
     }
 
 
-def load_chat_history(owner_user_id: int, chat_id: int, limit: int = CHAT_CONTEXT_TURNS) -> list[dict[str, str]]:
-    return [
-        {"role": str(row["role"]), "text": str(row["text"]), "created_at": str(row["created_at"])}
-        for row in list_conversation_turns(int(owner_user_id), int(chat_id), limit)
-    ]
+def load_chat_history(owner_user_id: int, chat_id: int, limit: int = CHAT_CONTEXT_TURNS) -> list[dict[str, Any]]:
+    rows = list_conversation_turns(int(owner_user_id), int(chat_id), limit)
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        history.append({
+            "role": str(row["role"]),
+            "text": str(row["text"]),
+            "created_at": str(row["created_at"]),
+            "metadata": metadata if isinstance(metadata, dict) else {},
+        })
+    return prepare_chat_history(history)
+
+
+def prepare_chat_history(history: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Remove transient execution receipts and adjacent duplicate turns before prompting."""
+    prepared: list[dict[str, Any]] = []
+    for raw_turn in history or []:
+        turn = dict(raw_turn or {})
+        role = str(turn.get("role") or "user")
+        text = str(turn.get("text") or "").strip()
+        metadata = turn.get("metadata") if isinstance(turn.get("metadata"), dict) else {}
+        response_kind = str(metadata.get("response_kind") or "")
+        if role == "assistant" and (
+            response_kind == "agent_acceptance"
+            or text.lower().startswith("[greyai agent task accepted;")
+        ):
+            continue
+        if prepared and prepared[-1].get("role") == role and prepared[-1].get("text", "").strip() == text:
+            continue
+        turn["role"] = role
+        turn["text"] = text
+        turn["metadata"] = metadata
+        prepared.append(turn)
+    return prepared[-CHAT_CONTEXT_TURNS:]
+
+
+def remember_user_turn(
+    chat_id: int,
+    user_text: str,
+    owner_user_id: int,
+    source_message_id: int | None = None,
+    reply_to_message_id: int | None = None,
+    business_connection_id: str | None = None,
+) -> None:
+    """Persist a user request without adding a temporary status message to chat context."""
+    owner_id = int(owner_user_id)
+    history_key = _chat_history_key(owner_id, chat_id)
+    history = chat_histories.setdefault(history_key, [])
+    history.append({"role": "user", "text": str(user_text)[:CHAT_MEMORY_TEXT_CHARS]})
+    chat_histories[history_key] = prepare_chat_history(history)
+    record_conversation_turn(
+        owner_id,
+        chat_id,
+        "user",
+        user_text,
+        source_message_id=source_message_id,
+        telegram_message_id=source_message_id,
+        reply_to_message_id=reply_to_message_id,
+        business_connection_id=business_connection_id,
+        metadata={"source": "telegram", "owner_user_id": owner_id},
+    )
 
 
 def record_contact_log(
@@ -3132,7 +3205,7 @@ def remember_chat_turn(
         {"role": "user", "text": str(user_text)[:CHAT_MEMORY_TEXT_CHARS]},
         {"role": "assistant", "text": str(reply_text)[:CHAT_MEMORY_TEXT_CHARS]},
     ])
-    chat_histories[history_key] = history[-CHAT_MEMORY_TURNS:]
+    chat_histories[history_key] = prepare_chat_history(history)[-CHAT_MEMORY_TURNS:]
     metadata = {"source": "telegram", "owner_user_id": owner_id}
     record_conversation_turn(
         owner_id,
@@ -3174,7 +3247,7 @@ def remember_assistant_turn(
     history_key = _chat_history_key(owner_id, chat_id)
     history = chat_histories.setdefault(history_key, [])
     history.append({"role": "assistant", "text": str(reply_text)[:CHAT_MEMORY_TEXT_CHARS]})
-    chat_histories[history_key] = history[-CHAT_MEMORY_TURNS:]
+    chat_histories[history_key] = prepare_chat_history(history)[-CHAT_MEMORY_TURNS:]
     record_conversation_turn(
         owner_id,
         chat_id,
@@ -3207,7 +3280,7 @@ async def generate_chat_reply(
         return "Chat mode is not configured yet. Please set GEMINI_API_KEY or GEMINI_API_KEY_2."
     owner_id = int(owner_user_id if owner_user_id is not None else chat_id)
     durable_history = load_chat_history(owner_id, chat_id, CHAT_CONTEXT_TURNS)
-    history = durable_history or chat_histories.get(_chat_history_key(owner_id, chat_id), [])
+    history = prepare_chat_history(durable_history or chat_histories.get(_chat_history_key(owner_id, chat_id), []))
     if private_chat and is_standalone_private_social_turn(user_text) and not reply_context:
         history = []
     native_context = build_native_grey_context(
@@ -8368,15 +8441,13 @@ async def _process_natural_language(
     else:
         status_msg = await source_message.reply_text(status_text, parse_mode="Markdown")
     create_operation(operation_id, user_id, chat_id, "natural_language")
-    remember_chat_turn(
+    remember_user_turn(
         chat_id,
         request_text,
-        f"[GreyAI agent task accepted; operation {operation_id} is being executed. The application will post the result in this chat.]",
         user_id,
         getattr(source_message, "message_id", None),
         reply_to_message_id,
         business_connection_id,
-        getattr(status_msg, "message_id", None),
     )
     update_operation(operation_id, "running", 0)
 
@@ -8738,37 +8809,67 @@ async def _process_natural_language(
             return
 
     if plan and plan.get("mode") == "search":
-        if not GOOGLE_CUSTOM_SEARCH_ENABLED or not google_custom_search_provider.configured:
-            update_operation(operation_id, "failed")
-            await status_msg.edit_text("Google Custom Search is enabled for this request but is not configured. An administrator must set GOOGLE_CUSTOM_SEARCH_API_KEY and GOOGLE_CUSTOM_SEARCH_CX.")
-            log_audit(user_id, "custom_search", None, "NOT_CONFIGURED")
-            return
+        search_query = str(plan.get("query") or request_text).strip()[:500]
         try:
-            results = await asyncio.wait_for(
-                google_custom_search_provider.search(plan["query"]),
-                timeout=GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS + 1,
-            )
-            await deliver_text_response(
-                status_msg,
-                format_google_search_results(plan["query"], results),
-                user_id,
-                edit=True,
-                title="Search results",
-            )
-            update_operation(operation_id, "succeeded")
-            log_audit(user_id, "custom_search", None, "SUCCESS")
+            if GOOGLE_CUSTOM_SEARCH_ENABLED and google_custom_search_provider.configured:
+                results = await asyncio.wait_for(
+                    google_custom_search_provider.search(search_query),
+                    timeout=GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS + 1,
+                )
+                response_text = format_google_search_results(search_query, results)
+                log_audit(user_id, "custom_search", None, "SUCCESS")
+            else:
+                raise SearchProviderUnavailable("custom search is not configured")
         except SearchProviderTimeout:
-            update_operation(operation_id, "failed")
-            await status_msg.edit_text("Google Custom Search timed out. No browser scraping fallback was attempted; please try again shortly.")
-            log_audit(user_id, "custom_search", None, "TIMEOUT")
+            response_text = ""
         except asyncio.TimeoutError:
-            update_operation(operation_id, "failed")
-            await status_msg.edit_text("Google Custom Search timed out. No browser scraping fallback was attempted; please try again shortly.")
-            log_audit(user_id, "custom_search", None, "TIMEOUT")
+            response_text = ""
         except SearchProviderUnavailable:
-            update_operation(operation_id, "failed")
-            await status_msg.edit_text("Google Custom Search is temporarily unavailable or its quota is exhausted. No browser scraping fallback was attempted; please try again later.")
-            log_audit(user_id, "custom_search", None, "UNAVAILABLE")
+            response_text = ""
+        if not response_text:
+            search_sources = search_source_candidates_for_query(search_query, user_id)
+            if not search_sources:
+                update_operation(operation_id, "failed")
+                await status_msg.edit_text("No safe search provider is currently enabled. Please try again later.")
+                log_audit(user_id, "custom_search", None, "NO_SAFE_FALLBACK")
+                return
+            try:
+                await status_msg.edit_text("🔎 Searching through safe fallback providers...")
+                result = await run_browser_request(
+                    operation_id,
+                    user_id,
+                    chat_id,
+                    "search",
+                    lambda: run_browser_task_with_source_fallback(
+                        search_sources,
+                        ["ai_extract:Return concise, deduplicated search results with title, source URL, and the most relevant facts. Do not repeat the query or instructions."],
+                        user_id,
+                        operation_id,
+                        status_msg=status_msg,
+                        native_context={**native_context, "grey": {**native_context["grey"], "mode": "agent"}, "request": {**native_context["request"], "operation_id": operation_id}},
+                    ),
+                    status_msg=status_msg,
+                )
+                extracted = "\n\n".join(result.get("extracted") or []) or "No useful search result text was returned."
+                response_text = f"Search results for: {search_query}\n\n{extracted}"
+                log_audit(user_id, "custom_search", result.get("source_url"), "BROWSER_FALLBACK_SUCCESS")
+            except Exception as exc:
+                update_operation(operation_id, "failed")
+                await status_msg.edit_text(f"Search providers were unavailable: {browser_failure_message(exc, search_query)}")
+                log_audit(user_id, "custom_search", None, f"FALLBACK_FAILED_{type(exc).__name__}")
+                return
+        search_message = await deliver_text_response(status_msg, response_text, user_id, edit=True, title="Search results")
+        remember_assistant_turn(
+            chat_id,
+            response_text,
+            user_id,
+            assistant_message_id=getattr(search_message, "message_id", None),
+            reply_to_message_id=reply_to_message_id,
+            business_connection_id=business_connection_id,
+            operation_id=operation_id,
+            response_kind="search_results",
+        )
+        update_operation(operation_id, "succeeded")
         return
 
     if not plan:

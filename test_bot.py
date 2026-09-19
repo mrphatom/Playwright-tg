@@ -1564,6 +1564,39 @@ def test_fast_route_keeps_ordinary_summary_question_in_chat_mode():
     assert bot.classify_message_route("What is the difference between TCP and UDP?") == "chat"
 
 
+def test_search_requests_have_safe_browser_fallback_candidates(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "GOOGLE_CUSTOM_SEARCH_ENABLED", False)
+    monkeypatch.setattr(bot, "DUCKDUCKGO_ENABLED", True)
+    monkeypatch.setattr(bot, "BING_SEARCH_ENABLED", True)
+    monkeypatch.setattr(bot, "BRAVE_SEARCH_ENABLED", False)
+    monkeypatch.setattr(bot, "STARTPAGE_SEARCH_ENABLED", False)
+
+    candidates = bot.search_source_candidates_for_query("current bitcoin price", user_id=42)
+
+    assert candidates
+    assert any("duckduckgo.com" in candidate for candidate in candidates)
+    assert any("bing.com" in candidate for candidate in candidates)
+
+
+def test_chat_history_drops_agent_acceptance_receipts_and_adjacent_duplicates():
+    import bot
+
+    history = [
+        {"role": "user", "text": "Check the news", "metadata": {}},
+        {"role": "assistant", "text": "[GreyAI agent task accepted; operation abc is being executed.]", "metadata": {}},
+        {"role": "assistant", "text": "The headlines are updated.", "metadata": {"response_kind": "web_extraction"}},
+        {"role": "assistant", "text": "The headlines are updated.", "metadata": {"response_kind": "web_extraction"}},
+    ]
+
+    prepared = bot.prepare_chat_history(history)
+
+    assert len(prepared) == 2
+    assert all("agent task accepted" not in turn["text"].lower() for turn in prepared)
+    assert prepared[-1]["text"] == "The headlines are updated."
+
+
 def test_multimodal_handlers_exist_for_voice_and_photo_updates():
     import bot
 
