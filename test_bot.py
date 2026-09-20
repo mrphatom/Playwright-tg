@@ -1660,6 +1660,28 @@ def test_manual_handoff_parser_understands_takeover_language_and_named_site():
     }
 
 
+def test_exact_x_handoff_phrases_start_a_new_handoff_before_management_reopen():
+    import bot
+
+    for phrase in (
+        "Head on to x and give me a manual handoff",
+        "Open a manual handoff for X",
+    ):
+        plan = asyncio.run(bot.parse_natural_language_intent(phrase))
+        assert plan == {
+            "mode": "manual_handoff_start",
+            "url": "https://x.com/i/flow/login",
+        }
+
+
+def test_targetless_manual_handoff_remains_reopen_only():
+    import bot
+
+    assert asyncio.run(bot.parse_natural_language_intent("Open a manual handoff")) == {
+        "mode": "manual_handoff",
+    }
+
+
 def test_model_handoff_with_url_starts_new_handoff(monkeypatch):
     import bot
 
