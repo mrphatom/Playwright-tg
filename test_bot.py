@@ -5972,6 +5972,19 @@ def test_shared_viewer_escapes_title_markup_without_breaking_page():
     assert not markup.inline_keyboard
 
 
+def test_telegram_announcement_html_preserves_supported_tags_without_raw_html_leaks():
+    import bot
+
+    rendered = bot.telegram_announcement_html(
+        "<b>GreyAI Update</b>\n\n<i>Early users</i> <script>alert(1)</script>"
+    )
+
+    assert "<b>GreyAI Update</b>" in rendered
+    assert "<i>Early users</i>" in rendered
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in rendered
+    assert "<script>" not in rendered
+
+
 def test_landing_page_generator_returns_complete_static_site_files():
     from starter_templates import build_landing_page_files
 
