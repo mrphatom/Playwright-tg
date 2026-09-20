@@ -3535,7 +3535,11 @@ def parse_deterministic_manual_handoff_request(user_text: str) -> dict[str, Any]
             "facebook": "https://www.facebook.com/login",
             "instagram": "https://www.instagram.com/accounts/login/",
         }
-        url = named_hosts.get(named_site.group(0).lower(), "https://example.com/") if named_site else "https://example.com/"
+        # A targetless request is handled by the management parser as a reopen
+        # request. Do not invent example.com as a browser target.
+        if not named_site:
+            return None
+        url = named_hosts[named_site.group(0).lower()]
     if not is_valid_url(url) or not is_domain_allowed(url):
         return None
     return {"mode": "manual_handoff_start", "url": url}
@@ -3842,6 +3846,12 @@ async def parse_natural_language_intent(
     native_context: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Interpret every authorized message before falling back to conversational chat."""
+    # Targeted handoff requests must be resolved before the generic management
+    # parser, whose targetless form intentionally means "reopen an active handoff".
+    handoff_plan = parse_deterministic_manual_handoff_request(user_text)
+    if handoff_plan:
+        return handoff_plan
+
     management_plan = parse_deterministic_management_request(
         user_text,
         chat_history=chat_history,
@@ -3849,10 +3859,6 @@ async def parse_natural_language_intent(
     )
     if management_plan:
         return management_plan
-
-    handoff_plan = parse_deterministic_manual_handoff_request(user_text)
-    if handoff_plan:
-        return handoff_plan
 
     login_plan = parse_deterministic_login_request(user_text)
     if re.search(r"\b(?:login|log(?:\s+me)?\s+in(?:to)?|sign(?:\s+me)?\s+in(?:to)?|get\s+me\s+in)\b", str(user_text or ""), flags=re.IGNORECASE):
