@@ -2380,6 +2380,19 @@ def public_search_source_candidates(user_text: str) -> list[str]:
     return candidates
 
 
+def search_source_candidates_for_query(query: str, user_id: int | None = None) -> list[str]:
+    """Return policy-checked browser search sources for a query."""
+    clean_query = re.sub(r"\s+", " ", str(query or "").strip())[:500]
+    if not clean_query:
+        return []
+    candidates = public_search_source_candidates(clean_query)
+    return [
+        candidate
+        for candidate in dict.fromkeys(candidates)
+        if route_url_allowed(candidate, user_id)
+    ]
+
+
 DOWNLOAD_REQUEST_ACTION_TERMS = ("download", "get", "fetch", "retrieve", "send", "attach", "find", "search", "look for")
 DOWNLOAD_REQUEST_ARTIFACT_TERMS = ("file", "song", "music", "track", "movie", "film", "video", "app", "application", "archive", "zip", "pdf", "document", "installer", "book", "image", "photo")
 
@@ -2500,7 +2513,7 @@ def source_candidates_for_request(user_text: str, primary_url: str = "", user_id
             alternate_scheme = "http" if parsed_primary.scheme.lower() == "https" else "https"
             ordered.append(parsed_primary._replace(scheme=alternate_scheme).geturl())
     elif is_live_web_lookup_request(user_text):
-        ordered = public_search_source_candidates(user_text)
+        ordered = search_source_candidates_for_query(user_text, user_id)
     else:
         ordered = []
     for candidate in ordered:
@@ -3070,11 +3083,71 @@ def extract_reply_context(
     }
 
 
-def load_chat_history(owner_user_id: int, chat_id: int, limit: int = CHAT_CONTEXT_TURNS) -> list[dict[str, str]]:
-    return [
-        {"role": str(row["role"]), "text": str(row["text"]), "created_at": str(row["created_at"])}
-        for row in list_conversation_turns(int(owner_user_id), int(chat_id), limit)
-    ]
+def load_chat_history(owner_user_id: int, chat_id: int, limit: int = CHAT_CONTEXT_TURNS) -> list[dict[str, Any]]:
+    rows = list_conversation_turns(int(owner_user_id), int(chat_id), limit)
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        history.append({
+            "role": str(row["role"]),
+            "text": str(row["text"]),
+            "created_at": str(row["created_at"]),
+            "metadata": metadata if isinstance(metadata, dict) else {},
+        })
+    return prepare_chat_history(history)
+
+
+def prepare_chat_history(history: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Remove transient execution receipts and adjacent duplicate turns before prompting."""
+    prepared: list[dict[str, Any]] = []
+    for raw_turn in history or []:
+        turn = dict(raw_turn or {})
+        role = str(turn.get("role") or "user")
+        text = str(turn.get("text") or "").strip()
+        metadata = turn.get("metadata") if isinstance(turn.get("metadata"), dict) else {}
+        response_kind = str(metadata.get("response_kind") or "")
+        if role == "assistant" and (
+            response_kind == "agent_acceptance"
+            or text.lower().startswith("[greyai agent task accepted;")
+        ):
+            continue
+        if prepared and prepared[-1].get("role") == role and prepared[-1].get("text", "").strip() == text:
+            continue
+        turn["role"] = role
+        turn["text"] = text
+        turn["metadata"] = metadata
+        prepared.append(turn)
+    return prepared[-CHAT_CONTEXT_TURNS:]
+
+
+def remember_user_turn(
+    chat_id: int,
+    user_text: str,
+    owner_user_id: int,
+    source_message_id: int | None = None,
+    reply_to_message_id: int | None = None,
+    business_connection_id: str | None = None,
+) -> None:
+    """Persist a user request without adding a temporary status message to chat context."""
+    owner_id = int(owner_user_id)
+    history_key = _chat_history_key(owner_id, chat_id)
+    history = chat_histories.setdefault(history_key, [])
+    history.append({"role": "user", "text": str(user_text)[:CHAT_MEMORY_TEXT_CHARS]})
+    chat_histories[history_key] = prepare_chat_history(history)
+    record_conversation_turn(
+        owner_id,
+        chat_id,
+        "user",
+        user_text,
+        source_message_id=source_message_id,
+        telegram_message_id=source_message_id,
+        reply_to_message_id=reply_to_message_id,
+        business_connection_id=business_connection_id,
+        metadata={"source": "telegram", "owner_user_id": owner_id},
+    )
 
 
 def record_contact_log(
@@ -3132,7 +3205,7 @@ def remember_chat_turn(
         {"role": "user", "text": str(user_text)[:CHAT_MEMORY_TEXT_CHARS]},
         {"role": "assistant", "text": str(reply_text)[:CHAT_MEMORY_TEXT_CHARS]},
     ])
-    chat_histories[history_key] = history[-CHAT_MEMORY_TURNS:]
+    chat_histories[history_key] = prepare_chat_history(history)[-CHAT_MEMORY_TURNS:]
     metadata = {"source": "telegram", "owner_user_id": owner_id}
     record_conversation_turn(
         owner_id,
@@ -3174,7 +3247,7 @@ def remember_assistant_turn(
     history_key = _chat_history_key(owner_id, chat_id)
     history = chat_histories.setdefault(history_key, [])
     history.append({"role": "assistant", "text": str(reply_text)[:CHAT_MEMORY_TEXT_CHARS]})
-    chat_histories[history_key] = history[-CHAT_MEMORY_TURNS:]
+    chat_histories[history_key] = prepare_chat_history(history)[-CHAT_MEMORY_TURNS:]
     record_conversation_turn(
         owner_id,
         chat_id,
@@ -3207,7 +3280,7 @@ async def generate_chat_reply(
         return "Chat mode is not configured yet. Please set GEMINI_API_KEY or GEMINI_API_KEY_2."
     owner_id = int(owner_user_id if owner_user_id is not None else chat_id)
     durable_history = load_chat_history(owner_id, chat_id, CHAT_CONTEXT_TURNS)
-    history = durable_history or chat_histories.get(_chat_history_key(owner_id, chat_id), [])
+    history = prepare_chat_history(durable_history or chat_histories.get(_chat_history_key(owner_id, chat_id), []))
     if private_chat and is_standalone_private_social_turn(user_text) and not reply_context:
         history = []
     native_context = build_native_grey_context(
@@ -3322,7 +3395,7 @@ def parse_deterministic_login_request(user_text: str) -> dict[str, Any] | None:
     """Build a consent-gated login pipeline without sending credentials to an LLM."""
     text = str(user_text or "").strip()
     lowered = text.lower()
-    if not re.search(r"\b(?:login|log\s+in|sign\s+in)\b", lowered):
+    if not re.search(r"\b(?:login|log(?:\s+me)?\s+in(?:to)?|sign(?:\s+me)?\s+in(?:to)?|get\s+me\s+in)\b", lowered):
         return None
     if re.search(
         r"\b(?:bypass|circumvent|evade|defeat|solve|avoid)\b.{0,60}\b(?:captcha|anti[- ]?bot|bot\s+detection|automated\s+traffic|challenge)\b"
@@ -3335,34 +3408,57 @@ def parse_deterministic_login_request(user_text: str) -> dict[str, Any] | None:
     consent_granted = bool(
         re.search(
             r"\b(?:i|we)\s+(?:explicitly\s+)?(?:approve|authorize|consent\s+to|allow|permit)\b"
-            r".{0,100}\b(?:greyai|grey)\b.{0,60}\b(?:login|log\s+in|sign\s+in)\b",
+            r".{0,100}\b(?:greyai|grey)\b.{0,60}\b(?:login|log\s+in(?:to)?|sign\s+in(?:to)?)\b",
             lowered,
             flags=re.IGNORECASE | re.DOTALL,
         )
         or re.search(
-            r"\b(?:approve|authorize|confirm|allow|permit)\b.{0,30}\b(?:greyai|grey)?\s*(?:to\s+)?(?:login|log\s+in|sign\s+in)\b",
+            r"\b(?:approve|authorize|confirm|allow|permit)\b.{0,30}\b(?:greyai|grey)?\s*(?:to\s+)?(?:login|log\s+in(?:to)?|sign\s+in(?:to)?)\b",
             lowered,
             flags=re.IGNORECASE | re.DOTALL,
         )
     )
 
     url_match = re.search(r"https?://[^\s,]+", text, flags=re.IGNORECASE)
+    if not url_match:
+        named_site = re.search(r"\b(?:x|twitter|linkedin|github|google|facebook|instagram)\b", lowered)
+        named_hosts = {
+            "x": "https://x.com/i/flow/login",
+            "twitter": "https://x.com/i/flow/login",
+            "linkedin": "https://www.linkedin.com/login",
+            "github": "https://github.com/login",
+            "google": "https://accounts.google.com/",
+            "facebook": "https://www.facebook.com/login",
+            "instagram": "https://www.instagram.com/accounts/login/",
+        }
+        if named_site:
+            url_match = SimpleNamespace(group=lambda _index=0: named_hosts[named_site.group(0).lower()])
     username_match = re.search(
-        r"\b(?:username|user\s*name|email|e-mail)\s*(?:is|:|=)?\s*[\"'‘’“”]?([^\s,\"'‘’“”]+)[\"'‘’“”]?\s+(?:and\s+)?(?:the\s+)?password\b",
+        r"\b(?:username|user\s*name|email|e-mail|handle|user\s*id|account\s*name|login)\s*(?:is|:|=)?\s*[\"'‘’“”]?([^\s,;\"'‘’“”]+)[\"'‘’“”]?",
         text,
         flags=re.IGNORECASE,
     )
     password_match = re.search(
-        r"\b(?:password|passcode)\s*(?:is|:|=)?\s*[\"'‘’“”]?(.+?)[\"'‘’“”]?(?=\s+and\s+(?:remember|save|keep)\b|\s*$)",
+        r"\b(?:password|passcode|pass|pwd|secret|passphrase)\s*(?:is|:|=)?\s*(?:[\"'‘’“”]([^\"'‘’“”]+)[\"'‘’“”]|([^\s,;]+))",
         text,
         flags=re.IGNORECASE,
     )
     if not url_match or not username_match or not password_match:
+        if re.search(r"\b(?:password|passcode|passphrase|secret|pwd)\b", lowered):
+            return {"mode": "login_blocked", "reason": "credentials_not_parsed"}
         return None
 
     url = url_match.group(0).rstrip(".,;!?)")
     username = username_match.group(1).strip().rstrip(".,;!?)")
-    password = password_match.group(1).strip().rstrip(".,;!?)").strip("\"'‘’“”")
+    password = (password_match.group(1) or password_match.group(2) or "").strip().rstrip(".,;!?)").strip("\"'‘’“”")
+    consent_granted = consent_granted or bool(
+        re.search(
+            r"\b(?:use|using|fill|enter|type)\b.{0,100}\b(?:username|user\s*name|email|e-mail|password|passcode|pass|pwd|secret|passphrase)\b"
+            r"|\b(?:use|fill|enter|type)\b.{0,40}\b(?:them|these|those|details|credentials)\b"
+            r"|\b(?:go\s+ahead|proceed|do\s+it|carry\s+on)\b",
+            lowered,
+        )
+    )
     if not username or not password or not is_valid_url(url) or not is_domain_allowed(url):
         return None
 
@@ -3400,6 +3496,37 @@ def parse_deterministic_login_request(user_text: str) -> dict[str, Any] | None:
         "session_name": session_name,
         "consent_granted": consent_granted,
     }
+
+
+def login_credentials_present(user_text: str) -> bool:
+    """Detect credential labels so malformed credential requests never reach the LLM."""
+    return bool(re.search(r"\b(?:password|passcode|passphrase|secret|pwd)\s*(?:is|:|=)?", str(user_text or ""), flags=re.IGNORECASE))
+
+
+def parse_deterministic_manual_handoff_request(user_text: str) -> dict[str, Any] | None:
+    """Parse an explicit user-requested browser handoff, independent of CAPTCHA detection."""
+    text = str(user_text or "").strip()
+    lowered = text.lower()
+    if not re.search(r"\b(?:manual\s+handoff|handoff|hand\s+the\s+browser|let\s+me\s+take\s+over|let\s+me\s+control|take\s+over|give\s+me\s+control)\b", lowered):
+        return None
+    url_match = re.search(r"https?://[^\s,]+", text, flags=re.IGNORECASE)
+    if url_match:
+        url = url_match.group(0).rstrip(".,;!?)")
+    else:
+        named_site = re.search(r"\b(?:x|twitter|linkedin|github|google|facebook|instagram)\b", lowered)
+        named_hosts = {
+            "x": "https://x.com/i/flow/login",
+            "twitter": "https://x.com/i/flow/login",
+            "linkedin": "https://www.linkedin.com/login",
+            "github": "https://github.com/login",
+            "google": "https://accounts.google.com/",
+            "facebook": "https://www.facebook.com/login",
+            "instagram": "https://www.instagram.com/accounts/login/",
+        }
+        url = named_hosts.get(named_site.group(0).lower(), "https://example.com/") if named_site else "https://example.com/"
+    if not is_valid_url(url) or not is_domain_allowed(url):
+        return None
+    return {"mode": "manual_handoff_start", "url": url}
 
 
 def parse_deterministic_schedule_request(user_text: str) -> dict[str, Any] | None:
@@ -3711,9 +3838,15 @@ async def parse_natural_language_intent(
     if management_plan:
         return management_plan
 
+    handoff_plan = parse_deterministic_manual_handoff_request(user_text)
+    if handoff_plan:
+        return handoff_plan
+
     login_plan = parse_deterministic_login_request(user_text)
-    if re.search(r"\b(?:login|log\s+in|sign\s+in)\b", str(user_text or ""), flags=re.IGNORECASE):
-        return login_plan
+    if re.search(r"\b(?:login|log(?:\s+me)?\s+in(?:to)?|sign(?:\s+me)?\s+in(?:to)?|get\s+me\s+in)\b", str(user_text or ""), flags=re.IGNORECASE):
+        return login_plan or {"mode": "login_blocked", "reason": "credentials_not_parsed"}
+    if login_credentials_present(user_text):
+        return {"mode": "login_blocked", "reason": "credentials_not_parsed"}
 
     fallback = lambda: parse_deterministic_schedule_request(user_text) or parse_deterministic_web_request(user_text, default_session_name, user_id)
     deterministic_plan = fallback()
@@ -5088,9 +5221,9 @@ def manual_challenge_link(token: str) -> str:
 
 def manual_handoff_unavailable_message() -> str:
     return (
-        "There is no active manual challenge to hand off right now. "
-        "Start or repeat the approved browser request; if the site presents a CAPTCHA, MFA, "
-        "or security check, GreyAI will pause and send a fresh private handoff link."
+        "There is no active manual challenge or handoff to reopen. "
+        "Ask GreyAI to open a manual handoff for an approved URL, or repeat the browser request; "
+        "if the site presents a CAPTCHA, MFA, or security check, GreyAI will pause and send a fresh private handoff link."
     )
 
 
@@ -5135,7 +5268,7 @@ async def create_manual_challenge_handoff(page, user_id: int, operation_id: str,
             "user_id": int(user_id),
             "operation_id": str(operation_id)[:80],
             "page": page,
-            "challenge_kind": challenge_kind if challenge_kind in {"captcha", "mfa", "security-check"} else "security-check",
+            "challenge_kind": challenge_kind if challenge_kind in {"captcha", "mfa", "security-check", "user-requested"} else "security-check",
             "created_at": time.monotonic(),
             "expires_at": time.monotonic() + MANUAL_CHALLENGE_TIMEOUT_SECONDS,
             "status": "waiting",
@@ -5147,8 +5280,13 @@ async def create_manual_challenge_handoff(page, user_id: int, operation_id: str,
     link = manual_challenge_link(token)
     runtime_metrics["manual_challenge_handoffs"] += 1
     if status_msg:
+        opening = (
+            "🛑 GreyAI paused because you requested a manual browser handoff."
+            if challenge_kind == "user-requested"
+            else "🛑 GreyAI paused because the site requires a manual security challenge."
+        )
         await status_msg.edit_text(
-            "🛑 GreyAI paused because the site requires a manual security challenge.\n\n"
+            f"{opening}\n\n"
             f"Open this private handoff link to complete it yourself:\n{link}\n\n"
             "Use the page controls to click, scroll, or type the required code. GreyAI will not solve or bypass the challenge. "
             f"The handoff expires in about {MANUAL_CHALLENGE_TIMEOUT_SECONDS // 60} minutes.",
@@ -5163,6 +5301,11 @@ async def wait_for_manual_challenge(page, user_id: int, operation_id: str, statu
     if not challenge_kind:
         return
     token = await create_manual_challenge_handoff(page, user_id, operation_id, status_msg, challenge_kind=challenge_kind)
+    await wait_for_manual_handoff_token(token, page, user_id, operation_id, status_msg)
+
+
+async def wait_for_manual_handoff_token(token: str, page, user_id: int, operation_id: str, status_msg=None) -> None:
+    """Wait for a specific handoff, whether it was challenge-triggered or user-requested."""
     while True:
         record = manual_challenges.get(token)
         if not record:
@@ -5392,6 +5535,17 @@ async def execute_pipeline(page, browser_context, actions: list[str], user_id: i
                     result["navigation_snapshot"] = navigation_result["navigation_snapshot"]
             elif action.startswith("wait:"):
                 await page.wait_for_timeout(min(int(float(action.replace("wait:", "", 1).strip()) * 1000), 30000))
+
+            elif action == "manual_handoff:":
+                token = await create_manual_challenge_handoff(
+                    page,
+                    user_id,
+                    operation_id,
+                    status_msg,
+                    challenge_kind="user-requested",
+                )
+                result["extracted"].append("🛑 Manual browser handoff is active. Complete the requested interaction, then press ‘I’m done’.")
+                await wait_for_manual_handoff_token(token, page, user_id, operation_id, status_msg)
                 
             elif action.startswith("extract:"):
                 selector = action.replace("extract:", "", 1).strip()
@@ -8368,15 +8522,13 @@ async def _process_natural_language(
     else:
         status_msg = await source_message.reply_text(status_text, parse_mode="Markdown")
     create_operation(operation_id, user_id, chat_id, "natural_language")
-    remember_chat_turn(
+    remember_user_turn(
         chat_id,
         request_text,
-        f"[GreyAI agent task accepted; operation {operation_id} is being executed. The application will post the result in this chat.]",
         user_id,
         getattr(source_message, "message_id", None),
         reply_to_message_id,
         business_connection_id,
-        getattr(status_msg, "message_id", None),
     )
     update_operation(operation_id, "running", 0)
 
@@ -8738,37 +8890,67 @@ async def _process_natural_language(
             return
 
     if plan and plan.get("mode") == "search":
-        if not GOOGLE_CUSTOM_SEARCH_ENABLED or not google_custom_search_provider.configured:
-            update_operation(operation_id, "failed")
-            await status_msg.edit_text("Google Custom Search is enabled for this request but is not configured. An administrator must set GOOGLE_CUSTOM_SEARCH_API_KEY and GOOGLE_CUSTOM_SEARCH_CX.")
-            log_audit(user_id, "custom_search", None, "NOT_CONFIGURED")
-            return
+        search_query = str(plan.get("query") or request_text).strip()[:500]
         try:
-            results = await asyncio.wait_for(
-                google_custom_search_provider.search(plan["query"]),
-                timeout=GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS + 1,
-            )
-            await deliver_text_response(
-                status_msg,
-                format_google_search_results(plan["query"], results),
-                user_id,
-                edit=True,
-                title="Search results",
-            )
-            update_operation(operation_id, "succeeded")
-            log_audit(user_id, "custom_search", None, "SUCCESS")
+            if GOOGLE_CUSTOM_SEARCH_ENABLED and google_custom_search_provider.configured:
+                results = await asyncio.wait_for(
+                    google_custom_search_provider.search(search_query),
+                    timeout=GOOGLE_CUSTOM_SEARCH_TIMEOUT_SECONDS + 1,
+                )
+                response_text = format_google_search_results(search_query, results)
+                log_audit(user_id, "custom_search", None, "SUCCESS")
+            else:
+                raise SearchProviderUnavailable("custom search is not configured")
         except SearchProviderTimeout:
-            update_operation(operation_id, "failed")
-            await status_msg.edit_text("Google Custom Search timed out. No browser scraping fallback was attempted; please try again shortly.")
-            log_audit(user_id, "custom_search", None, "TIMEOUT")
+            response_text = ""
         except asyncio.TimeoutError:
-            update_operation(operation_id, "failed")
-            await status_msg.edit_text("Google Custom Search timed out. No browser scraping fallback was attempted; please try again shortly.")
-            log_audit(user_id, "custom_search", None, "TIMEOUT")
+            response_text = ""
         except SearchProviderUnavailable:
-            update_operation(operation_id, "failed")
-            await status_msg.edit_text("Google Custom Search is temporarily unavailable or its quota is exhausted. No browser scraping fallback was attempted; please try again later.")
-            log_audit(user_id, "custom_search", None, "UNAVAILABLE")
+            response_text = ""
+        if not response_text:
+            search_sources = search_source_candidates_for_query(search_query, user_id)
+            if not search_sources:
+                update_operation(operation_id, "failed")
+                await status_msg.edit_text("No safe search provider is currently enabled. Please try again later.")
+                log_audit(user_id, "custom_search", None, "NO_SAFE_FALLBACK")
+                return
+            try:
+                await status_msg.edit_text("🔎 Searching through safe fallback providers...")
+                result = await run_browser_request(
+                    operation_id,
+                    user_id,
+                    chat_id,
+                    "search",
+                    lambda: run_browser_task_with_source_fallback(
+                        search_sources,
+                        ["ai_extract:Return concise, deduplicated search results with title, source URL, and the most relevant facts. Do not repeat the query or instructions."],
+                        user_id,
+                        operation_id,
+                        status_msg=status_msg,
+                        native_context={**native_context, "grey": {**native_context["grey"], "mode": "agent"}, "request": {**native_context["request"], "operation_id": operation_id}},
+                    ),
+                    status_msg=status_msg,
+                )
+                extracted = "\n\n".join(result.get("extracted") or []) or "No useful search result text was returned."
+                response_text = f"Search results for: {search_query}\n\n{extracted}"
+                log_audit(user_id, "custom_search", result.get("source_url"), "BROWSER_FALLBACK_SUCCESS")
+            except Exception as exc:
+                update_operation(operation_id, "failed")
+                await status_msg.edit_text(f"Search providers were unavailable: {browser_failure_message(exc, search_query)}")
+                log_audit(user_id, "custom_search", None, f"FALLBACK_FAILED_{type(exc).__name__}")
+                return
+        search_message = await deliver_text_response(status_msg, response_text, user_id, edit=True, title="Search results")
+        remember_assistant_turn(
+            chat_id,
+            response_text,
+            user_id,
+            assistant_message_id=getattr(search_message, "message_id", None),
+            reply_to_message_id=reply_to_message_id,
+            business_connection_id=business_connection_id,
+            operation_id=operation_id,
+            response_kind="search_results",
+        )
+        update_operation(operation_id, "succeeded")
         return
 
     if not plan:
@@ -8882,11 +9064,60 @@ async def _process_natural_language(
 
     if plan["mode"] == "login_blocked":
         update_operation(operation_id, "rejected")
-        log_audit(user_id, "natural_language_login", None, "DENIED_CAPTCHA_OR_ANTIBOT_BYPASS")
-        await status_msg.edit_text(
-            "⛔ GreyAI cannot bypass CAPTCHAs, anti-bot challenges, automated-traffic controls, or access restrictions. "
-            "If you are authorized to use the site, complete the challenge yourself and ask GreyAI to continue only through a permitted, user-approved flow."
-        )
+        reason = str(plan.get("reason") or "")
+        if reason == "credentials_not_parsed":
+            log_audit(user_id, "natural_language_login", None, "DENIED_CREDENTIALS_NOT_PARSED")
+            await status_msg.edit_text(
+                "🔐 I detected login credentials but could not safely identify the site, username, and password fields. "
+                "No credential was sent to an AI provider. Provide the named site and use: ‘log into [site] with username … and password …’, or use a secure browser handoff."
+            )
+        else:
+            log_audit(user_id, "natural_language_login", None, "DENIED_CAPTCHA_OR_ANTIBOT_BYPASS")
+            await status_msg.edit_text(
+                "⛔ GreyAI cannot bypass CAPTCHAs, anti-bot challenges, automated-traffic controls, or access restrictions. "
+                "If you are authorized to use the site, complete the challenge yourself and ask GreyAI to continue only through a permitted, user-approved flow."
+            )
+        return
+
+    if plan["mode"] == "manual_handoff_start":
+        try:
+            result = await run_browser_request(
+                operation_id,
+                user_id,
+                chat_id,
+                "manual_handoff",
+                lambda: run_browser_task_with_retry(
+                    plan["url"],
+                    ["manual_handoff:"],
+                    user_id,
+                    operation_id,
+                    status_msg=status_msg,
+                    native_context={**native_context, "grey": {**native_context["grey"], "mode": "agent"}, "request": {**native_context["request"], "operation_id": operation_id}},
+                    screenshot_requested=True,
+                ),
+                status_msg=status_msg,
+            )
+            await status_msg.edit_text("✅ Manual handoff completed. GreyAI has resumed the browser session and verified the page is still on an approved route.")
+            screenshot_path = result.get("screenshot")
+            if screenshot_path and os.path.exists(screenshot_path):
+                try:
+                    photo = await _input_file_from_path(screenshot_path)
+                    await source_message.reply_photo(photo=photo, caption="✅ Manual handoff completed.")
+                finally:
+                    try:
+                        os.remove(screenshot_path)
+                    except OSError:
+                        pass
+            log_audit(user_id, "manual_handoff_request", plan["url"], "COMPLETED")
+        except ManualChallengeRequired as exc:
+            update_operation(operation_id, "paused")
+            await status_msg.edit_text(f"🛑 Manual handoff paused: {str(exc)[:240]}")
+            log_audit(user_id, "manual_handoff_request", plan["url"], "PAUSED")
+        except Exception as exc:
+            update_operation(operation_id, "failed")
+            logger.exception("manual_handoff_request_failed operation_id=%s", operation_id)
+            await status_msg.edit_text(f"❌ Manual handoff failed: {browser_failure_message(exc, plan['url'])}")
+            log_audit(user_id, "manual_handoff_request", plan["url"], f"ERROR_{type(exc).__name__}")
         return
 
     if plan["mode"] == "login":
@@ -9572,8 +9803,8 @@ def settings_text(settings: dict[str, Any], session_names: list[str], active_han
         f"<b>Persistent login + automatic session save:</b> {persistent}",
         "These two protections are paired. When enabled, GreyAI may reuse and refresh the encrypted session for an approved site. Disabling them stops automatic reuse/save but does not delete existing sessions.",
         "",
-        f"<b>Manual CAPTCHA/MFA handoff:</b> {challenge}",
-        "When enabled, GreyAI pauses and gives you a private browser handoff to complete the site’s own challenge. GreyAI never solves or bypasses it.",
+        f"<b>Manual browser handoff:</b> {challenge}",
+        "When enabled, GreyAI pauses for CAPTCHA/MFA/security checks by default, and you can also request a handoff manually for testing or an authorized interaction. GreyAI never solves or bypasses site challenges.",
         "",
         f"<b>Saved encrypted sessions:</b> {len(session_names)}",
         f"<b>Active manual handoffs:</b> {active_handoffs}",
@@ -9583,7 +9814,7 @@ def settings_text(settings: dict[str, Any], session_names: list[str], active_han
 
 def settings_keyboard(settings: dict[str, Any], session_names: list[str]) -> InlineKeyboardMarkup:
     persistent = "✅ Persistent login + auto-save: ON" if settings.get("persistent_login_enabled") else "⚪ Persistent login + auto-save: OFF"
-    challenge = "✅ Manual challenge handoff: ON" if settings.get("challenge_handoff_enabled", True) else "⚪ Manual challenge handoff: OFF"
+    challenge = "✅ Manual browser handoff: ON" if settings.get("challenge_handoff_enabled", True) else "⚪ Manual browser handoff: OFF"
     rows = [
         [InlineKeyboardButton(persistent, callback_data="settings:toggle_persistent")],
         [InlineKeyboardButton(challenge, callback_data="settings:toggle_challenge")],

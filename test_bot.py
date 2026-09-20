@@ -1564,6 +1564,116 @@ def test_fast_route_keeps_ordinary_summary_question_in_chat_mode():
     assert bot.classify_message_route("What is the difference between TCP and UDP?") == "chat"
 
 
+def test_search_requests_have_safe_browser_fallback_candidates(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "GOOGLE_CUSTOM_SEARCH_ENABLED", False)
+    monkeypatch.setattr(bot, "DUCKDUCKGO_ENABLED", True)
+    monkeypatch.setattr(bot, "BING_SEARCH_ENABLED", True)
+    monkeypatch.setattr(bot, "BRAVE_SEARCH_ENABLED", False)
+    monkeypatch.setattr(bot, "STARTPAGE_SEARCH_ENABLED", False)
+
+    candidates = bot.search_source_candidates_for_query("current bitcoin price", user_id=42)
+
+    assert candidates
+    assert any("duckduckgo.com" in candidate for candidate in candidates)
+    assert any("bing.com" in candidate for candidate in candidates)
+
+
+def test_chat_history_drops_agent_acceptance_receipts_and_adjacent_duplicates():
+    import bot
+
+    history = [
+        {"role": "user", "text": "Check the news", "metadata": {}},
+        {"role": "assistant", "text": "[GreyAI agent task accepted; operation abc is being executed.]", "metadata": {}},
+        {"role": "assistant", "text": "The headlines are updated.", "metadata": {"response_kind": "web_extraction"}},
+        {"role": "assistant", "text": "The headlines are updated.", "metadata": {"response_kind": "web_extraction"}},
+    ]
+
+    prepared = bot.prepare_chat_history(history)
+
+    assert len(prepared) == 2
+    assert all("agent task accepted" not in turn["text"].lower() for turn in prepared)
+    assert prepared[-1]["text"] == "The headlines are updated."
+
+
+def test_manual_handoff_request_is_parsed_without_waiting_for_captcha():
+    import bot
+
+    plan = bot.parse_deterministic_manual_handoff_request(
+        "open a manual handoff for https://x.com/i/flow/login so I can test it"
+    )
+
+    assert plan == {
+        "mode": "manual_handoff_start",
+        "url": "https://x.com/i/flow/login",
+    }
+
+
+def test_login_parser_supports_log_into_x_and_keeps_credentials_out_of_model_path():
+    import bot
+
+    plan = bot.parse_deterministic_login_request(
+        "log into X using username test_user and password 'test-password-123'; I authorize GreyAI to log in"
+    )
+
+    assert plan is not None
+    assert plan["mode"] == "login"
+    assert plan["url"] == "https://x.com/i/flow/login"
+    assert plan["consent_granted"] is True
+    assert "type_username:test_user" in plan["actions"]
+    assert any(action.startswith("type_password:") for action in plan["actions"])
+
+
+def test_login_parser_blocks_unparsed_password_input_before_model_fallback():
+    import bot
+
+    assert bot.login_credentials_present("please login with password: secret") is True
+    assert bot.parse_deterministic_login_request("please login with password: secret") is not None
+
+
+def test_login_parser_understands_natural_aliases_and_reordered_credentials():
+    import bot
+
+    plan = bot.parse_deterministic_login_request(
+        "I need you to sign me into my X account. The pass is 'multi word placeholder' and my handle is alice_42; go ahead."
+    )
+
+    assert plan is not None
+    assert plan["mode"] == "login"
+    assert plan["url"] == "https://x.com/i/flow/login"
+    assert "type_username:alice_42" in plan["actions"]
+    assert "type_password:multi word placeholder" in plan["actions"]
+    assert plan["consent_granted"] is True
+
+
+def test_manual_handoff_parser_understands_takeover_language_and_named_site():
+    import bot
+
+    plan = bot.parse_deterministic_manual_handoff_request(
+        "Open X and let me control the browser for a moment"
+    )
+
+    assert plan == {
+        "mode": "manual_handoff_start",
+        "url": "https://x.com/i/flow/login",
+    }
+
+
+def test_login_parser_handles_conversational_login_and_secret_synonyms():
+    import bot
+
+    plan = bot.parse_deterministic_login_request(
+        "My X login is alice_42 and my secret is 'multi word placeholder'; use them to get me in."
+    )
+
+    assert plan is not None
+    assert plan["url"] == "https://x.com/i/flow/login"
+    assert "type_username:alice_42" in plan["actions"]
+    assert "type_password:multi word placeholder" in plan["actions"]
+    assert plan["consent_granted"] is True
+
+
 def test_multimodal_handlers_exist_for_voice_and_photo_updates():
     import bot
 
