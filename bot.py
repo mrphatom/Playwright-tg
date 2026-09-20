@@ -1926,7 +1926,12 @@ def is_domain_allowed(url: str) -> bool:
         hostname = (urlparse(url).hostname or "").rstrip(".").lower()
         if not hostname:
             return False
-        policies = list_domain_policies()
+        try:
+            policies = list_domain_policies()
+        except (OSError, sqlite3.Error):
+            # A policy-store outage must never turn into an accidental allow.
+            logger.exception("domain_policy_lookup_failed hostname=%s", hostname)
+            return False
         if any(row["effect"] == "deny" and domain_pattern_matches(hostname, row["pattern"]) for row in policies):
             return False
         return not any(domain_pattern_matches(hostname, pattern) for pattern in BLACKLIST_DOMAINS)
@@ -2544,6 +2549,13 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
         schedule_config = normalize_schedule_config(raw_plan)
         return {"mode": "schedule", "schedule": schedule_config} if schedule_config else None
     if mode == "manual_handoff":
+        raw_url = str(raw_plan.get("url") or "").strip().rstrip(".,;!?)")
+        if raw_url and not raw_url.lower().startswith(("http://", "https://")):
+            raw_url = "https://" + raw_url
+        if raw_url and is_valid_url(raw_url) and route_url_allowed(raw_url, user_id):
+            return {"mode": "manual_handoff_start", "url": raw_url}
+        # Without a target URL, preserve the explicit reopen action. The caller
+        # will only reissue an already-active handoff and will not invent one.
         return {"mode": "manual_handoff"}
     if mode == "developer_bot_starter":
         language = str(raw_plan.get("language", "python") or "python").strip().lower()

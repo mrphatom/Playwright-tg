@@ -1660,6 +1660,29 @@ def test_manual_handoff_parser_understands_takeover_language_and_named_site():
     }
 
 
+def test_model_handoff_with_url_starts_new_handoff(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "route_url_allowed", lambda url, user_id=None: True)
+    plan = bot.normalize_natural_language_plan(
+        {"mode": "manual_handoff", "url": "https://x.com/i/flow/login"},
+        user_id=6411860985,
+    )
+
+    assert plan == {
+        "mode": "manual_handoff_start",
+        "url": "https://x.com/i/flow/login",
+    }
+
+
+def test_model_handoff_without_url_remains_reopen_only():
+    import bot
+
+    assert bot.normalize_natural_language_plan({"mode": "manual_handoff"}) == {
+        "mode": "manual_handoff",
+    }
+
+
 def test_login_parser_handles_conversational_login_and_secret_synonyms():
     import bot
 
