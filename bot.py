@@ -7136,6 +7136,15 @@ def _parse_bulk_ids(raw_values: list[str]) -> list[str]:
     return sorted({value[:100] for value in values if value})
 
 
+def _command_payload_preserving_layout(message_text: str | None, command: str, fallback_args: list[str] | None = None) -> str:
+    """Extract a command body without destroying user-supplied line breaks."""
+    raw = str(message_text or "")
+    match = re.match(rf"^\s*/{re.escape(command)}(?:@[A-Za-z0-9_]+)?(?:(?:[ \t]+)|(?:\r?\n)|$)", raw, flags=re.IGNORECASE)
+    if match:
+        return raw[match.end():].strip()
+    return " ".join(fallback_args or []).strip()
+
+
 def _bulk_preview_text(job: dict[str, Any]) -> str:
     payload = json.loads(job.get("payload_json") or "{}") if isinstance(job.get("payload_json"), str) else job.get("payload_json", {})
     audience_line = f"\nAudience: {payload.get('audience')}" if payload.get("audience") else ""
@@ -7152,7 +7161,11 @@ def _bulk_preview_text(job: dict[str, Any]) -> str:
 async def announce_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not BULK_ACTIONS_ENABLED:
         return await update.message.reply_text("Bulk announcements are disabled by configuration.")
-    message = " ".join(context.args).strip()[:3500]
+    message = _command_payload_preserving_layout(
+        getattr(update.message, "text", None),
+        "announce",
+        context.args,
+    )[:3500]
     if not message:
         return await update.message.reply_text("Usage: /announce <message>\nThe message is previewed first and requires /confirmbulk before delivery.")
     targets = [str(row["telegram_user_id"]) for row in list_users_by_status("active", MAX_BULK_TARGETS)]
