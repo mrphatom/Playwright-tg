@@ -495,7 +495,7 @@ async def notification_worker(bot) -> None:
                 if not mark_notification_sending(row["notification_id"]):
                     continue
                 try:
-                    text = f"<b>{html_escape(row['title'])}</b>\n\n{html_escape(row['body'])}"
+                    text = f"<b>{telegram_announcement_html(row['title'], 180)}</b>\n\n{telegram_announcement_html(row['body'], 3500)}"
                     await bot.send_message(chat_id=row["user_id"], text=text, parse_mode="HTML")
                     mark_notification_delivered(row["notification_id"])
                 except TelegramError as exc:
@@ -4037,6 +4037,22 @@ def telegram_safe_html(text: str, max_length: int | None = 4000) -> str:
     for index, token_value in enumerate(tokens):
         rendered = rendered.replace(f"\x00GREYAI_{index}\x00", token_value)
     return rendered
+
+
+def telegram_announcement_html(text: str, max_length: int | None = 3500) -> str:
+    """Render announcement text as safe Telegram HTML.
+
+    Admins may paste Telegram-supported formatting tags, but arbitrary HTML
+    and attributes must remain escaped before the message reaches Telegram.
+    """
+    rendered = telegram_safe_html(text, max_length=max_length)
+    supported_tags = r"b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler"
+    return re.sub(
+        rf"&lt;(/?)({supported_tags})&gt;",
+        lambda match: f"<{match.group(1)}{match.group(2)}>",
+        rendered,
+        flags=re.IGNORECASE,
+    )
 
 
 def split_telegram_message(text: str, max_length: int = 3900) -> list[str]:
