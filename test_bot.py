@@ -5985,6 +5985,16 @@ def test_telegram_announcement_html_preserves_supported_tags_without_raw_html_le
     assert "<script>" not in rendered
 
 
+def test_announce_payload_preserves_newlines_and_falls_back_to_args():
+    import bot
+
+    raw = "/announce <b>Release update</b>\n\n• First improvement\n• Second improvement"
+    assert bot._command_payload_preserving_layout(raw, "announce", ["ignored"]) == (
+        "<b>Release update</b>\n\n• First improvement\n• Second improvement"
+    )
+    assert bot._command_payload_preserving_layout(None, "announce", ["one", "two"]) == "one two"
+
+
 def test_landing_page_generator_returns_complete_static_site_files():
     from starter_templates import build_landing_page_files
 
