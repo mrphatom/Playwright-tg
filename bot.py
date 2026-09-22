@@ -5939,9 +5939,9 @@ async def check_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_valid_url(url): 
         return await update.message.reply_text("⚠️ Invalid URL format.")
         
-    if not is_domain_allowed(url):
-        log_audit(user_id, "/check", url, "BLOCKED_DOMAIN_NOT_WHITELISTED")
-        return await update.message.reply_text("⛔ *Domain Blocked:* This domain is not in the allowed whitelist.", parse_mode='Markdown')
+    if not route_url_allowed(url, user_id):
+        log_audit(user_id, "/check", url, "BLOCKED_DOMAIN_POLICY")
+        return await update.message.reply_text("⛔ *Domain blocked:* the host is blacklisted, or this `.onion` host is not explicitly allowlisted for Tor access.", parse_mode='Markdown')
 
     operation_id = uuid.uuid4().hex[:12]
     create_operation(operation_id, user_id, chat_id, "check", url)
@@ -5999,9 +5999,9 @@ async def watch_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = [p.strip() for p in cmd_str.split("|") if p.strip()]
     url = 'https://' + parts[0] if not parts[0].startswith(('http://', 'https://')) else parts[0]
     
-    if not is_domain_allowed(url):
-        log_audit(user_id, "/watch", url, "BLOCKED_DOMAIN_NOT_WHITELISTED")
-        return await update.message.reply_text("⛔ *Domain Blocked:* Domain not in whitelist.", parse_mode='Markdown')
+    if not route_url_allowed(url, user_id):
+        log_audit(user_id, "/watch", url, "BLOCKED_DOMAIN_POLICY")
+        return await update.message.reply_text("⛔ *Domain blocked:* the host is blacklisted, or this `.onion` host is not explicitly allowlisted for Tor access.", parse_mode='Markdown')
 
     interval = 60
     actions = []
@@ -9762,14 +9762,15 @@ async def stop_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return await update.message.reply_text("⚠️ Provide a watcher ID.")
     w_id = context.args[0]
     
-    if chat_id in active_watchers and w_id in active_watchers[chat_id]:
-        if not deactivate_watcher_in_db(w_id, owner_user_id=user_id, chat_id=chat_id):
-            return await update.message.reply_text("⚠️ That watcher is not owned by you in this chat.")
-        active_watchers[chat_id][w_id].cancel()
+    task = active_watchers.get(chat_id, {}).get(w_id)
+    if not deactivate_watcher_in_db(w_id, owner_user_id=user_id, chat_id=chat_id):
+        return await update.message.reply_text("⚠️ Watcher ID not found, or it is not owned by you in this chat.")
+    if task and not task.done():
+        task.cancel()
+    active_watchers.get(chat_id, {}).pop(w_id, None)
+    if task or w_id:
         log_audit(user_id, "/stopwatch", None, f"STOPPED_WATCHER_{w_id}")
         await update.message.reply_text(f"🛑 Watcher `{w_id}` stopped.")
-    else:
-        await update.message.reply_text("⚠️ Watcher ID not found.")
 
 @restricted
 async def list_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
