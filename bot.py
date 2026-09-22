@@ -11,6 +11,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+from database import bootstrap_postgres_from_sqlite, connect as db_connect
 import tarfile
 import tempfile
 import time
@@ -1350,8 +1351,9 @@ runtime_metrics = {
 
 # ==========================================
 def init_db():
-    """Initializes the SQLite database tables."""
-    with sqlite3.connect(get_db_path()) as conn:
+    """Initializes the runtime database tables and performs the safe first-run bootstrap."""
+    bootstrap_postgres_from_sqlite(get_db_path())
+    with db_connect(get_db_path()) as conn:
         cursor = conn.cursor()
         
         # Sessions table (encrypted storage)
@@ -1470,7 +1472,7 @@ def init_db():
     logger.info("Database initialized successfully.")
 
 def get_chat_setting(chat_id: int) -> dict[str, Any] | None:
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         row = conn.execute(
             "SELECT chat_id, chat_type, enabled, enabled_by_user_id FROM chat_settings WHERE chat_id = ?",
             (chat_id,),
@@ -1486,7 +1488,7 @@ def get_chat_setting(chat_id: int) -> dict[str, Any] | None:
 
 
 def set_chat_setting(chat_id: int, chat_type: str, enabled: bool, enabled_by_user_id: int | None) -> None:
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         conn.execute(
             """INSERT INTO chat_settings (chat_id, chat_type, enabled, enabled_by_user_id, updated_at)
                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -1561,7 +1563,7 @@ def domain_pattern_matches(hostname: str, pattern: str) -> bool:
 
 
 def list_domain_policies() -> list[dict[str, Any]]:
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         rows = conn.execute(
             "SELECT pattern, effect, created_by_user_id, created_at, updated_at FROM domain_policies ORDER BY pattern"
         ).fetchall()
@@ -1581,7 +1583,7 @@ def set_domain_policy(pattern: str, effect: str, user_id: int) -> str:
     normalized = normalize_domain_pattern(pattern)
     if effect not in {"allow", "deny"}:
         raise ValueError("domain policy effect must be allow or deny")
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         conn.execute(
             """INSERT INTO domain_policies (pattern, effect, created_by_user_id, updated_at)
                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -1595,7 +1597,7 @@ def set_domain_policy(pattern: str, effect: str, user_id: int) -> str:
 
 def remove_domain_policy(pattern: str) -> str:
     normalized = normalize_domain_pattern(pattern)
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         conn.execute("DELETE FROM domain_policies WHERE pattern = ?", (normalized,))
         conn.commit()
     return normalized
@@ -1604,7 +1606,7 @@ def remove_domain_policy(pattern: str) -> str:
 def log_audit(user_id: int, command: str, target_url: str | None, status: str):
     """Inserts a command log entry into SQLite."""
     try:
-        with sqlite3.connect(get_db_path()) as conn:
+        with db_connect(get_db_path()) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO audit_logs (user_id, command, target_url, status) VALUES (?, ?, ?, ?)",
@@ -1620,7 +1622,7 @@ def save_encrypted_session(user_id: int, name: str, session_data: dict):
     encrypted_bytes = cipher_suite.encrypt(json_str.encode("utf-8"))
     encrypted_str = encrypted_bytes.decode("utf-8")
     
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO sessions (user_id, name, encrypted_data) 
@@ -1631,7 +1633,7 @@ def save_encrypted_session(user_id: int, name: str, session_data: dict):
 
 def load_encrypted_session(user_id: int, name: str) -> dict | None:
     """Retrieves and decrypts a browser session from SQLite."""
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT encrypted_data FROM sessions WHERE user_id = ? AND name = ?", (user_id, name))
         row = cursor.fetchone()
@@ -1646,14 +1648,14 @@ def load_encrypted_session(user_id: int, name: str) -> dict | None:
 
 def list_user_sessions(user_id: int) -> list[str]:
     """Lists all active session names for a user."""
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sessions WHERE user_id = ?", (user_id,))
         return [row[0] for row in cursor.fetchall()]
 
 def delete_user_session(user_id: int, name: str) -> bool:
     """Deletes a saved session from SQLite."""
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM sessions WHERE user_id = ? AND name = ?", (user_id, name))
         conn.commit()
@@ -1661,7 +1663,7 @@ def delete_user_session(user_id: int, name: str) -> bool:
 
 def save_business_connection(connection_id: str, owner_user_id: int, owner_chat_id: int, is_enabled: bool, can_read_messages: bool, can_reply: bool):
     """Persist only non-secret Business Mode connection metadata."""
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         conn.execute(
             """INSERT INTO business_connections
                (connection_id, owner_user_id, owner_chat_id, is_enabled, can_read_messages, can_reply, updated_at)
@@ -1679,7 +1681,7 @@ def save_business_connection(connection_id: str, owner_user_id: int, owner_chat_
 
 
 def get_business_connection(connection_id: str) -> dict[str, Any] | None:
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         row = conn.execute(
             """SELECT connection_id, owner_user_id, owner_chat_id, is_enabled, can_read_messages, can_reply
                FROM business_connections WHERE connection_id = ?""",
@@ -1710,14 +1712,20 @@ def save_watcher_to_db(
     """Persist a watcher configuration and its ordered, already-validated sources."""
     safe_sources = list(dict.fromkeys(str(item).strip() for item in (source_urls or [url]) if str(item).strip()))
     owner_id = int(owner_user_id if owner_user_id is not None else chat_id)
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO watchers (
+            INSERT INTO watchers (
                 watcher_id, chat_id, owner_user_id, url, actions_json, interval_seconds, is_active,
                 business_connection_id, source_urls_json, last_checked_at, last_success_at,
                 last_error, consecutive_failures, last_result_hash, last_condition_met_at
             ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL, NULL, 0, NULL, NULL)
+            ON CONFLICT(watcher_id) DO UPDATE SET
+                chat_id = excluded.chat_id, owner_user_id = excluded.owner_user_id,
+                url = excluded.url, actions_json = excluded.actions_json,
+                interval_seconds = excluded.interval_seconds, is_active = 1,
+                business_connection_id = excluded.business_connection_id,
+                source_urls_json = excluded.source_urls_json
         """, (watcher_id, chat_id, owner_id, url, json.dumps(actions), interval, business_connection_id, json.dumps(safe_sources)))
         conn.commit()
 
@@ -1733,7 +1741,7 @@ def update_watcher_health(
     """Record bounded watcher health and return the current state for notification decisions."""
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     safe_error = str(error or "")[:500] or None
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT consecutive_failures, last_result_hash, last_condition_met_at FROM watchers WHERE watcher_id = ?",
@@ -1757,7 +1765,7 @@ def update_watcher_health(
 
 def deactivate_watcher_in_db(watcher_id: str, owner_user_id: int | None = None, chat_id: int | None = None):
     """Mark a watcher inactive, optionally requiring its owner and chat scope."""
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         cursor = conn.cursor()
         clauses = ["watcher_id = ?"]
         params: list[Any] = [watcher_id]
@@ -1781,7 +1789,7 @@ def list_watchers_for_chat(chat_id: int, active_only: bool = True, owner_user_id
     if owner_user_id is not None:
         predicates.append("owner_user_id = ?")
         params.append(int(owner_user_id))
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         rows = conn.execute(
             f"""SELECT watcher_id, chat_id, owner_user_id, url, actions_json, interval_seconds, is_active, created_at,
                        source_urls_json, last_checked_at, last_success_at, last_error,
@@ -1824,11 +1832,15 @@ def list_watchers_for_chat(chat_id: int, active_only: bool = True, owner_user_id
 
 
 def save_schedule_to_db(schedule_id: str, user_id: int, chat_id: int, config: dict[str, Any], next_run: datetime):
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO schedules
+            """INSERT INTO schedules
                (schedule_id, user_id, chat_id, config_json, next_run_at, is_active)
-               VALUES (?, ?, ?, ?, ?, 1)""",
+               VALUES (?, ?, ?, ?, ?, 1)
+               ON CONFLICT(schedule_id) DO UPDATE SET
+                 user_id = excluded.user_id, chat_id = excluded.chat_id,
+                 config_json = excluded.config_json, next_run_at = excluded.next_run_at,
+                 is_active = 1""",
             (schedule_id, user_id, chat_id, json.dumps(config), next_run.isoformat()),
         )
         conn.commit()
@@ -1840,7 +1852,7 @@ def list_schedules_for_chat(chat_id: int, owner_user_id: int | None = None) -> l
     if owner_user_id is not None:
         predicates.append("user_id = ?")
         params.append(int(owner_user_id))
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         rows = conn.execute(
             f"""SELECT schedule_id, user_id, chat_id, config_json, next_run_at
                FROM schedules WHERE {' AND '.join(predicates)}
@@ -1860,7 +1872,7 @@ def list_schedules_for_chat(chat_id: int, owner_user_id: int | None = None) -> l
 
 
 def list_active_schedules() -> list[dict[str, Any]]:
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         rows = conn.execute(
             """SELECT schedule_id, user_id, chat_id, config_json, next_run_at
                FROM schedules WHERE is_active = 1 ORDER BY next_run_at"""
@@ -1878,7 +1890,7 @@ def list_active_schedules() -> list[dict[str, Any]]:
 
 
 def update_schedule_next_run(schedule_id: str, next_run: datetime):
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         conn.execute(
             "UPDATE schedules SET next_run_at = ? WHERE schedule_id = ? AND is_active = 1",
             (next_run.isoformat(), schedule_id),
@@ -1892,7 +1904,7 @@ def deactivate_schedule_in_db(schedule_id: str, chat_id: int, owner_user_id: int
     if owner_user_id is not None:
         predicates.append("user_id = ?")
         params.append(int(owner_user_id))
-    with sqlite3.connect(get_db_path()) as conn:
+    with db_connect(get_db_path()) as conn:
         cursor = conn.execute(
             f"UPDATE schedules SET is_active = 0 WHERE {' AND '.join(predicates)}",
             tuple(params),
@@ -4376,7 +4388,7 @@ async def start_browser_pool(application: Application):
 
 async def restore_watchers_from_db(context_bot):
     try:
-        with sqlite3.connect(get_db_path()) as conn:
+        with db_connect(get_db_path()) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT watcher_id, chat_id, owner_user_id, url, actions_json, interval_seconds, business_connection_id, source_urls_json FROM watchers WHERE is_active = 1")
             rows = cursor.fetchall()
