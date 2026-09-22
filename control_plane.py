@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
+from database import connect as db_connect
 
 ROLE_USER = "user"
 ROLE_DEVELOPER = "developer"
@@ -56,10 +57,7 @@ def public_mode() -> bool:
 
 
 def _connect() -> sqlite3.Connection:
-    connection = sqlite3.connect(db_path(), timeout=30)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 30000")
-    return connection
+    return db_connect(db_path())
 
 
 def init_platform_db() -> None:
@@ -2266,7 +2264,8 @@ def record_conversation_turn(
             """INSERT INTO conversation_turns
                (owner_user_id, chat_id, role, text, source_message_id, telegram_message_id,
                 reply_to_message_id, business_connection_id, metadata_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               RETURNING turn_id""",
             (
                 int(owner_user_id),
                 int(chat_id),
@@ -2280,8 +2279,9 @@ def record_conversation_turn(
                 utc_now(),
             ),
         )
+        turn_id = cursor.fetchone()[0]
         connection.commit()
-        return int(cursor.lastrowid)
+        return int(turn_id)
 
 
 def get_conversation_turn_by_telegram_message_id(owner_user_id: int, chat_id: int, telegram_message_id: int) -> sqlite3.Row | None:

@@ -1579,6 +1579,29 @@ def test_search_requests_have_safe_browser_fallback_candidates(monkeypatch):
     assert any("duckduckgo.com" in candidate for candidate in candidates)
     assert any("bing.com" in candidate for candidate in candidates)
 
+def test_route_policy_allows_non_blacklisted_http_hosts_and_denies_blacklisted_hosts(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, "BLACKLIST_DOMAINS", ["blocked.example"])
+    monkeypatch.setattr(bot, "list_domain_policies", lambda: [])
+    assert bot.route_url_allowed("https://news.example.org/story", user_id=42) is True
+    assert bot.route_url_allowed("https://blocked.example/story", user_id=42) is False
+
+def test_stop_watch_can_deactivate_a_persisted_watcher_without_in_memory_task(monkeypatch):
+    import bot
+    class Message:
+        async def reply_text(self, *args, **kwargs):
+            return None
+    class Update:
+        effective_chat = type("Chat", (), {"id": 100})()
+        effective_user = type("User", (), {"id": 42})()
+        message = Message()
+    class Context:
+        args = ["watch-1"]
+    monkeypatch.setattr(bot, "deactivate_watcher_in_db", lambda watcher_id, owner_user_id, chat_id: True)
+    bot.active_watchers.clear()
+    asyncio.run(bot.stop_watch(Update(), Context()))
+    assert bot.active_watchers == {}
+
 
 def test_chat_history_drops_agent_acceptance_receipts_and_adjacent_duplicates():
     import bot

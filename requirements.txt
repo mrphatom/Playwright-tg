@@ -6,3 +6,4 @@ psutil==5.9.8
 cryptography==50.0.0
 pytest==9.0.3
 discord.py==2.7.1
+psycopg[binary]==3.2.10

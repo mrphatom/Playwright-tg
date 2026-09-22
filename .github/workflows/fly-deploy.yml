@@ -84,6 +84,24 @@ jobs:
           echo "API key secret configuration failed after 3 attempts" >&2
           exit 1
 
+      - name: Configure Neon PostgreSQL connection
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          test -n "$DATABASE_URL"
+          for attempt in 1 2 3; do
+            echo "Neon database secret configuration attempt ${attempt}/3"
+            if flyctl secrets set DATABASE_URL="$DATABASE_URL" --app playwright-tg-mrphatom; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep 30
+            fi
+          done
+          echo "Neon database secret configuration failed after 3 attempts" >&2
+          exit 1
+
       - name: Configure Gemini fallback secrets
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
@@ -134,8 +152,6 @@ jobs:
             flyctl ips allocate-v4 --shared --app playwright-tg-mrphatom
           fi
         
-
-
 
 
 
