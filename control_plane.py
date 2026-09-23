@@ -1469,20 +1469,23 @@ def get_platform_activity_summary() -> dict[str, Any]:
 def get_queue_stats() -> dict[str, Any]:
     with _connect() as connection:
         counts = {row["status"]: int(row["count"]) for row in connection.execute("SELECT status, COUNT(*) AS count FROM request_queue GROUP BY status").fetchall()}
-        active = connection.execute(
-            """
-            SELECT AVG(duration_seconds) AS seconds
-            FROM (
-                SELECT (julianday(completed_at) - julianday(started_at)) * 86400.0 AS duration_seconds
-                FROM request_queue
-                WHERE status = 'succeeded' AND started_at IS NOT NULL AND completed_at IS NOT NULL
-                ORDER BY completed_at DESC
-                LIMIT 100
-            )
-            """
-        ).fetchone()["seconds"]
+        completed_rows = connection.execute(
+            """SELECT started_at, completed_at
+               FROM request_queue
+               WHERE status = 'succeeded' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+               ORDER BY completed_at DESC LIMIT 100"""
+        ).fetchall()
         oldest = connection.execute("SELECT enqueued_at FROM request_queue WHERE status = 'queued' ORDER BY priority DESC, enqueued_at ASC LIMIT 1").fetchone()
-    return {"counts": counts, "queued": counts.get("queued", 0), "running": counts.get("running", 0), "oldest_queued_at": oldest["enqueued_at"] if oldest else None, "average_completed_seconds": round(float(active or 0), 2)}
+    durations = []
+    for row in completed_rows:
+        try:
+            started = datetime.fromisoformat(str(row["started_at"]).replace("Z", "+00:00"))
+            completed = datetime.fromisoformat(str(row["completed_at"]).replace("Z", "+00:00"))
+            durations.append(max(0.0, (completed - started).total_seconds()))
+        except (TypeError, ValueError):
+            continue
+    average = sum(durations) / len(durations) if durations else 0.0
+    return {"counts": counts, "queued": counts.get("queued", 0), "running": counts.get("running", 0), "oldest_queued_at": oldest["enqueued_at"] if oldest else None, "average_completed_seconds": round(average, 2)}
 
 
 def consume_quota(user_id: int, units: int = 1) -> tuple[bool, int, int]:

@@ -57,8 +57,12 @@ def migrate(sqlite_path: Path, database_url: str, dry_run: bool) -> None:
         raise SystemExit("DATABASE_URL or --database-url is required")
     with psycopg.connect(database_url) as destination:
         with destination.cursor() as cursor:
+            identity_columns = []
             for table, create_sql in tables:
                 cursor.execute(translate_create(table, create_sql))
+                for column in source.execute(f"PRAGMA table_info({ident(table)})").fetchall():
+                    if int(column[5] or 0) == 1 and re.search(r"\bAUTOINCREMENT\b", create_sql, flags=re.I):
+                        identity_columns.append((table, column[1]))
             for index, index_sql in indexes:
                 try:
                     cursor.execute(index_sql)
@@ -79,6 +83,13 @@ def migrate(sqlite_path: Path, database_url: str, dry_run: bool) -> None:
                 if destination_count < source_count:
                     raise RuntimeError(f"row-count validation failed for {table}: source={source_count}, destination={destination_count}")
                 print(f"copied {table}: source={source_count} destination={destination_count}")
+            for table, column in identity_columns:
+                cursor.execute(
+                    sql.SQL("SELECT setval(pg_get_serial_sequence(%s, %s), COALESCE((SELECT MAX({}) FROM {}), 1), EXISTS (SELECT 1 FROM {}))").format(
+                        sql.Identifier(column), sql.Identifier(table), sql.Identifier(table)
+                    ),
+                    (table, column),
+                )
         destination.commit()
     source.close()
 
