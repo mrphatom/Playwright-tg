@@ -205,6 +205,7 @@ def bootstrap_postgres_from_sqlite(sqlite_path: str) -> bool:
             return False
         tables = source.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name").fetchall()
         indexes = source.execute("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
+        identity_columns: list[tuple[str, str]] = []
         for table, create_sql in tables:
             body = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", "BIGSERIAL PRIMARY KEY", create_sql.rstrip(';'), flags=re.I)
             body = re.sub(r"\bINTEGER\b", "BIGINT", body, flags=re.I)
@@ -214,6 +215,9 @@ def bootstrap_postgres_from_sqlite(sqlite_path: str) -> bool:
             body = re.sub(r"\bAUTOINCREMENT\b", "", body, flags=re.I)
             body = re.sub(r"^CREATE TABLE(?: IF NOT EXISTS)?\s+[^\s(]+", f"CREATE TABLE IF NOT EXISTS {ident(table)}", body, flags=re.I)
             target.execute(body)
+            for column in source.execute(f"PRAGMA table_info({ident(table)})").fetchall():
+                if int(column[5] or 0) == 1 and re.search(r"\bAUTOINCREMENT\b", create_sql, flags=re.I):
+                    identity_columns.append((table, column[1]))
         for _, index_sql in indexes:
             target.execute(index_sql)
         for table, _ in tables:
@@ -224,6 +228,15 @@ def bootstrap_postgres_from_sqlite(sqlite_path: str) -> bool:
             placeholders = ", ".join("?" for _ in columns)
             rows = source.execute(f"SELECT {names} FROM {ident(table)}")
             target.executemany(f"INSERT INTO {ident(table)} ({names}) VALUES ({placeholders})", [tuple(row) for row in rows])
+        for table, column in identity_columns:
+            target.execute(
+                """SELECT setval(
+                    pg_get_serial_sequence(%s, %s),
+                    COALESCE((SELECT MAX({column}) FROM {table}), 1),
+                    EXISTS (SELECT 1 FROM {table})
+                )""".format(column=ident(column), table=ident(table)),
+                (table, column),
+            )
         target.execute("INSERT INTO _greyai_sqlite_bootstrap (id, completed_at) VALUES (1, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING")
         target.commit()
         return True
