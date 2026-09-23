@@ -107,7 +107,18 @@ def _translate_sql(query: str) -> str:
     query = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", query, flags=re.I)
     query = re.sub(r"\bdatetime\s*\(\s*'now'\s*\)", "CURRENT_TIMESTAMP", query, flags=re.I)
     query = re.sub(r"\bdate\s*\(\s*'now'\s*\)", "CURRENT_DATE", query, flags=re.I)
-    query = re.sub(r"\bAUTOINCREMENT\b", "", query, flags=re.I)
+    if re.match(r"^CREATE\s+TABLE\b", query, flags=re.I):
+        query = re.sub(
+            r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b",
+            "BIGSERIAL PRIMARY KEY",
+            query,
+            flags=re.I,
+        )
+        query = re.sub(r"\bINTEGER\b", "BIGINT", query, flags=re.I)
+        query = re.sub(r"\bBLOB\b", "BYTEA", query, flags=re.I)
+        query = re.sub(r"\bREAL\b", "DOUBLE PRECISION", query, flags=re.I)
+        query = re.sub(r"\bDATETIME\b", "TIMESTAMPTZ", query, flags=re.I)
+        query = re.sub(r"\bAUTOINCREMENT\b", "", query, flags=re.I)
     if query.upper().startswith("INSERT INTO ") and " ON CONFLICT " not in query.upper():
         if query.rstrip().endswith(")"):
             query = query.rstrip() + " ON CONFLICT DO NOTHING"
@@ -195,11 +206,12 @@ def bootstrap_postgres_from_sqlite(sqlite_path: str) -> bool:
         tables = source.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name").fetchall()
         indexes = source.execute("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
         for table, create_sql in tables:
-            body = re.sub(r"\bAUTOINCREMENT\b", "", create_sql.rstrip(';'), flags=re.I)
+            body = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", "BIGSERIAL PRIMARY KEY", create_sql.rstrip(';'), flags=re.I)
+            body = re.sub(r"\bINTEGER\b", "BIGINT", body, flags=re.I)
             body = re.sub(r"\bBLOB\b", "BYTEA", body, flags=re.I)
             body = re.sub(r"\bREAL\b", "DOUBLE PRECISION", body, flags=re.I)
             body = re.sub(r"\bDATETIME\b", "TIMESTAMPTZ", body, flags=re.I)
-            body = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", body, flags=re.I)
+            body = re.sub(r"\bAUTOINCREMENT\b", "", body, flags=re.I)
             body = re.sub(r"^CREATE TABLE(?: IF NOT EXISTS)?\s+[^\s(]+", f"CREATE TABLE IF NOT EXISTS {ident(table)}", body, flags=re.I)
             target.execute(body)
         for _, index_sql in indexes:
