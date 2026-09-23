@@ -119,6 +119,12 @@ def _translate_sql(query: str) -> str:
         query = re.sub(r"\bREAL\b", "DOUBLE PRECISION", query, flags=re.I)
         query = re.sub(r"\bDATETIME\b", "TIMESTAMPTZ", query, flags=re.I)
         query = re.sub(r"\bAUTOINCREMENT\b", "", query, flags=re.I)
+    query = re.sub(
+        r"^(ALTER\s+TABLE\s+\S+\s+ADD\s+COLUMN)(?!\s+IF\s+NOT\s+EXISTS)\b",
+        r"\1 IF NOT EXISTS",
+        query,
+        flags=re.I,
+    )
     if query.upper().startswith("INSERT INTO ") and " ON CONFLICT " not in query.upper():
         if query.rstrip().endswith(")"):
             query = query.rstrip() + " ON CONFLICT DO NOTHING"
@@ -178,6 +184,25 @@ def using_postgres() -> bool:
     return bool(os.getenv("DATABASE_URL", "").strip())
 
 
+def repair_postgres_sequences(target: PostgresConnection) -> None:
+    """Advance serial sequences after imports or interrupted first-start repairs."""
+    rows = target.execute(
+        """SELECT table_name, column_name
+           FROM information_schema.columns
+           WHERE table_schema = 'public' AND column_default LIKE 'nextval(%'"""
+    ).fetchall()
+    for row in rows:
+        table, column = str(row[0]), str(row[1])
+        target.execute(
+            """SELECT setval(
+                pg_get_serial_sequence(%s, %s),
+                COALESCE((SELECT MAX({column}) FROM {table}), 1),
+                EXISTS (SELECT 1 FROM {table})
+            )""".format(column=ident(column), table=ident(table)),
+            (table, column),
+        )
+
+
 def connect(path: str | None = None):
     url = os.getenv("DATABASE_URL", "").strip()
     if url:
@@ -202,6 +227,8 @@ def bootstrap_postgres_from_sqlite(sqlite_path: str) -> bool:
     try:
         target.execute("CREATE TABLE IF NOT EXISTS _greyai_sqlite_bootstrap (id INTEGER PRIMARY KEY, completed_at TEXT NOT NULL)")
         if target.execute("SELECT id FROM _greyai_sqlite_bootstrap WHERE id = 1").fetchone():
+            repair_postgres_sequences(target)
+            target.commit()
             return False
         tables = source.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name").fetchall()
         indexes = source.execute("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
@@ -238,6 +265,7 @@ def bootstrap_postgres_from_sqlite(sqlite_path: str) -> bool:
                 (table, column),
             )
         target.execute("INSERT INTO _greyai_sqlite_bootstrap (id, completed_at) VALUES (1, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING")
+        repair_postgres_sequences(target)
         target.commit()
         return True
     finally:
