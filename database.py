@@ -128,6 +128,10 @@ def _translate_sql(query: str) -> str:
     if query.upper().startswith("INSERT INTO ") and " ON CONFLICT " not in query.upper():
         if query.rstrip().endswith(")"):
             query = query.rstrip() + " ON CONFLICT DO NOTHING"
+    # Psycopg treats every percent as placeholder syntax. Preserve the
+    # application's literal LIKE patterns while leaving real placeholders
+    # and already-escaped percent signs untouched.
+    query = re.sub(r"(?<!%)%(?![sbt%])", "%%", query)
     return _replace_parameters(query)
 
 
@@ -189,7 +193,7 @@ def repair_postgres_sequences(target: PostgresConnection) -> None:
     rows = target.execute(
         """SELECT table_name, column_name
            FROM information_schema.columns
-           WHERE table_schema = 'public' AND column_default LIKE 'nextval(%'"""
+           WHERE table_schema = 'public' AND column_default LIKE 'nextval(%%'"""
     ).fetchall()
     for row in rows:
         table, column = str(row[0]), str(row[1])
