@@ -23,7 +23,8 @@ def ident(value: str) -> str:
 
 def translate_create(table: str, source_sql: str) -> str:
     body = source_sql.strip().rstrip(';')
-    body = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", body, flags=re.I)
+    body = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", "BIGSERIAL PRIMARY KEY", body, flags=re.I)
+    body = re.sub(r"\bINTEGER\b", "BIGINT", body, flags=re.I)
     body = re.sub(r"\bBLOB\b", "BYTEA", body, flags=re.I)
     body = re.sub(r"\bREAL\b", "DOUBLE PRECISION", body, flags=re.I)
     body = re.sub(r"\bDATETIME\b", "TIMESTAMPTZ", body, flags=re.I)
