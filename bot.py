@@ -5747,7 +5747,9 @@ async def run_browser_task(url: str, actions: list[str], user_id: int, status_ms
 
         pipeline_res["title"] = await page.title()
         pipeline_res["screenshot"] = None
-        if screenshot_requested or not pipeline_res.get("extracted") or pipeline_res.get("action_errors"):
+        if user_settings.get("screenshots_enabled", True) and (
+            screenshot_requested or not pipeline_res.get("extracted") or pipeline_res.get("action_errors")
+        ):
             screenshot_path = f"screenshot_{uuid.uuid4().hex}.png"
             await page.mouse.wheel(delta_x=0, delta_y=600)
             await page.screenshot(path=screenshot_path, full_page=True)

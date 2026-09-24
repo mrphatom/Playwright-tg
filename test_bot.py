@@ -4115,6 +4115,140 @@ def test_successful_text_extraction_does_not_create_screenshot(monkeypatch, tmp_
     assert result["screenshot"] is None
 
 
+def test_disabled_screenshot_setting_blocks_explicit_and_diagnostic_capture(monkeypatch, tmp_path):
+    import bot
+
+    class FakeMouse:
+        async def wheel(self, **_kwargs):
+            raise AssertionError("screenshot capture should be disabled")
+
+    class FakePage:
+        url = "https://example.com/detail"
+        mouse = FakeMouse()
+
+        async def goto(self, *_args, **_kwargs):
+            return None
+
+        async def wait_for_timeout(self, *_args):
+            return None
+
+        async def title(self):
+            return "Example detail"
+
+        async def screenshot(self, *args, **kwargs):
+            raise AssertionError("screenshot capture should be disabled")
+
+        async def close(self):
+            return None
+
+    class FakeContext:
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **_kwargs):
+            return FakeContext()
+
+    class FakePool:
+        browser = FakeBrowser()
+
+    async def fake_pipeline(*_args, **_kwargs):
+        return {"extracted": [], "condition_met": False, "action_errors": ["provider_unavailable"]}
+
+    monkeypatch.setattr(bot, "pool", FakePool())
+    monkeypatch.setattr(bot, "execute_pipeline", fake_pipeline)
+    monkeypatch.setattr(bot, "build_native_grey_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bot, "get_user_settings", lambda _user_id: {
+        "persistent_login_enabled": False,
+        "auto_save_sessions_enabled": False,
+        "challenge_handoff_enabled": True,
+        "screenshots_enabled": False,
+        "advanced_navigation_enabled": True,
+    })
+    monkeypatch.chdir(tmp_path)
+
+    result = asyncio.run(bot.run_browser_task(
+        "https://example.com",
+        ["screenshot", "ai_extract:price"],
+        42,
+        screenshot_requested=True,
+    ))
+
+    assert result["screenshot"] is None
+    assert result["action_errors"] == ["provider_unavailable"]
+
+
+def test_disabled_advanced_navigation_strips_navigation_actions(monkeypatch, tmp_path):
+    import bot
+
+    class FakeMouse:
+        async def wheel(self, **_kwargs):
+            return None
+
+    class FakePage:
+        url = "https://example.com/detail"
+        mouse = FakeMouse()
+
+        async def goto(self, *_args, **_kwargs):
+            return None
+
+        async def wait_for_timeout(self, *_args):
+            return None
+
+        async def title(self):
+            return "Example detail"
+
+        async def screenshot(self, path, full_page=True):
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeContext:
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **_kwargs):
+            return FakeContext()
+
+    class FakePool:
+        browser = FakeBrowser()
+
+    seen_actions = []
+
+    async def fake_pipeline(_page, _context, actions, *_args, **_kwargs):
+        seen_actions.extend(actions)
+        return {"extracted": ["direct page"], "condition_met": False, "action_errors": []}
+
+    monkeypatch.setattr(bot, "pool", FakePool())
+    monkeypatch.setattr(bot, "execute_pipeline", fake_pipeline)
+    monkeypatch.setattr(bot, "build_native_grey_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bot, "get_user_settings", lambda _user_id: {
+        "persistent_login_enabled": False,
+        "auto_save_sessions_enabled": False,
+        "challenge_handoff_enabled": True,
+        "screenshots_enabled": True,
+        "advanced_navigation_enabled": False,
+    })
+    monkeypatch.chdir(tmp_path)
+
+    result = asyncio.run(bot.run_browser_task(
+        "https://example.com",
+        ["navigate:find the price", "search:bitcoin", "click:details", "extract:body"],
+        42,
+    ))
+
+    assert seen_actions == ["extract:body"]
+    assert "advanced_navigation_disabled" in result["action_errors"]
+
+
 def test_deterministic_download_request_requires_explicit_allowed_url(monkeypatch):
     import bot
 
