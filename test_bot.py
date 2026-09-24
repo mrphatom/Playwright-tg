@@ -5180,6 +5180,8 @@ def test_settings_keyboard_exposes_button_only_controls():
 
     assert "settings:toggle_persistent" in callbacks
     assert "settings:toggle_challenge" in callbacks
+    assert "settings:toggle_screenshots" in callbacks
+    assert "settings:toggle_navigation" in callbacks
     assert "settings:sessions" in callbacks
     assert f"session:delete:{bot._session_callback_key('example.com')}" in callbacks
     assert all(callback != "settings:toggle_autosave" for callback in callbacks)
@@ -5205,6 +5207,32 @@ def test_persistent_login_setting_updates_auto_save_as_a_pair(monkeypatch):
     assert captured == {"user_id": 42, "values": {"persistent_login_enabled": True, "auto_save_sessions_enabled": True}}
     assert updated["persistent_login_enabled"] is True
     assert updated["auto_save_sessions_enabled"] is True
+
+
+def test_capability_settings_toggle_without_commands(monkeypatch):
+    import bot
+
+    current = {
+        "persistent_login_enabled": False,
+        "auto_save_sessions_enabled": False,
+        "challenge_handoff_enabled": True,
+        "screenshots_enabled": True,
+        "advanced_navigation_enabled": True,
+    }
+    monkeypatch.setattr(bot, "get_user_settings", lambda _user_id: dict(current))
+    calls = []
+
+    def fake_set_settings(user_id, **values):
+        calls.append((user_id, values))
+        return {**current, **values}
+
+    monkeypatch.setattr(bot, "set_user_settings", fake_set_settings)
+    assert bot.toggle_screenshots_setting(42)["screenshots_enabled"] is False
+    assert bot.toggle_advanced_navigation_setting(42)["advanced_navigation_enabled"] is False
+    assert calls == [
+        (42, {"screenshots_enabled": False}),
+        (42, {"advanced_navigation_enabled": False}),
+    ]
 
 
 
@@ -6142,3 +6170,43 @@ def test_start_browser_pool_starts_dashboard_before_database_initialization(monk
         await asyncio.gather(dashboard_task, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_ai_extraction_provider_outage_returns_page_text_instead_of_failing(monkeypatch):
+    import bot
+
+    class FailingProvider:
+        async def generate_text(self, *_args, **_kwargs):
+            raise bot.TextProviderUnavailable("all configured providers exhausted")
+
+    class FakePage:
+        url = "https://example.com/article"
+
+        async def evaluate(self, _script):
+            return "Article body remains available for a non-AI fallback."
+
+    monkeypatch.setattr(bot, "gemini_configured", lambda: True)
+    monkeypatch.setattr(bot, "gemini_provider", FailingProvider())
+
+    result = asyncio.run(bot._ai_extract_current_page(FakePage(), "summarize this page", {}))
+
+    assert "provider is temporarily unavailable" in result.lower()
+    assert "Article body remains available" in result
+
+
+def test_natural_language_plan_accepts_model_screenshot_action(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot, "ALLOWED_DOMAINS", [])
+    plan = bot.normalize_natural_language_plan(
+        {
+            "mode": "check",
+            "url": "https://example.com",
+            "request": "send me a screenshot",
+            "actions": ["screenshot"],
+        }
+    )
+
+    assert plan is not None
+    assert plan["actions"] == ["screenshot"]
+    assert plan["screenshot_requested"] is True

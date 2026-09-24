@@ -162,6 +162,8 @@ def init_platform_db() -> None:
                 persistent_login_enabled INTEGER NOT NULL DEFAULT 0,
                 auto_save_sessions_enabled INTEGER NOT NULL DEFAULT 0,
                 challenge_handoff_enabled INTEGER NOT NULL DEFAULT 1,
+                screenshots_enabled INTEGER NOT NULL DEFAULT 1,
+                advanced_navigation_enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL
             );
 
@@ -567,6 +569,14 @@ def init_platform_db() -> None:
             connection.execute("ALTER TABLE ad_campaigns ADD COLUMN paused_at TEXT")
         except sqlite3.OperationalError:
             pass
+        for column, definition in (
+            ("screenshots_enabled", "INTEGER NOT NULL DEFAULT 1"),
+            ("advanced_navigation_enabled", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            try:
+                connection.execute(f"ALTER TABLE user_settings ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
         connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_telegram_id ON conversation_turns(owner_user_id, chat_id, telegram_message_id, turn_id DESC)")
         connection.commit()
 
@@ -915,17 +925,16 @@ def canonical_telegram_user_id_for_discord(discord_user_id: str) -> int | None:
 def get_user_settings(user_id: int) -> dict[str, Any]:
     """Return durable non-secret settings with safe defaults for existing users."""
     now = utc_now()
+    select_sql = """SELECT persistent_login_enabled, auto_save_sessions_enabled, challenge_handoff_enabled,
+                           screenshots_enabled, advanced_navigation_enabled
+                    FROM user_settings WHERE telegram_user_id = ?"""
     try:
         with _connect() as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO user_settings (telegram_user_id, updated_at) VALUES (?, ?)",
                 (int(user_id), now),
             )
-            row = connection.execute(
-                """SELECT persistent_login_enabled, auto_save_sessions_enabled, challenge_handoff_enabled
-                   FROM user_settings WHERE telegram_user_id = ?""",
-                (int(user_id),),
-            ).fetchone()
+            row = connection.execute(select_sql, (int(user_id),)).fetchone()
             connection.commit()
     except sqlite3.OperationalError as exc:
         if "no such table: user_settings" not in str(exc).lower():
@@ -936,22 +945,22 @@ def get_user_settings(user_id: int) -> dict[str, Any]:
                 "INSERT OR IGNORE INTO user_settings (telegram_user_id, updated_at) VALUES (?, ?)",
                 (int(user_id), now),
             )
-            row = connection.execute(
-                """SELECT persistent_login_enabled, auto_save_sessions_enabled, challenge_handoff_enabled
-                   FROM user_settings WHERE telegram_user_id = ?""",
-                (int(user_id),),
-            ).fetchone()
+            row = connection.execute(select_sql, (int(user_id),)).fetchone()
             connection.commit()
     if not row:
         return {
             "persistent_login_enabled": False,
             "auto_save_sessions_enabled": False,
             "challenge_handoff_enabled": True,
+            "screenshots_enabled": True,
+            "advanced_navigation_enabled": True,
         }
     return {
         "persistent_login_enabled": bool(row[0]),
         "auto_save_sessions_enabled": bool(row[1]),
         "challenge_handoff_enabled": bool(row[2]),
+        "screenshots_enabled": bool(row[3]),
+        "advanced_navigation_enabled": bool(row[4]),
     }
 
 
@@ -968,21 +977,30 @@ def set_user_settings(user_id: int, **values: Any) -> dict[str, bool]:
         current["auto_save_sessions_enabled"] = paired
     if "challenge_handoff_enabled" in values:
         current["challenge_handoff_enabled"] = bool(values["challenge_handoff_enabled"])
+    if "screenshots_enabled" in values:
+        current["screenshots_enabled"] = bool(values["screenshots_enabled"])
+    if "advanced_navigation_enabled" in values:
+        current["advanced_navigation_enabled"] = bool(values["advanced_navigation_enabled"])
     with _connect() as connection:
         connection.execute(
             """INSERT INTO user_settings
-               (telegram_user_id, persistent_login_enabled, auto_save_sessions_enabled, challenge_handoff_enabled, updated_at)
-               VALUES (?, ?, ?, ?, ?)
+               (telegram_user_id, persistent_login_enabled, auto_save_sessions_enabled, challenge_handoff_enabled,
+                screenshots_enabled, advanced_navigation_enabled, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(telegram_user_id) DO UPDATE SET
                  persistent_login_enabled=excluded.persistent_login_enabled,
                  auto_save_sessions_enabled=excluded.auto_save_sessions_enabled,
                  challenge_handoff_enabled=excluded.challenge_handoff_enabled,
+                 screenshots_enabled=excluded.screenshots_enabled,
+                 advanced_navigation_enabled=excluded.advanced_navigation_enabled,
                  updated_at=excluded.updated_at""",
             (
                 int(user_id),
                 int(current["persistent_login_enabled"]),
                 int(current["auto_save_sessions_enabled"]),
                 int(current["challenge_handoff_enabled"]),
+                int(current["screenshots_enabled"]),
+                int(current["advanced_navigation_enabled"]),
                 utc_now(),
             ),
         )

@@ -2106,7 +2106,7 @@ def _normalize_pipeline_actions(raw_actions: Any, mode: str) -> list[str] | None
             selector, value = payload.split("=", 1)
             if not selector.strip() or not value.strip():
                 return None
-        elif action in {"inspect"}:
+        elif action in {"inspect", "screenshot"}:
             pass
         elif action.startswith("navigate:"):
             goal = action.split(":", 1)[1].strip()
@@ -2692,7 +2692,11 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
     }
     if discovered_url:
         plan["discovered_url"] = True
-    if bool(raw_plan.get("screenshot", False)) or re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", request, flags=re.IGNORECASE):
+    if (
+        bool(raw_plan.get("screenshot", False))
+        or "screenshot" in actions
+        or re.search(r"\b(?:screenshot|screen\s*shot|screen\s*capture)\b", request, flags=re.IGNORECASE)
+    ):
         plan["screenshot_requested"] = True
     request_for_sources = str(raw_plan.get("request", ""))
     safe_sources = source_candidates_for_request(request_for_sources, url, user_id)
@@ -2739,7 +2743,7 @@ Use this shape:
   "reply": "the conversational answer when mode is chat; empty for every other mode",
   "reply_summary": "short confirmation"
 }
-Allowed actions are only: inspect, navigate:<goal>, search:<query>, click:<visible target>, type:<css_selector>=<text>, wait:<seconds from 0 to 30>, extract:<css_selector>, ai_extract:<prompt>, save_session:<name>, load_session:<name>, proxy:on, condition_contains:<text>, and condition_ai:<prompt>. Navigation actions must be read-only and use semantic targets discovered from the current page; never invent selectors, credentials, or destructive actions.
+Allowed actions are only: inspect, screenshot, navigate:<goal>, search:<query>, click:<visible target>, type:<css_selector>=<text>, wait:<seconds from 0 to 30>, extract:<css_selector>, ai_extract:<prompt>, save_session:<name>, load_session:<name>, proxy:on, condition_contains:<text>, and condition_ai:<prompt>. Navigation actions must be read-only and use semantic targets discovered from the current page; never invent selectors, credentials, or destructive actions.
 Use mode download for a user-requested artifact when the request includes either a canonical HTTPS or explicitly allowlisted `.onion` source URL, or `discover_url:true` with a clear artifact request that Grey can resolve through its approved search-source fallbacks. Never use it to bypass DRM, paywalls, CAPTCHAs, platform blocks, malware defenses, or access controls. The application applies plan gates, byte limits, rate limits, archive validation, and temporary-file cleanup before Telegram delivery.
 Use mode chat when the request is conversational and needs no external web, browser, monitoring, scheduling, management, or session action. Return {"mode":"chat","reply":"..."} and write the complete conversational answer in reply. Leave reply empty for every other mode. Use Grey’s native registry to answer capability or upgrade questions; never claim that Grey is merely Gemini.
 Use mode watch when the user asks to be told, alerted, notified, or checked until a condition happens.
@@ -5194,8 +5198,18 @@ async def _ai_extract_current_page(page, prompt: str, native_context: dict[str, 
         f"User request: {str(prompt)[:1200]}\n\n"
         f"<webpage_data>\n{str(page_text or '')[:30000]}\n</webpage_data>"
     )
-    extracted = (await gemini_provider.generate_text(query, {})) or "No information extracted."
-    return extracted.strip()[:3500]
+    try:
+        extracted = (await gemini_provider.generate_text(query, {})) or "No information extracted."
+        return extracted.strip()[:3500]
+    except TextProviderUnavailable:
+        fallback_text = re.sub(r"\s+", " ", str(page_text or "")).strip()[:3000]
+        if not fallback_text:
+            fallback_text = "The page did not expose readable text."
+        return (
+            "⚠️ The AI provider is temporarily unavailable. I’m returning the readable page text "
+            "and preserving the browser result so the task can continue.\n\n"
+            + fallback_text
+        )
 
 
 class ManualChallengeRequired(RuntimeError):
@@ -5577,6 +5591,8 @@ async def execute_pipeline(page, browser_context, actions: list[str], user_id: i
                     "title": snapshot["title"],
                     "control_count": len(snapshot["controls"]),
                 }
+            elif action == "screenshot":
+                result["screenshot_needed"] = True
             elif action.startswith("search:"):
                 await _fill_navigation_search(page, action.replace("search:", "", 1).strip())
                 await page.wait_for_timeout(250)
@@ -5661,6 +5677,14 @@ async def run_browser_task(url: str, actions: list[str], user_id: int, status_ms
     operation_id = str((native_context.get("request") or {}).get("operation_id") or "browser")[:80]
     user_settings = get_user_settings(user_id)
     effective_actions = list(actions)
+    screenshot_requested = bool(screenshot_requested and user_settings.get("screenshots_enabled", True))
+    blocked_navigation_actions = []
+    if not user_settings.get("advanced_navigation_enabled", True):
+        blocked_navigation_actions = [
+            action for action in effective_actions
+            if action == "inspect" or action.startswith(("navigate:", "search:", "click:"))
+        ]
+        effective_actions = [action for action in effective_actions if action not in blocked_navigation_actions]
     hostname = (urlparse(url).hostname or "site").removeprefix("www.")
     default_session_name = sanitize_session_name(hostname)[:80]
     if user_settings.get("persistent_login_enabled") and not any(action.startswith("load_session:") for action in effective_actions):
@@ -5714,10 +5738,16 @@ async def run_browser_task(url: str, actions: list[str], user_id: int, status_ms
         )
         pipeline_res["requested_url"] = url
         pipeline_res["final_url"] = page.url
+        if blocked_navigation_actions:
+            pipeline_res.setdefault("action_errors", []).append("advanced_navigation_disabled")
+            pipeline_res.setdefault("extracted", []).insert(
+                0,
+                "⚙️ Advanced navigation is disabled in Settings; the direct page check continued.",
+            )
 
         pipeline_res["title"] = await page.title()
         pipeline_res["screenshot"] = None
-        if screenshot_requested or not pipeline_res.get("extracted"):
+        if screenshot_requested or not pipeline_res.get("extracted") or pipeline_res.get("action_errors"):
             screenshot_path = f"screenshot_{uuid.uuid4().hex}.png"
             await page.mouse.wheel(delta_x=0, delta_y=600)
             await page.screenshot(path=screenshot_path, full_page=True)
@@ -9321,7 +9351,7 @@ async def _process_natural_language(
                         user_id,
                         title="Web extraction",
                     )
-                if plan.get("screenshot_requested") or not result.get("extracted"):
+                if plan.get("screenshot_requested") or not result.get("extracted") or result.get("action_errors"):
                     if not screenshot_path:
                         raise RuntimeError("screenshot_unavailable")
                     photo = await _input_file_from_path(screenshot_path)
@@ -9867,6 +9897,19 @@ def toggle_challenge_handoff_setting(user_id: int) -> dict[str, bool]:
     return set_user_settings(user_id, challenge_handoff_enabled=not current.get("challenge_handoff_enabled", True))
 
 
+def toggle_screenshots_setting(user_id: int) -> dict[str, bool]:
+    current = get_user_settings(user_id)
+    return set_user_settings(user_id, screenshots_enabled=not current.get("screenshots_enabled", True))
+
+
+def toggle_advanced_navigation_setting(user_id: int) -> dict[str, bool]:
+    current = get_user_settings(user_id)
+    return set_user_settings(
+        user_id,
+        advanced_navigation_enabled=not current.get("advanced_navigation_enabled", True),
+    )
+
+
 def _session_callback_key(name: str) -> str:
     safe = sanitize_session_name(name)
     return safe if len(safe) <= 45 else hashlib.sha256(safe.encode("utf-8")).hexdigest()[:16]
@@ -9875,6 +9918,8 @@ def _session_callback_key(name: str) -> str:
 def settings_text(settings: dict[str, Any], session_names: list[str], active_handoffs: int = 0) -> str:
     persistent = "ON" if settings.get("persistent_login_enabled") else "OFF"
     challenge = "ON" if settings.get("challenge_handoff_enabled", True) else "OFF"
+    screenshots = "ON" if settings.get("screenshots_enabled", True) else "OFF"
+    navigation = "ON" if settings.get("advanced_navigation_enabled", True) else "OFF"
     lines = [
         "<b>GreyAI settings</b>",
         "Settings are saved to your account. Use the buttons below; no settings action requires a command.",
@@ -9885,6 +9930,12 @@ def settings_text(settings: dict[str, Any], session_names: list[str], active_han
         f"<b>Manual browser handoff:</b> {challenge}",
         "When enabled, GreyAI pauses for CAPTCHA/MFA/security checks by default, and you can also request a handoff manually for testing or an authorized interaction. GreyAI never solves or bypasses site challenges.",
         "",
+        f"<b>Screenshot delivery:</b> {screenshots}",
+        "When enabled, GreyAI can send a current-page screenshot when you ask for one, and can include a diagnostic screenshot after a partial browser-action failure.",
+        "",
+        f"<b>Advanced navigation:</b> {navigation}",
+        "Controls semantic search, read-only link selection, multi-step page navigation, and page inspection. Disabling it keeps simple direct checks available.",
+        "",
         f"<b>Saved encrypted sessions:</b> {len(session_names)}",
         f"<b>Active manual handoffs:</b> {active_handoffs}",
     ]
@@ -9894,9 +9945,13 @@ def settings_text(settings: dict[str, Any], session_names: list[str], active_han
 def settings_keyboard(settings: dict[str, Any], session_names: list[str]) -> InlineKeyboardMarkup:
     persistent = "✅ Persistent login + auto-save: ON" if settings.get("persistent_login_enabled") else "⚪ Persistent login + auto-save: OFF"
     challenge = "✅ Manual browser handoff: ON" if settings.get("challenge_handoff_enabled", True) else "⚪ Manual browser handoff: OFF"
+    screenshots = "✅ Screenshot delivery: ON" if settings.get("screenshots_enabled", True) else "⚪ Screenshot delivery: OFF"
+    navigation = "✅ Advanced navigation: ON" if settings.get("advanced_navigation_enabled", True) else "⚪ Advanced navigation: OFF"
     rows = [
         [InlineKeyboardButton(persistent, callback_data="settings:toggle_persistent")],
         [InlineKeyboardButton(challenge, callback_data="settings:toggle_challenge")],
+        [InlineKeyboardButton(screenshots, callback_data="settings:toggle_screenshots")],
+        [InlineKeyboardButton(navigation, callback_data="settings:toggle_navigation")],
         [InlineKeyboardButton("🔐 Manage saved sessions", callback_data="settings:sessions")],
         [InlineKeyboardButton("🛑 Cancel my active handoffs", callback_data="settings:cancel_handoffs")],
     ]
@@ -9935,6 +9990,12 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "settings:toggle_challenge":
         settings = toggle_challenge_handoff_setting(user_id)
         await query.answer("Manual challenge handoff setting updated.")
+    elif data == "settings:toggle_screenshots":
+        settings = toggle_screenshots_setting(user_id)
+        await query.answer("Screenshot delivery setting updated.")
+    elif data == "settings:toggle_navigation":
+        settings = toggle_advanced_navigation_setting(user_id)
+        await query.answer("Advanced navigation setting updated.")
     elif data == "settings:cancel_handoffs":
         tokens = [token for token, record in manual_challenges.items() if int(record.get("user_id", -1)) == user_id]
         for token in tokens:
