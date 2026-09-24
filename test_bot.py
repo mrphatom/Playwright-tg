@@ -6107,9 +6107,38 @@ def test_natural_language_landing_page_request_delivers_zip(monkeypatch):
 
 def test_natural_language_update_deduplication_is_transport_scoped():
     import bot
-
     bot.recent_natural_language_updates.clear()
     assert bot.claim_natural_language_update(SimpleNamespace(update_id=1001)) is True
     assert bot.claim_natural_language_update(SimpleNamespace(update_id=1001)) is False
     assert bot.claim_natural_language_update(SimpleNamespace(update_id=1002)) is True
     assert bot.claim_natural_language_update(SimpleNamespace()) is True
+
+
+def test_start_browser_pool_starts_dashboard_before_database_initialization(monkeypatch):
+    import bot
+
+    class FakeApplication:
+        bot_data = {}
+
+    dashboard_started = asyncio.Event()
+
+    async def fake_dashboard():
+        dashboard_started.set()
+        await asyncio.Event().wait()
+
+    def failing_init_db():
+        raise RuntimeError("Neon initialization failed")
+
+    monkeypatch.setattr(bot, "serve_dashboard", fake_dashboard)
+    monkeypatch.setattr(bot, "init_db", failing_init_db)
+
+    async def scenario():
+        application = FakeApplication()
+        with pytest.raises(RuntimeError, match="Neon initialization failed"):
+            await bot.start_browser_pool(application)
+        dashboard_task = application.bot_data["dashboard_task"]
+        await asyncio.wait_for(dashboard_started.wait(), timeout=1)
+        dashboard_task.cancel()
+        await asyncio.gather(dashboard_task, return_exceptions=True)
+
+    asyncio.run(scenario())

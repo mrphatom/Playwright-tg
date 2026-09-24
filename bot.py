@@ -4373,9 +4373,28 @@ def rate_limited(func):
 # ==========================================
 # BROWSER & AI INTEGRATIONS
 # ==========================================
+def _log_dashboard_task_failure(task: asyncio.Task) -> None:
+    """Surface dashboard task failures instead of leaving an unobserved task exception."""
+    if task.cancelled():
+        logger.info("dashboard_task_cancelled")
+        return
+    try:
+        exception = task.exception()
+    except asyncio.CancelledError:
+        logger.info("dashboard_task_cancelled")
+        return
+    if exception is not None:
+        logger.error(
+            "dashboard_task_failed",
+            exc_info=(type(exception), exception, exception.__traceback__),
+        )
+
+
 async def start_browser_pool(application: Application):
+    dashboard_task = asyncio.create_task(serve_dashboard(), name="greyai-dashboard")
+    dashboard_task.add_done_callback(_log_dashboard_task_failure)
+    application.bot_data["dashboard_task"] = dashboard_task
     init_db()
-    application.bot_data["dashboard_task"] = asyncio.create_task(serve_dashboard())
     logger.info("Initializing Global Browser Pool...")
     pool.playwright = await async_playwright().start()
     pool.browser = await pool.playwright.chromium.launch(
