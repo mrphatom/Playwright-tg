@@ -31,6 +31,7 @@ from control_plane import (
     get_discord_pairing_for_telegram,
     get_latest_runtime_snapshot,
     get_maintenance_state,
+    get_operation,
     get_platform_identity,
     get_queue_stats,
     get_referral_stats,
@@ -41,6 +42,7 @@ from control_plane import (
     list_appeals,
     list_maintenance_events,
     list_operations,
+    list_operation_events,
     list_referrals,
     list_reports,
     list_session_metadata,
@@ -54,6 +56,7 @@ from control_plane import (
     revoke_dashboard_session,
     search_users,
     set_user_status,
+    transition_operation,
 )
 
 SESSION_COOKIE = "greyai_session"
@@ -243,6 +246,43 @@ async def operations_handler(request: web.Request):
     _, user = _require_session(request)
     user_id = None if is_admin(user["telegram_user_id"]) and request.query.get("scope") == "all" else user["telegram_user_id"]
     return web.json_response({"operations": _json_rows(list_operations(user_id, 100)), "sessions": _json_rows(list_session_metadata(user_id, 100))})
+
+
+async def operation_detail_handler(request: web.Request):
+    _, user = _require_session(request)
+    operation_id = request.match_info["operation_id"]
+    owner_id = None if is_admin(user["telegram_user_id"]) and request.query.get("scope") == "all" else user["telegram_user_id"]
+    operation = get_operation(operation_id, owner_id)
+    if not operation:
+        raise web.HTTPNotFound(text=json.dumps({"error": "operation_not_found"}), content_type="application/json")
+    return web.json_response({"operation": dict(operation), "events": _json_rows(list_operation_events(operation_id, owner_id, 200))})
+
+
+async def operation_events_handler(request: web.Request):
+    _, user = _require_session(request)
+    operation_id = request.match_info["operation_id"]
+    owner_id = None if is_admin(user["telegram_user_id"]) and request.query.get("scope") == "all" else user["telegram_user_id"]
+    if not get_operation(operation_id, owner_id):
+        raise web.HTTPNotFound(text=json.dumps({"error": "operation_not_found"}), content_type="application/json")
+    return web.json_response({"events": _json_rows(list_operation_events(operation_id, owner_id, _bounded_query_limit(request, 100, 200)))})
+
+
+async def operation_mutation_handler(request: web.Request):
+    session, user = _require_session(request)
+    _require_csrf(request, session)
+    operation_id = request.match_info["operation_id"]
+    operation = get_operation(operation_id, user["telegram_user_id"])
+    if not operation:
+        raise web.HTTPNotFound(text=json.dumps({"error": "operation_not_found"}), content_type="application/json")
+    action = request.match_info["action"]
+    target = {"pause": "paused", "resume": "running", "cancel": "cancelled", "retry": "retrying"}.get(action)
+    if not target:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "unsupported_operation_action"}), content_type="application/json")
+    changed = transition_operation(operation_id, target, user_id=user["telegram_user_id"], message=f"User requested {action}")
+    if not changed:
+        raise web.HTTPConflict(text=json.dumps({"error": "invalid_operation_transition", "status": operation["status"], "action": action}), content_type="application/json")
+    updated = get_operation(operation_id, user["telegram_user_id"])
+    return web.json_response({"operation": dict(updated), "action": action})
 
 
 def public_status_payload() -> dict[str, Any]:
@@ -749,6 +789,9 @@ def create_dashboard_app() -> web.Application:
         web.delete("/api/v1/keys/{key_id}", developer_key_revoke_handler),
         web.get("/api/v1/developer/stats", developer_stats_handler),
         web.get("/api/operations", operations_handler),
+        web.get("/api/operations/{operation_id}", operation_detail_handler),
+        web.get("/api/operations/{operation_id}/events", operation_events_handler),
+        web.post("/api/operations/{operation_id}/{action}", operation_mutation_handler),
         web.get("/api/referrals", referrals_handler),
         web.get("/api/admin/users", admin_users_handler),
         web.get("/api/admin/referrals", admin_referrals_handler),

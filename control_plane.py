@@ -288,6 +288,19 @@ def init_platform_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_operations_user_time ON operations(telegram_user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status);
 
+            CREATE TABLE IF NOT EXISTS operation_events (
+                event_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                status TEXT,
+                message TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_operation_events_operation_time ON operation_events(operation_id, created_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_operation_events_user_time ON operation_events(user_id, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS download_jobs (
                 job_id TEXT PRIMARY KEY,
                 operation_id TEXT NOT NULL UNIQUE,
@@ -1599,6 +1612,10 @@ def create_operation(operation_id: str, user_id: int, chat_id: int | None, kind:
             "INSERT INTO operations (operation_id, telegram_user_id, chat_id, kind, status, target_url, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
             (operation_id, user_id, chat_id, kind, target_url, json.dumps(metadata or {}, separators=(",", ":")), now, now),
         )
+        connection.execute(
+            "INSERT INTO operation_events (event_id, operation_id, user_id, event_type, status, message, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("opev_" + secrets.token_urlsafe(8), str(operation_id)[:100], int(user_id), "created", "queued", "Operation created", "{}", now),
+        )
         connection.commit()
 
 
@@ -1650,6 +1667,67 @@ def update_operation(operation_id: str, status: str, attempt_count: int | None =
             cursor = connection.execute("UPDATE operations SET status = ?, attempt_count = ?, updated_at = ? WHERE operation_id = ?", (status, attempt_count, utc_now(), operation_id))
         connection.commit()
         return cursor.rowcount == 1
+
+
+OPERATION_STATUSES = {"queued", "running", "paused", "retrying", "succeeded", "failed", "cancelled", "rejected"}
+OPERATION_TRANSITIONS = {
+    "queued": {"running", "paused", "cancelled", "rejected"},
+    "running": {"paused", "succeeded", "failed", "cancelled"},
+    "paused": {"running", "cancelled"},
+    "retrying": {"queued", "running", "failed", "cancelled"},
+    "failed": {"retrying", "cancelled"},
+    "cancelled": {"retrying"},
+    "succeeded": {"retrying"},
+    "rejected": {"retrying"},
+}
+
+
+def get_operation(operation_id: str, user_id: int | None = None) -> sqlite3.Row | None:
+    """Return one operation, optionally enforcing owner scope."""
+    with _connect() as connection:
+        query = "SELECT operation_id, telegram_user_id, chat_id, kind, status, target_url, metadata_json, attempt_count, created_at, updated_at FROM operations WHERE operation_id = ?"
+        params: tuple[Any, ...] = (str(operation_id)[:100],)
+        if user_id is not None:
+            query += " AND telegram_user_id = ?"
+            params += (int(user_id),)
+        return connection.execute(query, params).fetchone()
+
+
+def transition_operation(operation_id: str, new_status: str, *, user_id: int | None = None, message: str = "", metadata: dict[str, Any] | None = None, attempt_count: int | None = None) -> bool:
+    """Apply a validated operation transition and write a timeline event atomically."""
+    clean_id = str(operation_id)[:100]
+    clean_status = str(new_status or "").strip().lower()
+    if clean_status not in OPERATION_STATUSES:
+        raise ValueError("invalid operation status")
+    with _connect() as connection:
+        row = connection.execute("SELECT telegram_user_id, status, attempt_count FROM operations WHERE operation_id = ?", (clean_id,)).fetchone()
+        if not row or (user_id is not None and int(row["telegram_user_id"]) != int(user_id)):
+            return False
+        current = str(row["status"] or "queued")
+        if current == clean_status:
+            return True
+        if clean_status not in OPERATION_TRANSITIONS.get(current, set()):
+            return False
+        now = utc_now()
+        next_attempt = int(attempt_count if attempt_count is not None else row["attempt_count"] or 0)
+        connection.execute("UPDATE operations SET status = ?, attempt_count = ?, updated_at = ? WHERE operation_id = ?", (clean_status, next_attempt, now, clean_id))
+        connection.execute(
+            "INSERT INTO operation_events (event_id, operation_id, user_id, event_type, status, message, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("opev_" + secrets.token_urlsafe(8), clean_id, int(row["telegram_user_id"]), "status_changed", clean_status, str(message or "")[:500], json.dumps(metadata or {}, separators=(",", ":"), default=str)[:4000], now),
+        )
+        connection.commit()
+        return True
+
+
+def list_operation_events(operation_id: str, user_id: int | None = None, limit: int = 100) -> list[sqlite3.Row]:
+    with _connect() as connection:
+        owner = connection.execute("SELECT telegram_user_id FROM operations WHERE operation_id = ?", (str(operation_id)[:100],)).fetchone()
+        if not owner or (user_id is not None and int(owner["telegram_user_id"]) != int(user_id)):
+            return []
+        return connection.execute(
+            "SELECT event_id, operation_id, user_id, event_type, status, message, metadata_json, created_at FROM operation_events WHERE operation_id = ? ORDER BY created_at ASC LIMIT ?",
+            (str(operation_id)[:100], max(1, min(int(limit), 500))),
+        ).fetchall()
 
 
 def list_session_metadata(user_id: int | None = None, limit: int = 100) -> list[sqlite3.Row]:

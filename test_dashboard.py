@@ -73,6 +73,13 @@ def test_dashboard_registers_developer_and_integration_routes(dashboard_db):
     assert "/api/connections/discord/revoke" in paths
 
 
+def test_dashboard_registers_task_control_routes(dashboard_db):
+    paths = {resource.canonical for resource in dashboard.create_dashboard_app().router.resources()}
+    assert "/api/operations/{operation_id}" in paths
+    assert "/api/operations/{operation_id}/events" in paths
+    assert "/api/operations/{operation_id}/{action}" in paths
+
+
 def test_dashboard_connections_handler_redacts_tokens_and_returns_owner_pairing(monkeypatch):
     import asyncio
     import json

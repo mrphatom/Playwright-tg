@@ -298,6 +298,27 @@ def test_legacy_user_settings_table_receives_capability_columns(tmp_path, monkey
     assert settings["advanced_navigation_enabled"] is True
 
 
+def test_operation_lifecycle_is_owner_scoped_idempotent_and_evented(platform_db):
+    cp.ensure_user(42)
+    cp.ensure_user(43)
+    cp.create_operation("op_lifecycle", 42, 42, "check", "https://example.com")
+
+    assert cp.get_operation("op_lifecycle", 43) is None
+    assert cp.transition_operation("op_lifecycle", "running", user_id=43) is False
+    assert cp.transition_operation("op_lifecycle", "running", user_id=42, message="Started") is True
+    assert cp.transition_operation("op_lifecycle", "running", user_id=42) is True
+    assert cp.transition_operation("op_lifecycle", "paused", user_id=42, message="Paused by user") is True
+    assert cp.transition_operation("op_lifecycle", "succeeded", user_id=42) is False
+    assert cp.transition_operation("op_lifecycle", "running", user_id=42) is True
+    assert cp.transition_operation("op_lifecycle", "succeeded", user_id=42) is True
+
+    operation = cp.get_operation("op_lifecycle", 42)
+    assert operation["status"] == "succeeded"
+    events = cp.list_operation_events("op_lifecycle", 42)
+    assert [event["status"] for event in events] == ["queued", "running", "paused", "running", "succeeded"]
+    assert cp.list_operation_events("op_lifecycle", 43) == []
+
+
 def test_developer_request_is_idempotent_and_admin_reviewable(platform_db):
     cp.ensure_user(42)
     first_id, first_created = cp.create_developer_access_request(42, "I need a scoped check API for my Telegram bot")
