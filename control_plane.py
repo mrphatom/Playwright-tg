@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
-from database import connect as db_connect
+from database import connect as db_connect, ident, using_postgres
 
 ROLE_USER = "user"
 ROLE_DEVELOPER = "developer"
@@ -58,6 +58,21 @@ def public_mode() -> bool:
 
 def _connect() -> sqlite3.Connection:
     return db_connect(db_path())
+
+
+def _add_column_if_missing(connection, table: str, column: str, definition: str) -> None:
+    """Add a column on both SQLite and PostgreSQL without hiding real errors."""
+    table_sql = ident(table) if using_postgres() else table
+    column_sql = ident(column) if using_postgres() else column
+    statement = f"ALTER TABLE {table_sql} ADD COLUMN {column_sql} {definition}"
+    if using_postgres():
+        connection.execute(statement.replace("ADD COLUMN ", "ADD COLUMN IF NOT EXISTS ", 1))
+        return
+    try:
+        connection.execute(statement)
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
 
 
 def init_platform_db() -> None:
@@ -547,36 +562,30 @@ def init_platform_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_referral_rewards_recipient ON referral_rewards(recipient_user_id, created_at DESC);
             """
         )
+        for column, definition in (
+            ("session_secret", "TEXT"),
+        ):
+            _add_column_if_missing(connection, "dashboard_login_tokens", column, definition)
+        for column, definition in (
+            ("telegram_message_id", "INTEGER"),
+        ):
+            _add_column_if_missing(connection, "conversation_turns", column, definition)
+        for column, definition in (
+            ("pause_reason", "TEXT"),
+            ("paused_at", "TEXT"),
+        ):
+            _add_column_if_missing(connection, "ad_campaigns", column, definition)
+        for column, definition in (
+            ("screenshots_enabled", "INTEGER NOT NULL DEFAULT 1"),
+            ("advanced_navigation_enabled", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            _add_column_if_missing(connection, "user_settings", column, definition)
         _migrate_users_role_constraint(connection)
         _migrate_account_pairing_constraints(connection)
         connection.execute(
             "INSERT OR IGNORE INTO maintenance_state (singleton_id, mode, message, reason, updated_at) VALUES (1, 'operational', '', '', ?)",
             (utc_now(),),
         )
-        try:
-            connection.execute("ALTER TABLE dashboard_login_tokens ADD COLUMN session_secret TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            connection.execute("ALTER TABLE conversation_turns ADD COLUMN telegram_message_id INTEGER")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            connection.execute("ALTER TABLE ad_campaigns ADD COLUMN pause_reason TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            connection.execute("ALTER TABLE ad_campaigns ADD COLUMN paused_at TEXT")
-        except sqlite3.OperationalError:
-            pass
-        for column, definition in (
-            ("screenshots_enabled", "INTEGER NOT NULL DEFAULT 1"),
-            ("advanced_navigation_enabled", "INTEGER NOT NULL DEFAULT 1"),
-        ):
-            try:
-                connection.execute(f"ALTER TABLE user_settings ADD COLUMN {column} {definition}")
-            except sqlite3.OperationalError:
-                pass
         connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_telegram_id ON conversation_turns(owner_user_id, chat_id, telegram_message_id, turn_id DESC)")
         connection.commit()
 
@@ -590,39 +599,60 @@ def _migrate_account_pairing_constraints(connection: sqlite3.Connection) -> None
     table-level UNIQUE constraint, which made the second revoke fail with an
     IntegrityError. The rebuild is idempotent and preserves every row.
     """
-    row = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'account_pairings'"
-    ).fetchone()
-    schema = (row[0] if row else "").lower()
-    has_legacy_unique = "unique(telegram_user_id, status)" in schema or "unique(discord_user_id, status)" in schema
+    if using_postgres():
+        constraints = connection.execute(
+            """SELECT conname, pg_get_constraintdef(oid)
+               FROM pg_constraint
+               WHERE conrelid = to_regclass('public.account_pairings')
+                 AND contype = 'u'"""
+        ).fetchall()
+        has_legacy_unique = any(
+            "telegram_user_id, status" in str(row[1]).lower()
+            or "discord_user_id, status" in str(row[1]).lower()
+            for row in constraints
+        )
+        if has_legacy_unique:
+            for row in constraints:
+                definition = str(row[1]).lower()
+                if "telegram_user_id, status" in definition or "discord_user_id, status" in definition:
+                    connection.execute(f"ALTER TABLE account_pairings DROP CONSTRAINT {ident(str(row[0]))}")
+    else:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'account_pairings'"
+        ).fetchone()
+        schema = (row[0] if row else "").lower()
+        has_legacy_unique = "unique(telegram_user_id, status)" in schema or "unique(discord_user_id, status)" in schema
     if has_legacy_unique:
-        connection.execute("PRAGMA foreign_keys = OFF")
-        try:
-            connection.execute("BEGIN")
-            connection.execute(
-                """
-                CREATE TABLE account_pairings_migrating (
-                    pairing_id TEXT PRIMARY KEY,
-                    telegram_user_id INTEGER NOT NULL,
-                    discord_user_id TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
-                    created_at TEXT NOT NULL,
-                    last_confirmed_at TEXT NOT NULL,
-                    revoked_at TEXT
+        if using_postgres():
+            has_legacy_unique = False
+        else:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            try:
+                connection.execute("BEGIN")
+                connection.execute(
+                    """
+                    CREATE TABLE account_pairings_migrating (
+                        pairing_id TEXT PRIMARY KEY,
+                        telegram_user_id INTEGER NOT NULL,
+                        discord_user_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+                        created_at TEXT NOT NULL,
+                        last_confirmed_at TEXT NOT NULL,
+                        revoked_at TEXT
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                "INSERT INTO account_pairings_migrating SELECT pairing_id, telegram_user_id, discord_user_id, status, created_at, last_confirmed_at, revoked_at FROM account_pairings"
-            )
-            connection.execute("DROP TABLE account_pairings")
-            connection.execute("ALTER TABLE account_pairings_migrating RENAME TO account_pairings")
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute(
+                    "INSERT INTO account_pairings_migrating SELECT pairing_id, telegram_user_id, discord_user_id, status, created_at, last_confirmed_at, revoked_at FROM account_pairings"
+                )
+                connection.execute("DROP TABLE account_pairings")
+                connection.execute("ALTER TABLE account_pairings_migrating RENAME TO account_pairings")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.execute("PRAGMA foreign_keys = ON")
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_account_pairings_active_telegram ON account_pairings(telegram_user_id) WHERE status = 'active'"
     )
@@ -635,6 +665,22 @@ def _migrate_account_pairing_constraints(connection: sqlite3.Connection) -> None
 
 def _migrate_users_role_constraint(connection: sqlite3.Connection) -> None:
     """Expand the legacy users CHECK constraint without discarding existing rows."""
+    if using_postgres():
+        constraints = connection.execute(
+            """SELECT conname, pg_get_constraintdef(oid)
+               FROM pg_constraint
+               WHERE conrelid = to_regclass('public.users')
+                 AND contype = 'c'"""
+        ).fetchall()
+        if any("'developer'" in str(row[1]).lower() for row in constraints):
+            return
+        for row in constraints:
+            if "role" in str(row[1]).lower():
+                connection.execute(f"ALTER TABLE users DROP CONSTRAINT {ident(str(row[0]))}")
+        connection.execute(
+            "ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('user', 'developer', 'admin'))"
+        )
+        return
     row = connection.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'").fetchone()
     schema = (row[0] if row else "").lower()
     if "'developer'" in schema:

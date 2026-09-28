@@ -273,6 +273,31 @@ def test_legacy_users_table_migrates_to_include_developer_role(tmp_path, monkeyp
     assert cp.get_user(42)["quota_limit"] == cp.developer_quota_limit()
 
 
+def test_legacy_user_settings_table_receives_capability_columns(tmp_path, monkeypatch):
+    path = tmp_path / "legacy-settings.db"
+    monkeypatch.setenv("DB_PATH", str(path))
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE user_settings (
+                telegram_user_id INTEGER PRIMARY KEY,
+                persistent_login_enabled INTEGER NOT NULL DEFAULT 0,
+                auto_save_sessions_enabled INTEGER NOT NULL DEFAULT 0,
+                challenge_handoff_enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        connection.commit()
+
+    cp.init_platform_db()
+
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(user_settings)")}
+    assert {"screenshots_enabled", "advanced_navigation_enabled"} <= columns
+    settings = cp.get_user_settings(42)
+    assert settings["screenshots_enabled"] is True
+    assert settings["advanced_navigation_enabled"] is True
+
+
 def test_developer_request_is_idempotent_and_admin_reviewable(platform_db):
     cp.ensure_user(42)
     first_id, first_created = cp.create_developer_access_request(42, "I need a scoped check API for my Telegram bot")
