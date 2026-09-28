@@ -158,6 +158,10 @@ def test_dashboard_client_has_bounded_bootstrap_and_recovery_states():
     assert "Connections" in dashboard.HTML
     assert "Disconnect Discord" in dashboard.HTML
     assert "/api/connections" in dashboard.HTML
+    assert "operation-details" in dashboard.HTML
+    assert "operation-action" in dashboard.HTML
+    assert "showOperation" in dashboard.HTML
+    assert "mutateOperation" in dashboard.HTML
 
 
 def test_dashboard_uses_structured_responsive_surfaces_instead_of_raw_json():
