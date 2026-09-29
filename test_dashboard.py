@@ -190,6 +190,15 @@ def test_dashboard_uses_structured_responsive_surfaces_instead_of_raw_json():
     assert "JSON.stringify(k.keys" not in dashboard.HTML
 
 
+def test_dashboard_mobile_redesign_has_stacked_tasks_and_drawer_controls():
+    assert "@media(max-width:760px)" in dashboard.HTML
+    assert "td:before{content:attr(data-label)" in dashboard.HTML
+    assert 'data-label="Status"' in dashboard.HTML
+    assert "window.matchMedia('(max-width:760px)').matches" in dashboard.HTML
+    assert "event.key==='Escape'" in dashboard.HTML
+    assert "Close navigation" in dashboard.HTML
+
+
 def test_public_developer_api_contract_is_machine_readable(dashboard_db):
     response = dashboard.developer_api_docs()
     assert response["base_url"].endswith("playwright-tg-mrphatom.fly.dev")
