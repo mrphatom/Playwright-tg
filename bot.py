@@ -97,6 +97,7 @@ from control_plane import (
     get_developer_stats,
     get_last_download_job_at,
     get_maintenance_state,
+    get_operation,
     get_or_create_referral_code,
     get_payment_order_by_external_id,
     get_platform_activity_summary,
@@ -122,6 +123,7 @@ from control_plane import (
     list_pending_notifications,
     list_queue_entries,
     list_referrals,
+    list_resumable_operations,
     list_reports,
     list_users_by_role,
     list_users_by_status,
@@ -157,8 +159,10 @@ from control_plane import (
     update_ad_campaign_next_run,
     update_bulk_job_counts,
     update_maintenance_recovery_progress,
+    update_operation_metadata,
     update_operation,
     update_queue_entry,
+    transition_operation,
 )
 from control_plane import (
     list_contact_logs as load_contact_logs,
@@ -2690,6 +2694,12 @@ def normalize_natural_language_plan(raw_plan: Any, user_id: int | None = None) -
         "condition_type": condition_type,
         "interval_seconds": interval_seconds,
     }
+    if "approval_mode" in raw_plan:
+        approval_mode = str(raw_plan.get("approval_mode", "auto") or "auto").strip().lower()
+        if approval_mode not in {"auto", "preview", "confirm"}:
+            approval_mode = "auto"
+        plan["approval_mode"] = approval_mode
+        plan["requires_confirmation"] = approval_mode in {"preview", "confirm"}
     if discovered_url:
         plan["discovered_url"] = True
     if (
@@ -2728,6 +2738,7 @@ Use this shape:
   "condition_type": "ai" | "contains",
   "interval_seconds": integer,
   "actions": ["allowlisted browser pipeline actions"],
+  "approval_mode": "auto" | "preview" | "confirm",
   "schedule_time": "HH:MM for a schedule",
   "timezone": "IANA timezone for a schedule",
   "days": "daily, weekdays, weekends, or comma-separated weekday names",
@@ -4516,6 +4527,7 @@ async def run_browser_task_with_retry(url: str, actions: list[str], user_id: int
         browser_work = None
         try:
             update_operation(operation_id, "running", attempt)
+            update_operation_metadata(operation_id, {"step": "browser", "attempt": attempt}, user_id=user_id)
             runtime_metrics["browser_tasks_total"] += 1
             logger.info("browser_task_start operation_id=%s attempt=%s", operation_id, attempt)
             task_kwargs = {"screenshot_requested": True} if screenshot_requested else {}
@@ -4548,9 +4560,11 @@ async def run_browser_task_with_retry(url: str, actions: list[str], user_id: int
             raise
         except ManualChallengeRequired:
             update_operation(operation_id, "paused", attempt)
+            update_operation_metadata(operation_id, {"step": "manual_handoff", "attempt": attempt}, user_id=user_id)
             raise
         except Exception as exc:
             last_error = exc
+            update_operation_metadata(operation_id, {"step": "retrying", "attempt": attempt, "last_error_type": type(exc).__name__}, user_id=user_id)
             logger.warning(
                 "browser_task_failure operation_id=%s attempt=%s error_type=%s",
                 operation_id,
@@ -4954,6 +4968,7 @@ async def post_init(application: Application):
     else:
         restore_operational_mode_after_audit()
     await start_queue_dispatcher(application)
+    recover_interrupted_operations()
     if NOTIFICATION_WORKER_ENABLED:
         notification_worker_task = asyncio.create_task(notification_worker(application.bot))
         application.bot_data["notification_worker_task"] = notification_worker_task
@@ -8461,6 +8476,8 @@ async def _process_natural_language(
     context: ContextTypes.DEFAULT_TYPE,
     request_text_override: str | None = None,
     user_id_override: int | None = None,
+    approved_plan_override: dict[str, Any] | None = None,
+    operation_id_override: str | None = None,
     public_context: bool = False,
     shared_context: bool = False,
 ):
@@ -8474,6 +8491,7 @@ async def _process_natural_language(
     request_text = str(request_text_override if request_text_override is not None else (source_message.text or source_message.caption or "")).strip()
     if not request_text:
         return
+    approved_execution = bool(approved_plan_override and operation_id_override)
 
     user_id = user_id_override if user_id_override is not None else (update.effective_user.id if update.effective_user else None)
     chat_id = update.effective_chat.id if update.effective_chat else source_message.chat_id
@@ -8495,7 +8513,7 @@ async def _process_natural_language(
         {"private_chat": bool(update.effective_chat and getattr(update.effective_chat, "type", "private") == "private")},
     )
 
-    contextual_reply = resolve_contextual_watcher_followup(chat_id, request_text, owner_user_id=user_id)
+    contextual_reply = None if approved_execution else resolve_contextual_watcher_followup(chat_id, request_text, owner_user_id=user_id)
     if contextual_reply:
         sent_reply = await deliver_text_response(source_message, contextual_reply, user_id, title="GreyAI watcher context")
         remember_chat_turn(
@@ -8515,7 +8533,7 @@ async def _process_natural_language(
 
     # Keep obvious private social turns low-latency, but send every other message through
     # the same validated interpreter before choosing chat or Agentic execution.
-    if private_chat:
+    if private_chat and not approved_execution:
         micro_reply = private_chat_micro_reply(request_text)
         if micro_reply:
             sent_reply = await deliver_text_response(source_message, micro_reply, user_id, title="GreyAI chat")
@@ -8533,7 +8551,7 @@ async def _process_natural_language(
             return
 
     route_hint = classify_message_route(request_text)
-    if private_chat and is_standalone_private_social_turn(request_text):
+    if private_chat and not approved_execution and is_standalone_private_social_turn(request_text):
         reply = await generate_chat_reply(
             chat_id,
             request_text,
@@ -8570,16 +8588,19 @@ async def _process_natural_language(
         business_connection_id=business_connection_id,
     )
     try:
-        parser_kwargs = {"reply_context": reply_context} if reply_context else {}
-        plan = await parse_natural_language_intent(
-            request_text,
-            None if shared_context else active_session_by_chat.get(_session_state_key(user_id, chat_id)),
-            chat_history=chat_history,
-            private_chat=private_chat,
-            user_id=user_id,
-            native_context=native_context,
-            **parser_kwargs,
-        )
+        if approved_execution:
+            plan = approved_plan_override
+        else:
+            parser_kwargs = {"reply_context": reply_context} if reply_context else {}
+            plan = await parse_natural_language_intent(
+                request_text,
+                None if shared_context else active_session_by_chat.get(_session_state_key(user_id, chat_id)),
+                chat_history=chat_history,
+                private_chat=private_chat,
+                user_id=user_id,
+                native_context=native_context,
+                **parser_kwargs,
+            )
     except TextProviderUnavailable:
         # The deterministic route hint still prevents an obvious task from falling
         # into a misleading chat disclaimer when the interpretation provider is down.
@@ -8591,7 +8612,7 @@ async def _process_natural_language(
         except asyncio.CancelledError:
             pass
 
-    route = decide_message_route(request_text, plan, route_hint, reply_context)
+    route = "task" if approved_execution else decide_message_route(request_text, plan, route_hint, reply_context)
     if route == "task":
         runtime_metrics["agent_handoffs"] += 1
     if route == "chat":
@@ -8623,7 +8644,7 @@ async def _process_natural_language(
         return
 
     runtime_metrics["commands_total"] += 1
-    operation_id = uuid.uuid4().hex[:12]
+    operation_id = str(operation_id_override or uuid.uuid4().hex[:12])[:80]
     status_text = f"🧠 Thinking...\nRef: `{operation_id}`"
     progress_message = progress_state.get("message")
     if progress_message:
@@ -8631,7 +8652,18 @@ async def _process_natural_language(
         status_msg = progress_message
     else:
         status_msg = await source_message.reply_text(status_text, parse_mode="Markdown")
-    create_operation(operation_id, user_id, chat_id, "natural_language")
+    if not approved_execution:
+        create_operation(
+            operation_id,
+            user_id,
+            chat_id,
+            "natural_language",
+            (plan or {}).get("url") if isinstance(plan, dict) else None,
+            {"request": request_text, "plan": plan or {}, "approval": "pending" if plan and plan.get("requires_confirmation") else "auto", "step": 0},
+        )
+    elif not get_operation(operation_id, user_id):
+        await status_msg.edit_text("⚠️ This approval is no longer valid. Please submit the request again.")
+        return
     remember_user_turn(
         chat_id,
         request_text,
@@ -8640,7 +8672,20 @@ async def _process_natural_language(
         reply_to_message_id,
         business_connection_id,
     )
-    update_operation(operation_id, "running", 0)
+    if approved_execution:
+        update_operation_metadata(operation_id, {"approval": "approved", "step": 0}, user_id=user_id)
+        update_operation(operation_id, "running", 0)
+    elif plan and plan.get("requires_confirmation"):
+        update_operation_metadata(operation_id, {"approval": "pending", "step": 0}, user_id=user_id)
+        transition_operation(operation_id, "paused", user_id=user_id, message="Awaiting user approval", metadata={"approval_mode": plan.get("approval_mode", "confirm")})
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Approve and run", callback_data=f"approval:approve:{operation_id}"),
+            InlineKeyboardButton("✖ Reject", callback_data=f"approval:reject:{operation_id}"),
+        ]])
+        preview = json.dumps({"mode": plan.get("mode"), "url": plan.get("url"), "actions": plan.get("actions", []), "approval_mode": plan.get("approval_mode")}, indent=2)[:2800]
+        await status_msg.edit_text(f"Review GreyAI’s execution plan before it runs:\n\n<pre>{html_escape(preview)}</pre>", parse_mode="HTML", reply_markup=keyboard)
+        log_audit(user_id, "natural_language_plan", plan.get("url"), "AWAITING_APPROVAL")
+        return
 
     onion_match = re.search(r"https?://[^\s,]+\.onion(?:/[^\s,]*)?", request_text, flags=re.IGNORECASE)
     onion_target = str((plan or {}).get("url") or (onion_match.group(0) if onion_match else "")).rstrip(".,;!?)")
@@ -9796,6 +9841,51 @@ async def natural_language_handler(update: Update, context: ContextTypes.DEFAULT
 
 
 @restricted
+async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    await query.answer()
+    match = re.fullmatch(r"approval:(approve|reject):([A-Za-z0-9_-]{6,80})", str(query.data or ""))
+    if not match:
+        return
+    action, operation_id = match.groups()
+    user_id = int(query.from_user.id)
+    operation = get_operation(operation_id, user_id)
+    if not operation:
+        await query.edit_message_text("⚠️ This execution plan is no longer available to your account.")
+        return
+    try:
+        metadata = json.loads(operation["metadata_json"] or "{}")
+    except (TypeError, ValueError):
+        metadata = {}
+    plan = metadata.get("plan") if isinstance(metadata, dict) else None
+    request_text = str(metadata.get("request", "") if isinstance(metadata, dict) else "").strip()
+    if not isinstance(plan, dict) or not request_text:
+        await query.edit_message_text("⚠️ This execution plan is incomplete and cannot be resumed safely.")
+        transition_operation(operation_id, "rejected", user_id=user_id, message="Approval payload incomplete")
+        return
+    if action == "reject":
+        update_operation_metadata(operation_id, {"approval": "rejected"}, user_id=user_id)
+        transition_operation(operation_id, "rejected", user_id=user_id, message="User rejected execution plan")
+        await query.edit_message_text("✖ Execution plan rejected. No browser action was run.")
+        return
+    if str(metadata.get("approval", "pending")) != "pending":
+        await query.edit_message_text("This execution plan has already been handled.")
+        return
+    update_operation_metadata(operation_id, {"approval": "approved"}, user_id=user_id)
+    await query.edit_message_text("✅ Plan approved. GreyAI is starting the task…")
+    await _process_natural_language(
+        update,
+        context,
+        request_text_override=request_text,
+        user_id_override=user_id,
+        approved_plan_override=plan,
+        operation_id_override=operation_id,
+    )
+
+
+@restricted
 async def list_watchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     records = list_watchers_for_chat(chat_id, active_only=True, owner_user_id=update.effective_user.id)
@@ -9841,6 +9931,57 @@ async def list_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sessions = list_user_sessions(user_id)
     if not sessions: return await update.message.reply_text("No encrypted sessions found.")
     await deliver_text_response(update.message, "*Saved Encrypted Sessions:*\n" + "\n".join(f"• `{s}`" for s in sessions), user_id, title="Saved encrypted sessions")
+
+
+def recover_interrupted_operations() -> int:
+    """Convert work left running by a process restart into safe, user-resumable pauses."""
+    recovered = 0
+    for row in list_resumable_operations(limit=100):
+        if str(row["status"]) not in {"running", "retrying"}:
+            continue
+        if transition_operation(row["operation_id"], "paused", user_id=int(row["telegram_user_id"]), message="Paused after process restart; explicit resume required", metadata={"reason": "process_restart"}):
+            recovered += 1
+    if recovered:
+        logger.warning("recovered_interrupted_operations count=%s", recovered)
+    return recovered
+
+
+@restricted
+async def resume_operation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = int(update.effective_user.id)
+    if not context.args:
+        rows = list_resumable_operations(user_id=user_id, limit=10)
+        if not rows:
+            await update.message.reply_text("No resumable GreyAI operations are waiting for this account.")
+            return
+        lines = ["Resumable operations:"]
+        for row in rows:
+            lines.append(f"• `{row['operation_id']}` — {row['kind']} / {row['status']}")
+        lines.append("Use `/resume <operation_id>` to continue an approved or automatic task.")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+    operation_id = str(context.args[0])[:80]
+    operation = get_operation(operation_id, user_id)
+    if not operation:
+        await update.message.reply_text("That operation was not found or is not owned by your account.")
+        return
+    try:
+        metadata = json.loads(operation["metadata_json"] or "{}")
+    except (TypeError, ValueError):
+        metadata = {}
+    plan = metadata.get("plan") if isinstance(metadata, dict) else None
+    request_text = str(metadata.get("request", "") if isinstance(metadata, dict) else "").strip()
+    approval = str(metadata.get("approval", "auto") if isinstance(metadata, dict) else "auto")
+    if not isinstance(plan, dict) or not request_text:
+        await update.message.reply_text("This operation has no safe resumable plan. Please submit the task again.")
+        return
+    if approval == "pending":
+        await update.message.reply_text("This operation is still awaiting approval. Use the approval buttons on its original plan message.")
+        return
+    if str(operation["status"]) not in {"paused", "failed", "cancelled"}:
+        await update.message.reply_text(f"This operation is currently `{operation['status']}` and cannot be resumed from here.", parse_mode="Markdown")
+        return
+    await _process_natural_language(update, context, request_text_override=request_text, user_id_override=user_id, approved_plan_override=plan, operation_id_override=operation_id)
 
 @restricted
 async def delete_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10288,6 +10429,7 @@ def main():
     app.add_handler(CommandHandler("pair", pair_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CallbackQueryHandler(approval_callback, pattern=r"^approval:(approve|reject):[A-Za-z0-9_-]{6,80}$"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(settings:|session:delete:)"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(text_viewer_callback, pattern=r"^page:[A-Za-z0-9_-]{6,24}:\d{1,4}:\d{1,20}$"))
@@ -10304,6 +10446,7 @@ def main():
     app.add_handler(CommandHandler("resetdomain", reset_domain_command))
     app.add_handler(CommandHandler("domains", domains_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("resume", resume_operation_command))
     app.add_handler(CommandHandler("referral", referral_command))
     app.add_handler(CommandHandler("referrals", referrals_command))
     app.add_handler(CommandHandler("admin", admin_command))

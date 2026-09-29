@@ -80,6 +80,18 @@ def test_dashboard_registers_task_control_routes(dashboard_db):
     assert "/api/operations/{operation_id}/{action}" in paths
 
 
+def test_public_operation_projection_redacts_raw_metadata():
+    row = {
+        "operation_id": "op_1",
+        "metadata_json": '{"request":"password=secret","plan":{"actions":["type_password:secret"]},"approval":"pending","step":2}',
+    }
+    payload = dashboard._public_operation(row)
+    assert "metadata_json" not in payload
+    assert "secret" not in str(payload)
+    assert payload["approval"] == "pending"
+    assert payload["step"] == "2"
+
+
 def test_dashboard_connections_handler_redacts_tokens_and_returns_owner_pairing(monkeypatch):
     import asyncio
     import json

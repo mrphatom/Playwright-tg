@@ -81,6 +81,21 @@ def _json_rows(rows):
     return [dict(row) for row in rows]
 
 
+def _public_operation(row) -> dict[str, Any]:
+    payload = dict(row)
+    raw_metadata = payload.pop("metadata_json", "{}")
+    try:
+        metadata = json.loads(raw_metadata or "{}")
+    except (TypeError, ValueError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    payload["approval"] = str(metadata.get("approval", "auto"))[:20]
+    payload["step"] = str(metadata.get("step", ""))[:40]
+    payload["attempt"] = int(metadata.get("attempt", 0) or 0) if str(metadata.get("attempt", "0")).isdigit() else 0
+    return payload
+
+
 def developer_api_docs() -> dict[str, Any]:
     """Return the redacted, authoritative contract used by Grey’s API guidance."""
     return developer_api_contract(os.getenv("DASHBOARD_BASE_URL"))
@@ -255,7 +270,7 @@ async def operation_detail_handler(request: web.Request):
     operation = get_operation(operation_id, owner_id)
     if not operation:
         raise web.HTTPNotFound(text=json.dumps({"error": "operation_not_found"}), content_type="application/json")
-    return web.json_response({"operation": dict(operation), "events": _json_rows(list_operation_events(operation_id, owner_id, 200))})
+    return web.json_response({"operation": _public_operation(operation), "events": _json_rows(list_operation_events(operation_id, owner_id, 200))})
 
 
 async def operation_events_handler(request: web.Request):
@@ -282,7 +297,7 @@ async def operation_mutation_handler(request: web.Request):
     if not changed:
         raise web.HTTPConflict(text=json.dumps({"error": "invalid_operation_transition", "status": operation["status"], "action": action}), content_type="application/json")
     updated = get_operation(operation_id, user["telegram_user_id"])
-    return web.json_response({"operation": dict(updated), "action": action})
+    return web.json_response({"operation": _public_operation(updated), "action": action})
 
 
 def public_status_payload() -> dict[str, Any]:

@@ -1,4 +1,5 @@
 import base64
+import json
 import sqlite3
 
 import pytest
@@ -317,6 +318,21 @@ def test_operation_lifecycle_is_owner_scoped_idempotent_and_evented(platform_db)
     events = cp.list_operation_events("op_lifecycle", 42)
     assert [event["status"] for event in events] == ["queued", "running", "paused", "running", "succeeded"]
     assert cp.list_operation_events("op_lifecycle", 43) == []
+
+
+def test_operation_metadata_and_resumable_queries_preserve_owner_scope(platform_db):
+    cp.ensure_user(42)
+    cp.ensure_user(43)
+    cp.create_operation("op_resume", 42, 42, "check", "https://example.com", {"request": "read title", "plan": {"mode": "check"}})
+    assert cp.update_operation_metadata("op_resume", {"approval": "approved", "step": 2}, user_id=43) is False
+    assert cp.update_operation_metadata("op_resume", {"approval": "approved", "step": 2}, user_id=42) is True
+    row = cp.get_operation("op_resume", 42)
+    metadata = json.loads(row["metadata_json"])
+    assert metadata["request"] == "read title"
+    assert metadata["approval"] == "approved"
+    assert metadata["step"] == 2
+    assert [item["operation_id"] for item in cp.list_resumable_operations(42)] == ["op_resume"]
+    assert cp.list_resumable_operations(43) == []
 
 
 def test_developer_request_is_idempotent_and_admin_reviewable(platform_db):

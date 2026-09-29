@@ -1693,6 +1693,38 @@ def get_operation(operation_id: str, user_id: int | None = None) -> sqlite3.Row 
         return connection.execute(query, params).fetchone()
 
 
+def update_operation_metadata(operation_id: str, patch: dict[str, Any], *, user_id: int | None = None) -> bool:
+    """Merge bounded JSON metadata without crossing the operation owner boundary."""
+    with _connect() as connection:
+        row = connection.execute("SELECT telegram_user_id, metadata_json FROM operations WHERE operation_id = ?", (str(operation_id)[:100],)).fetchone()
+        if not row or (user_id is not None and int(row["telegram_user_id"]) != int(user_id)):
+            return False
+        try:
+            current = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            current = {}
+        if not isinstance(current, dict):
+            current = {}
+        current.update(patch or {})
+        encoded = json.dumps(current, separators=(",", ":"), default=str)[:12000]
+        connection.execute("UPDATE operations SET metadata_json = ?, updated_at = ? WHERE operation_id = ?", (encoded, utc_now(), str(operation_id)[:100]))
+        connection.commit()
+        return True
+
+
+def list_resumable_operations(user_id: int | None = None, limit: int = 50) -> list[sqlite3.Row]:
+    """Return operations that can be resumed after a process/provider restart."""
+    statuses = ("queued", "running", "paused", "retrying")
+    with _connect() as connection:
+        params: tuple[Any, ...] = (*statuses, max(1, min(int(limit), 100)))
+        query = "SELECT operation_id, telegram_user_id, chat_id, kind, status, target_url, metadata_json, attempt_count, created_at, updated_at FROM operations WHERE status IN (?, ?, ?, ?)"
+        if user_id is not None:
+            query += " AND telegram_user_id = ?"
+            params = (*statuses, int(user_id), max(1, min(int(limit), 100)))
+        query += " ORDER BY updated_at ASC LIMIT ?"
+        return connection.execute(query, params).fetchall()
+
+
 def transition_operation(operation_id: str, new_status: str, *, user_id: int | None = None, message: str = "", metadata: dict[str, Any] | None = None, attempt_count: int | None = None) -> bool:
     """Apply a validated operation transition and write a timeline event atomically."""
     clean_id = str(operation_id)[:100]

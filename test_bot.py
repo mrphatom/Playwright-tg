@@ -6276,6 +6276,16 @@ def test_natural_language_update_deduplication_is_transport_scoped():
     assert bot.claim_natural_language_update(SimpleNamespace()) is True
 
 
+def test_normalized_plan_preserves_explicit_approval_modes():
+    import bot
+    preview = bot.normalize_natural_language_plan({"mode": "check", "url": "https://example.com", "request": "read the title", "approval_mode": "preview"}, user_id=42)
+    assert preview["approval_mode"] == "preview"
+    assert preview["requires_confirmation"] is True
+    auto = bot.normalize_natural_language_plan({"mode": "check", "url": "https://example.com", "request": "read the title", "approval_mode": "unexpected-value"}, user_id=42)
+    assert auto["approval_mode"] == "auto"
+    assert auto["requires_confirmation"] is False
+
+
 def test_start_browser_pool_starts_dashboard_before_database_initialization(monkeypatch):
     import bot
 
