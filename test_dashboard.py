@@ -80,6 +80,41 @@ def test_dashboard_registers_task_control_routes(dashboard_db):
     assert "/api/operations/{operation_id}/{action}" in paths
 
 
+def test_dashboard_registers_admin_diagnostics_route(dashboard_db):
+    paths = {resource.canonical for resource in dashboard.create_dashboard_app().router.resources()}
+    assert "/api/admin/diagnostics" in paths
+
+
+def test_diagnostics_payload_is_structured_and_does_not_expose_secrets(monkeypatch):
+    monkeypatch.setattr(dashboard, "get_queue_stats", lambda: {"queued": 2, "running": 1})
+    monkeypatch.setattr(dashboard, "get_maintenance_state", lambda: {"mode": "operational", "incident_id": None})
+    monkeypatch.setattr(dashboard, "_runtime_module", lambda: SimpleNamespace(pool=SimpleNamespace(browser=object())))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "secret-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "secret-gemini")
+
+    payload = dashboard.diagnostics_payload()
+
+    assert payload["status"] == "ok"
+    assert {check["name"] for check in payload["checks"]} >= {
+        "process",
+        "database",
+        "queue",
+        "browser_pool",
+        "providers",
+        "workers",
+    }
+    assert "secret-token" not in str(payload)
+    assert "secret-gemini" not in str(payload)
+
+
+def test_diagnostics_handler_requires_admin(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(dashboard, "_require_admin", lambda _request: (_ for _ in ()).throw(web.HTTPForbidden()))
+    with pytest.raises(web.HTTPForbidden):
+        asyncio.run(dashboard.admin_diagnostics_handler(SimpleNamespace()))
+
+
 def test_public_operation_projection_redacts_raw_metadata():
     row = {
         "operation_id": "op_1",

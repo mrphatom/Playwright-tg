@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import web
@@ -439,6 +440,69 @@ async def public_maintenance_events_handler(request: web.Request):
     return web.json_response({"events": events})
 
 
+def _runtime_module():
+    """Return the already-running bot module without importing it recursively."""
+    return sys.modules.get("__main__") or sys.modules.get("bot")
+
+
+def _diagnostic_check(name: str, status: str, detail: str, **extra: Any) -> dict[str, Any]:
+    payload = {"name": name, "status": status, "detail": detail[:240]}
+    payload.update(extra)
+    return payload
+
+
+def diagnostics_payload() -> dict[str, Any]:
+    """Build a bounded, secret-free readiness matrix for administrators."""
+    checks: list[dict[str, Any]] = []
+    runtime = _runtime_module()
+
+    checks.append(_diagnostic_check("process", "ok", "Dashboard process is serving requests.", pid=os.getpid()))
+
+    try:
+        queue = get_queue_stats()
+        checks.append(_diagnostic_check("database", "ok", "Database-backed control-plane queries succeeded."))
+        checks.append(_diagnostic_check("queue", "ok", "Queue statistics are readable.", queued=int(queue.get("queued", 0) or 0), running=int(queue.get("running", 0) or 0)))
+    except Exception as exc:
+        checks.append(_diagnostic_check("database", "fail", f"Control-plane query failed: {type(exc).__name__}"))
+        checks.append(_diagnostic_check("queue", "unknown", "Queue state is unavailable while the database check is failing."))
+
+    browser = getattr(getattr(runtime, "pool", None), "browser", None)
+    checks.append(_diagnostic_check("browser_pool", "ok" if browser is not None else "degraded", "Browser pool is ready." if browser is not None else "Browser pool is not ready."))
+
+    configured_providers = sum(bool(os.getenv(name, "").strip()) for name in ("GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4"))
+    checks.append(_diagnostic_check("providers", "ok" if configured_providers else "degraded", f"{configured_providers} Gemini provider key(s) configured; values are never returned."))
+
+    worker_names = ("queue_dispatch_task", "maintenance_scheduler_task", "recovery_monitor_task", "notification_worker_task")
+    workers_running = 0
+    workers_known = 0
+    for name in worker_names:
+        task = getattr(runtime, name, None)
+        if task is not None and hasattr(task, "done"):
+            workers_known += 1
+            if not task.done():
+                workers_running += 1
+    checks.append(_diagnostic_check("workers", "ok" if workers_known == 0 or workers_running == workers_known else "degraded", f"{workers_running}/{workers_known} tracked background workers are active."))
+
+    maintenance = get_maintenance_state()
+    mode = str(maintenance.get("mode", "operational"))
+    checks.append(_diagnostic_check("maintenance", "ok" if mode == "operational" else "degraded", f"Maintenance mode: {mode}.", mode=mode, incident_id=maintenance.get("incident_id")))
+
+    failures = [check for check in checks if check["status"] == "fail"]
+    degraded = [check for check in checks if check["status"] in {"degraded", "unknown"}]
+    overall = "fail" if failures else "degraded" if degraded else "ok"
+    return {
+        "status": overall,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "checks": checks,
+        "summary": {"total": len(checks), "ok": sum(c["status"] == "ok" for c in checks), "degraded": len(degraded), "failed": len(failures)},
+    }
+
+
+async def admin_diagnostics_handler(request: web.Request):
+    _require_admin(request)
+    return web.json_response(diagnostics_payload())
+
+
 async def admin_runtime_handler(request: web.Request):
     _require_admin(request)
     snapshot = get_latest_runtime_snapshot("crash")
@@ -820,6 +884,7 @@ def create_dashboard_app() -> web.Application:
         web.get("/api/operations/{operation_id}/events", operation_events_handler),
         web.post("/api/operations/{operation_id}/{action}", operation_mutation_handler),
         web.get("/api/referrals", referrals_handler),
+        web.get("/api/admin/diagnostics", admin_diagnostics_handler),
         web.get("/api/admin/users", admin_users_handler),
         web.get("/api/admin/referrals", admin_referrals_handler),
         web.get("/api/admin/analytics", admin_analytics_handler),
