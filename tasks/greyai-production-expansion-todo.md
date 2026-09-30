@@ -1,26 +1,32 @@
 # GreyAI Production Expansion Tasks
 
-- [ ] **Slice 1 — Task control contract and durable lifecycle**
+## Current delivery status — 2026-09-30
+
+- **Delivered:** durable task lifecycle, dashboard task controls/timelines, approval-aware execution plans, restart/failover continuity, responsive dashboard redesign, and admin diagnostics readiness matrix.
+- **In progress:** workspace foundation (owner-scoped persistence and dashboard API); Telegram context/workspace selection and watcher/schedule attachment remain the next increment.
+- **Verification baseline:** 408 tests passed before workspace changes; focused workspace tests currently pass.
+
+- [x] **Slice 1 — Task control contract and durable lifecycle**
   - Acceptance: operation detail, pause/resume/cancel/retry state transitions are idempotent, owner-scoped, audited, and compatible with existing queue statuses.
   - Verify: control-plane unit tests, duplicate mutation tests, authorization tests, full pytest suite.
   - Files: `control_plane.py`, `bot.py`, `dashboard.py`, `test_platform.py`, `test_dashboard.py`.
 
-- [ ] **Slice 2 — Task Control Center UI and live timeline**
+- [x] **Slice 2 — Task Control Center UI and live timeline**
   - Acceptance: dashboard lists tasks with status, ETA, progress events, source/artifact links, and clear retry/cancel controls.
   - Verify: route tests, HTML assertions, websocket/poll fallback test, live dashboard smoke check.
   - Files: `dashboard.py`, `test_dashboard.py`.
 
-- [ ] **Slice 3 — Execution plan preview and approval modes**
+- [x] **Slice 3 — Execution plan preview and approval modes**
   - Acceptance: agent plans can be previewed, edited within the allowlisted schema, run read-only, or require per-action confirmation.
   - Verify: malformed-plan, unauthorized-action, confirmation, and read-only tests.
   - Files: `bot.py`, `control_plane.py`, `test_bot.py`.
 
-- [ ] **Slice 4 — Restart/failover continuity**
+- [x] **Slice 4 — Restart/failover continuity**
   - Acceptance: provider failover, browser recreation, manual handoff, and process restart preserve operation ID, owner context, plan, and resumable state.
   - Verify: simulated provider 429, browser crash, stale handoff, and resume tests.
   - Files: `bot.py`, `control_plane.py`, tests.
 
-- [ ] **Slice 5 — Diagnostics and deployment readiness gate**
+- [ ] **Slice 5 — Diagnostics and deployment readiness gate** *(diagnostics matrix delivered; CI/deployment readiness checks remain)*
   - Acceptance: admin diagnostics returns structured checks; deployment verifies migrations, schema, dashboard, browser, Telegram, and Discord before operational readiness.
   - Verify: local diagnostics fixtures, CI workflow run, Fly health check, redacted logs.
   - Files: `control_plane.py`, `dashboard.py`, `.github/workflows/fly-deploy.yml`, tests.
@@ -35,7 +41,7 @@
   - Verify: source redaction, conflicting-source, provider-outage, and long-output tests.
   - Files: `bot.py`, `control_plane.py`, `api_contract.py`, tests.
 
-- [ ] **Slice 8 — Workspaces and project memory**
+- [ ] **Slice 8 — Workspaces and project memory** *(workspace persistence/API foundation delivered; chat/memory integration remains)*
   - Acceptance: users can create isolated workspaces with instructions, memory scope, source preferences, sessions, watchers, and schedules.
   - Verify: ownership, deletion/archival, context isolation, and migration tests.
   - Files: `control_plane.py`, `bot.py`, `dashboard.py`, tests.

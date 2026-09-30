@@ -85,6 +85,23 @@ def test_dashboard_registers_admin_diagnostics_route(dashboard_db):
     assert "/api/admin/diagnostics" in paths
 
 
+def test_dashboard_registers_workspace_routes(dashboard_db):
+    paths = {resource.canonical for resource in dashboard.create_dashboard_app().router.resources()}
+    assert "/api/workspaces" in paths
+    assert "/api/workspaces/{workspace_id}/archive" in paths
+
+
+def test_workspace_list_is_scoped_to_authenticated_user(monkeypatch):
+    import asyncio
+    import json
+
+    monkeypatch.setattr(dashboard, "_require_session", lambda _request: (SimpleNamespace(), {"telegram_user_id": 101}))
+    monkeypatch.setattr(dashboard, "list_workspaces", lambda owner, include_archived: [{"workspace_id": "ws_1", "owner_user_id": owner, "status": "active"}])
+    response = asyncio.run(dashboard.workspaces_handler(SimpleNamespace(query={})))
+    payload = json.loads(response.text)
+    assert payload["data"]["workspaces"][0]["owner_user_id"] == 101
+
+
 def test_diagnostics_payload_is_structured_and_does_not_expose_secrets(monkeypatch):
     monkeypatch.setattr(dashboard, "get_queue_stats", lambda: {"queued": 2, "running": 1})
     monkeypatch.setattr(dashboard, "get_maintenance_state", lambda: {"mode": "operational", "incident_id": None})

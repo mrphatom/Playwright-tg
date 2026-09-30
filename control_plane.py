@@ -182,6 +182,20 @@ def init_platform_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS workspaces (
+                workspace_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                instructions TEXT NOT NULL DEFAULT '',
+                memory_scope TEXT NOT NULL DEFAULT 'private' CHECK (memory_scope IN ('private', 'workspace')),
+                source_preferences_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_user_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspaces_owner_status ON workspaces(owner_user_id, status, updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS conversation_turns (
                 turn_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_user_id INTEGER NOT NULL,
@@ -1065,6 +1079,65 @@ def set_user_settings(user_id: int, **values: Any) -> dict[str, bool]:
         )
         connection.commit()
     return current
+
+
+def _workspace_row(row) -> dict[str, Any]:
+    payload = dict(row)
+    try:
+        preferences = json.loads(payload.pop("source_preferences_json", "[]") or "[]")
+    except (TypeError, ValueError):
+        preferences = []
+    payload["source_preferences"] = preferences if isinstance(preferences, list) else []
+    return payload
+
+
+def create_workspace(owner_user_id: int, name: str, instructions: str = "", source_preferences: list[str] | None = None) -> dict[str, Any]:
+    normalized_name = " ".join(str(name or "").split()).strip()
+    normalized_instructions = str(instructions or "").strip()
+    if not normalized_name or len(normalized_name) > 80:
+        raise ValueError("workspace name must be between 1 and 80 characters")
+    if len(normalized_instructions) > 6000:
+        raise ValueError("workspace instructions must not exceed 6000 characters")
+    preferences = [str(value).strip()[:120] for value in (source_preferences or []) if str(value).strip()][:10]
+    workspace_id = "ws_" + secrets.token_urlsafe(10)
+    now = utc_now()
+    with _connect() as connection:
+        try:
+            connection.execute(
+                "INSERT INTO workspaces (workspace_id, owner_user_id, name, instructions, memory_scope, source_preferences_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'private', ?, 'active', ?, ?)",
+                (workspace_id, int(owner_user_id), normalized_name, normalized_instructions, json.dumps(preferences, separators=(",", ":")), now, now),
+            )
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            if "unique" in str(exc).lower():
+                raise ValueError("workspace name already exists") from exc
+            raise
+        row = connection.execute("SELECT * FROM workspaces WHERE workspace_id = ? AND owner_user_id = ?", (workspace_id, int(owner_user_id))).fetchone()
+    return _workspace_row(row)
+
+
+def list_workspaces(owner_user_id: int, include_archived: bool = True) -> list[dict[str, Any]]:
+    query = "SELECT * FROM workspaces WHERE owner_user_id = ?"
+    params: list[Any] = [int(owner_user_id)]
+    if not include_archived:
+        query += " AND status = 'active'"
+    query += " ORDER BY updated_at DESC, workspace_id DESC"
+    with _connect() as connection:
+        return [_workspace_row(row) for row in connection.execute(query, params).fetchall()]
+
+
+def get_workspace(workspace_id: str, owner_user_id: int) -> dict[str, Any] | None:
+    with _connect() as connection:
+        row = connection.execute("SELECT * FROM workspaces WHERE workspace_id = ? AND owner_user_id = ?", (str(workspace_id), int(owner_user_id))).fetchone()
+    return _workspace_row(row) if row else None
+
+
+def archive_workspace(workspace_id: str, owner_user_id: int) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE workspaces SET status = 'archived', updated_at = ? WHERE workspace_id = ? AND owner_user_id = ? AND status = 'active'", (utc_now(), str(workspace_id), int(owner_user_id)))
+        connection.commit()
+        return cursor.rowcount == 1
 
 
 def is_admin(user_id: int) -> bool:

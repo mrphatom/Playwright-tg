@@ -37,6 +37,8 @@ from control_plane import (
     get_queue_stats,
     get_referral_stats,
     get_user,
+    create_workspace,
+    archive_workspace,
     is_admin,
     is_developer,
     list_api_keys,
@@ -48,6 +50,7 @@ from control_plane import (
     list_reports,
     list_session_metadata,
     list_users_by_status,
+    list_workspaces,
     record_admin_action,
     record_developer_audit,
     resolve_appeal,
@@ -622,6 +625,32 @@ async def referrals_handler(request: web.Request):
     return web.json_response(get_referral_stats(user["telegram_user_id"]))
 
 
+async def workspaces_handler(request: web.Request):
+    _, user = _require_session(request)
+    include_archived = request.query.get("include_archived", "true").lower() in {"1", "true", "yes"}
+    return web.json_response({"data": {"workspaces": list_workspaces(user["telegram_user_id"], include_archived)}, "request_id": "req_" + secrets.token_urlsafe(8)})
+
+
+async def workspace_create_handler(request: web.Request):
+    session, user = _require_session(request)
+    _require_csrf(request, session)
+    data = await _json_object(request)
+    try:
+        workspace = create_workspace(user["telegram_user_id"], data.get("name", ""), data.get("instructions", ""), data.get("source_preferences", []))
+    except (TypeError, ValueError) as exc:
+        raise web.HTTPBadRequest(text=json.dumps({"error": {"code": "invalid_workspace", "message": str(exc)}}), content_type="application/json")
+    return web.json_response({"data": workspace, "request_id": "req_" + secrets.token_urlsafe(8)}, status=201)
+
+
+async def workspace_archive_handler(request: web.Request):
+    session, user = _require_session(request)
+    _require_csrf(request, session)
+    workspace_id = request.match_info["workspace_id"]
+    if not archive_workspace(workspace_id, user["telegram_user_id"]):
+        raise web.HTTPNotFound(text=json.dumps({"error": {"code": "workspace_not_found", "message": "Workspace is missing, archived, or not owned by this account."}}), content_type="application/json")
+    return web.json_response({"data": {"workspace_id": workspace_id, "status": "archived"}, "request_id": "req_" + secrets.token_urlsafe(8)})
+
+
 async def admin_referrals_handler(request: web.Request):
     _require_admin(request)
     return web.json_response({"referrals": _json_rows(list_referrals(request.query.get("status"), 100))})
@@ -884,6 +913,9 @@ def create_dashboard_app() -> web.Application:
         web.get("/api/operations/{operation_id}/events", operation_events_handler),
         web.post("/api/operations/{operation_id}/{action}", operation_mutation_handler),
         web.get("/api/referrals", referrals_handler),
+        web.get("/api/workspaces", workspaces_handler),
+        web.post("/api/workspaces", workspace_create_handler),
+        web.post("/api/workspaces/{workspace_id}/archive", workspace_archive_handler),
         web.get("/api/admin/diagnostics", admin_diagnostics_handler),
         web.get("/api/admin/users", admin_users_handler),
         web.get("/api/admin/referrals", admin_referrals_handler),

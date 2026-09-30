@@ -299,6 +299,34 @@ def test_legacy_user_settings_table_receives_capability_columns(tmp_path, monkey
     assert settings["advanced_navigation_enabled"] is True
 
 
+def test_workspace_crud_is_owner_scoped_and_archive_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "workspace.db"))
+    cp.init_platform_db()
+    cp.ensure_user(101)
+    cp.ensure_user(202)
+
+    workspace = cp.create_workspace(101, "Research", "Prefer primary sources", ["official", "news"])
+
+    assert workspace["owner_user_id"] == 101
+    assert workspace["status"] == "active"
+    assert cp.get_workspace(workspace["workspace_id"], 202) is None
+    assert [row["workspace_id"] for row in cp.list_workspaces(101)] == [workspace["workspace_id"]]
+    assert cp.archive_workspace(workspace["workspace_id"], 101) is True
+    assert cp.archive_workspace(workspace["workspace_id"], 101) is False
+    assert cp.list_workspaces(101)[0]["status"] == "archived"
+
+
+def test_workspace_validation_rejects_empty_or_oversized_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "workspace-validation.db"))
+    cp.init_platform_db()
+    cp.ensure_user(101)
+
+    with pytest.raises(ValueError, match="workspace name"):
+        cp.create_workspace(101, "   ")
+    with pytest.raises(ValueError, match="instructions"):
+        cp.create_workspace(101, "Research", "x" * 7000)
+
+
 def test_operation_lifecycle_is_owner_scoped_idempotent_and_evented(platform_db):
     cp.ensure_user(42)
     cp.ensure_user(43)
