@@ -94,6 +94,7 @@ from control_plane import (
     get_admin_analytics,
     get_appeal,
     get_conversation_turn_by_telegram_message_id,
+    get_chat_workspace_id,
     get_developer_stats,
     get_last_download_job_at,
     get_maintenance_state,
@@ -3122,8 +3123,9 @@ def extract_reply_context(
     }
 
 
-def load_chat_history(owner_user_id: int, chat_id: int, limit: int = CHAT_CONTEXT_TURNS) -> list[dict[str, Any]]:
-    rows = list_conversation_turns(int(owner_user_id), int(chat_id), limit)
+def load_chat_history(owner_user_id: int, chat_id: int, limit: int = CHAT_CONTEXT_TURNS, workspace_id: str | None = None) -> list[dict[str, Any]]:
+    workspace_id = workspace_id or get_chat_workspace_id(int(owner_user_id), int(chat_id))
+    rows = list_conversation_turns(int(owner_user_id), int(chat_id), limit, workspace_id=workspace_id)
     history: list[dict[str, Any]] = []
     for row in rows:
         try:
@@ -3169,9 +3171,11 @@ def remember_user_turn(
     source_message_id: int | None = None,
     reply_to_message_id: int | None = None,
     business_connection_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> None:
     """Persist a user request without adding a temporary status message to chat context."""
     owner_id = int(owner_user_id)
+    workspace_id = workspace_id or get_chat_workspace_id(owner_id, int(chat_id))
     history_key = _chat_history_key(owner_id, chat_id)
     history = chat_histories.setdefault(history_key, [])
     history.append({"role": "user", "text": str(user_text)[:CHAT_MEMORY_TEXT_CHARS]})
@@ -3185,6 +3189,7 @@ def remember_user_turn(
         telegram_message_id=source_message_id,
         reply_to_message_id=reply_to_message_id,
         business_connection_id=business_connection_id,
+        workspace_id=workspace_id,
         metadata={"source": "telegram", "owner_user_id": owner_id},
     )
 
@@ -3236,8 +3241,10 @@ def remember_chat_turn(
     reply_to_message_id: int | None = None,
     business_connection_id: str | None = None,
     assistant_message_id: int | None = None,
+    workspace_id: str | None = None,
 ):
     owner_id = int(owner_user_id if owner_user_id is not None else chat_id)
+    workspace_id = workspace_id or get_chat_workspace_id(owner_id, int(chat_id))
     history_key = _chat_history_key(owner_id, chat_id)
     history = chat_histories.setdefault(history_key, [])
     history.extend([
@@ -3255,6 +3262,7 @@ def remember_chat_turn(
         telegram_message_id=source_message_id,
         reply_to_message_id=reply_to_message_id,
         business_connection_id=business_connection_id,
+        workspace_id=workspace_id,
         metadata=metadata,
     )
     record_conversation_turn(
@@ -3266,6 +3274,7 @@ def remember_chat_turn(
         telegram_message_id=assistant_message_id,
         reply_to_message_id=reply_to_message_id,
         business_connection_id=business_connection_id,
+        workspace_id=workspace_id,
         metadata=metadata,
     )
 
@@ -3280,9 +3289,11 @@ def remember_assistant_turn(
     business_connection_id: str | None = None,
     operation_id: str | None = None,
     response_kind: str = "agent_result",
+    workspace_id: str | None = None,
 ) -> None:
     """Persist a completed assistant result without duplicating the user request."""
     owner_id = int(owner_user_id)
+    workspace_id = workspace_id or get_chat_workspace_id(owner_id, int(chat_id))
     history_key = _chat_history_key(owner_id, chat_id)
     history = chat_histories.setdefault(history_key, [])
     history.append({"role": "assistant", "text": str(reply_text)[:CHAT_MEMORY_TEXT_CHARS]})
@@ -3295,6 +3306,7 @@ def remember_assistant_turn(
         telegram_message_id=assistant_message_id,
         reply_to_message_id=reply_to_message_id,
         business_connection_id=business_connection_id,
+        workspace_id=workspace_id,
         metadata={
             "source": "telegram",
             "owner_user_id": owner_id,

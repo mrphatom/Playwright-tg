@@ -196,6 +196,15 @@ def init_platform_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_workspaces_owner_status ON workspaces(owner_user_id, status, updated_at DESC);
 
+            CREATE TABLE IF NOT EXISTS chat_workspace_bindings (
+                owner_user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                workspace_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_user_id, chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_workspace_bindings_workspace ON chat_workspace_bindings(workspace_id, updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS conversation_turns (
                 turn_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_user_id INTEGER NOT NULL,
@@ -206,6 +215,7 @@ def init_platform_db() -> None:
                 telegram_message_id INTEGER,
                 reply_to_message_id INTEGER,
                 business_connection_id TEXT,
+                workspace_id TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
@@ -595,6 +605,7 @@ def init_platform_db() -> None:
             _add_column_if_missing(connection, "dashboard_login_tokens", column, definition)
         for column, definition in (
             ("telegram_message_id", "INTEGER"),
+            ("workspace_id", "TEXT"),
         ):
             _add_column_if_missing(connection, "conversation_turns", column, definition)
         for column, definition in (
@@ -614,6 +625,7 @@ def init_platform_db() -> None:
             (utc_now(),),
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_telegram_id ON conversation_turns(owner_user_id, chat_id, telegram_message_id, turn_id DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_conversation_turns_workspace_scope ON conversation_turns(owner_user_id, chat_id, workspace_id, created_at DESC, turn_id DESC)")
         connection.commit()
 
 
@@ -1138,6 +1150,44 @@ def archive_workspace(workspace_id: str, owner_user_id: int) -> bool:
         cursor = connection.execute("UPDATE workspaces SET status = 'archived', updated_at = ? WHERE workspace_id = ? AND owner_user_id = ? AND status = 'active'", (utc_now(), str(workspace_id), int(owner_user_id)))
         connection.commit()
         return cursor.rowcount == 1
+
+
+def get_chat_workspace(owner_user_id: int, chat_id: int) -> dict[str, Any] | None:
+    with _connect() as connection:
+        row = connection.execute(
+            """SELECT w.* FROM workspaces w
+               JOIN chat_workspace_bindings b ON b.workspace_id = w.workspace_id
+               WHERE b.owner_user_id = ? AND b.chat_id = ? AND w.owner_user_id = ? AND w.status = 'active'""",
+            (int(owner_user_id), int(chat_id), int(owner_user_id)),
+        ).fetchone()
+    return _workspace_row(row) if row else None
+
+
+def set_chat_workspace(owner_user_id: int, chat_id: int, workspace_id: str | None) -> dict[str, Any] | None:
+    owner_id = int(owner_user_id)
+    chat_value = int(chat_id)
+    if workspace_id is None or not str(workspace_id).strip():
+        with _connect() as connection:
+            connection.execute("DELETE FROM chat_workspace_bindings WHERE owner_user_id = ? AND chat_id = ?", (owner_id, chat_value))
+            connection.commit()
+        return None
+    workspace = get_workspace(str(workspace_id), owner_id)
+    if not workspace or workspace["status"] != "active":
+        raise ValueError("workspace is missing, archived, or not owned by this account")
+    with _connect() as connection:
+        connection.execute(
+            """INSERT INTO chat_workspace_bindings (owner_user_id, chat_id, workspace_id, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(owner_user_id, chat_id) DO UPDATE SET workspace_id = excluded.workspace_id, updated_at = excluded.updated_at""",
+            (owner_id, chat_value, str(workspace_id), utc_now()),
+        )
+        connection.commit()
+    return workspace
+
+
+def get_chat_workspace_id(owner_user_id: int, chat_id: int) -> str | None:
+    workspace = get_chat_workspace(owner_user_id, chat_id)
+    return str(workspace["workspace_id"]) if workspace else None
 
 
 def is_admin(user_id: int) -> bool:
@@ -2505,6 +2555,7 @@ def record_conversation_turn(
     reply_to_message_id: int | None = None,
     business_connection_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    workspace_id: str | None = None,
 ) -> int:
     clean_role = str(role or "").strip().lower()
     if clean_role not in {"user", "assistant", "system"}:
@@ -2513,8 +2564,8 @@ def record_conversation_turn(
         cursor = connection.execute(
             """INSERT INTO conversation_turns
                (owner_user_id, chat_id, role, text, source_message_id, telegram_message_id,
-                reply_to_message_id, business_connection_id, metadata_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reply_to_message_id, business_connection_id, workspace_id, metadata_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                RETURNING turn_id""",
             (
                 int(owner_user_id),
@@ -2525,6 +2576,7 @@ def record_conversation_turn(
                 int(telegram_message_id) if telegram_message_id is not None else None,
                 int(reply_to_message_id) if reply_to_message_id is not None else None,
                 str(business_connection_id or "")[:200] or None,
+                str(workspace_id or "")[:100] or None,
                 json.dumps(metadata or {}, separators=(",", ":"), default=str)[:2000],
                 utc_now(),
             ),
@@ -2546,16 +2598,17 @@ def get_conversation_turn_by_telegram_message_id(owner_user_id: int, chat_id: in
         ).fetchone()
 
 
-def list_conversation_turns(owner_user_id: int, chat_id: int, limit: int = 24) -> list[sqlite3.Row]:
+def list_conversation_turns(owner_user_id: int, chat_id: int, limit: int = 24, workspace_id: str | None = None) -> list[sqlite3.Row]:
     bounded_limit = max(1, min(int(limit), 200))
     with _connect() as connection:
+        workspace_clause = " AND workspace_id IS NULL" if workspace_id is None else " AND workspace_id = ?"
+        params: tuple[Any, ...] = (int(owner_user_id), int(chat_id), str(workspace_id)) if workspace_id is not None else (int(owner_user_id), int(chat_id))
         rows = connection.execute(
             """SELECT turn_id, owner_user_id, chat_id, role, text, source_message_id,
-                      telegram_message_id, reply_to_message_id, business_connection_id, metadata_json, created_at
+                      telegram_message_id, reply_to_message_id, business_connection_id, workspace_id, metadata_json, created_at
                FROM conversation_turns
-               WHERE owner_user_id = ? AND chat_id = ?
-               ORDER BY turn_id DESC LIMIT ?""",
-            (int(owner_user_id), int(chat_id), bounded_limit),
+               WHERE owner_user_id = ? AND chat_id = ?""" + workspace_clause + " ORDER BY turn_id DESC LIMIT ?",
+            params + (bounded_limit,),
         ).fetchall()
     return list(reversed(rows))
 

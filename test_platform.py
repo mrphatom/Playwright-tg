@@ -640,3 +640,22 @@ def test_consume_quota_is_atomic_under_concurrent_requests(platform_db):
     assert sum(outcomes) == 1
     user = cp.get_user(42)
     assert user["quota_used"] == 1
+
+
+def test_chat_workspace_binding_is_owner_scoped_and_conversation_isolated(platform_db):
+    cp.ensure_user(42)
+    cp.ensure_user(43)
+    workspace = cp.create_workspace(42, "Client Alpha", "Use the client runbook")
+
+    assert cp.set_chat_workspace(42, 1001, workspace["workspace_id"])["workspace_id"] == workspace["workspace_id"]
+    assert cp.get_chat_workspace_id(42, 1001) == workspace["workspace_id"]
+    assert cp.get_chat_workspace_id(43, 1001) is None
+    with pytest.raises(ValueError):
+        cp.set_chat_workspace(43, 1001, workspace["workspace_id"])
+
+    cp.record_conversation_turn(42, 1001, "user", "workspace secret", workspace_id=workspace["workspace_id"])
+    cp.record_conversation_turn(42, 1001, "user", "legacy private turn")
+    scoped = cp.list_conversation_turns(42, 1001, workspace_id=workspace["workspace_id"])
+    private = cp.list_conversation_turns(42, 1001, workspace_id=None)
+    assert [row["text"] for row in scoped] == ["workspace secret"]
+    assert [row["text"] for row in private] == ["legacy private turn"]

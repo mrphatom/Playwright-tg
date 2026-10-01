@@ -41,7 +41,7 @@
   - Verify: source redaction, conflicting-source, provider-outage, and long-output tests.
   - Files: `bot.py`, `control_plane.py`, `api_contract.py`, tests.
 
-- [ ] **Slice 8 — Workspaces and project memory** *(workspace persistence/API foundation delivered; chat/memory integration remains)*
+- [x] **Slice 8 — Workspaces and project memory** *(workspace persistence and chat/memory isolation delivered; user-facing workspace controls remain)*
   - Acceptance: users can create isolated workspaces with instructions, memory scope, source preferences, sessions, watchers, and schedules.
   - Verify: ownership, deletion/archival, context isolation, and migration tests.
   - Files: `control_plane.py`, `bot.py`, `dashboard.py`, tests.
