@@ -70,3 +70,8 @@
   - Acceptance: README, API contract, operator runbook, migration notes, and rollback instructions match shipped behavior.
   - Verify: docs consistency checks, full test suite, CI deployment, live smoke tests, and clean git state.
   - Files: `README.md`, `docs/`, `api_contract.py`, workflow files as needed.
+
+
+## Next advanced feature wave
+
+The prioritized plan for the next implementation cycle is documented in [`tasks/greyai-advanced-feature-wave-2026-10-02.md`](greyai-advanced-feature-wave-2026-10-02.md). The recommended order is: workspace controls → smart watcher digest → evidence receipts → incident/readiness gate → signed webhooks → custom tools → tenant/business analytics.
