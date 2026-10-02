@@ -17,6 +17,7 @@ import pytest
 os.environ["DB_PATH"] = "test_telescout.db"
 
 from bot import (
+    build_help_sections,
     build_chat_prompt,
     calculate_next_schedule_run,
     deactivate_schedule_in_db,
@@ -35,6 +36,14 @@ from bot import (
     save_schedule_to_db,
     truncate_text,
 )
+
+
+def test_telegram_help_exposes_workspace_commands():
+    sections = build_help_sections(None)
+    rendered = "\n".join(body for _, body in sections)
+    assert "/workspace" in rendered
+    assert "workspace create" in rendered
+    assert "workspace clear" in rendered
 
 
 @pytest.fixture(autouse=True)

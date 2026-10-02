@@ -92,6 +92,13 @@ def test_discord_command_registry_includes_monitoring_surfaces(platform_db):
     assert {"watch", "watchers", "stopwatch", "schedule", "schedules", "unschedule"} <= names
 
 
+def test_discord_command_registry_includes_workspace_controls(platform_db):
+    import discord_bot
+
+    client = discord_bot.create_discord_bot()
+    assert "workspace" in {command.name for command in client.tree.get_commands()}
+
+
 def test_discord_command_registry_includes_fetch(platform_db):
     import discord_bot
 

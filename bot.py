@@ -83,6 +83,7 @@ from control_plane import (
     create_developer_access_request,
     create_download_job,
     create_operation,
+    create_workspace,
     create_queue_entry,
     create_report,
     enqueue_user_notification,
@@ -95,6 +96,7 @@ from control_plane import (
     get_appeal,
     get_conversation_turn_by_telegram_message_id,
     get_chat_workspace_id,
+    get_chat_workspace,
     get_developer_stats,
     get_last_download_job_at,
     get_maintenance_state,
@@ -125,6 +127,7 @@ from control_plane import (
     list_queue_entries,
     list_referrals,
     list_resumable_operations,
+    list_workspaces,
     list_reports,
     list_users_by_role,
     list_users_by_status,
@@ -148,10 +151,12 @@ from control_plane import (
     resolve_appeal,
     resolve_developer_access_request,
     resolve_report,
+    archive_workspace,
     resume_ad_campaign,
     revoke_all_api_keys_for_user,
     revoke_api_key,
     save_runtime_snapshot,
+    set_chat_workspace,
     search_users,
     set_maintenance_state,
     set_user_role,
@@ -542,6 +547,8 @@ async def configure_bot_profile(bot) -> None:
         BotCommand("start", "Start GreyAI and see your referral link"),
         BotCommand("help", "Show the full command and feature guide"),
         BotCommand("settings", "Open button-driven personal settings"),
+        BotCommand("workspace", "Manage isolated project workspaces"),
+        BotCommand("workspaces", "List and select project workspaces"),
         BotCommand("ask", "Ask GreyAI in a private chat or enabled group"),
         BotCommand("enablegreyai", "Enable GreyAI in a group"),
         BotCommand("disablegreyai", "Disable GreyAI in a group"),
@@ -10207,6 +10214,114 @@ def help_page_text(pages: list[str], page_index: int) -> str:
     return f"GreyAI command guide — page {page_index + 1}/{total_pages}\n\n{pages[page_index]}"
 
 
+def _workspace_label(workspace: dict[str, Any]) -> str:
+    status = str(workspace.get("status") or "active")
+    return f"{workspace.get('name', 'Unnamed')} ({workspace.get('workspace_id', '-')}) [{status}]"
+
+
+def _workspace_keyboard(owner_id: int, chat_id: int, workspaces: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for workspace in workspaces[:20]:
+        workspace_id = str(workspace.get("workspace_id") or "")
+        if not workspace_id or str(workspace.get("status")) != "active":
+            continue
+        rows.append([
+            InlineKeyboardButton(f"Use {str(workspace.get('name') or workspace_id)[:28]}", callback_data=f"workspace:select:{workspace_id}"),
+            InlineKeyboardButton("Archive", callback_data=f"workspace:archive:{workspace_id}"),
+        ])
+    rows.append([InlineKeyboardButton("Clear chat workspace", callback_data="workspace:clear")])
+    return InlineKeyboardMarkup(rows)
+
+
+@restricted
+async def workspace_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat:
+        return
+    owner_id = int(user.id)
+    args = [str(value).strip() for value in (context.args or []) if str(value).strip()]
+    action = args[0].lower() if args else "list"
+    if action in {"list", "ls"}:
+        rows = list_workspaces(owner_id, include_archived=False)
+        active = get_chat_workspace(owner_id, int(chat.id))
+        if not rows:
+            return await message.reply_text("No active workspaces yet. Create one with `/workspace create <name> | <instructions>`.", parse_mode="Markdown")
+        body = "Your active workspaces:\n\n" + "\n".join(
+            f"{'✅ ' if active and active['workspace_id'] == row['workspace_id'] else ''}{_workspace_label(row)}"
+            for row in rows[:20]
+        )
+        return await message.reply_text(body, reply_markup=_workspace_keyboard(owner_id, int(chat.id), rows))
+    if action in {"create", "new"}:
+        raw = " ".join(args[1:]).strip()
+        if "|" in raw:
+            name, instructions = (part.strip() for part in raw.split("|", 1))
+        else:
+            name, instructions = raw, ""
+        if not name:
+            return await message.reply_text("Usage: `/workspace create <name> | <optional instructions>`", parse_mode="Markdown")
+        try:
+            workspace = create_workspace(owner_id, name, instructions)
+        except ValueError as exc:
+            return await message.reply_text(f"Could not create workspace: {exc}")
+        set_chat_workspace(owner_id, int(chat.id), workspace["workspace_id"])
+        return await message.reply_text(f"✅ Created and selected **{workspace['name']}** (`{workspace['workspace_id']}`).", parse_mode="Markdown")
+    if action in {"select", "use"} and len(args) >= 2:
+        try:
+            workspace = set_chat_workspace(owner_id, int(chat.id), args[1])
+        except ValueError as exc:
+            return await message.reply_text(f"Could not select workspace: {exc}")
+        return await message.reply_text(f"✅ Active workspace: **{workspace['name']}**", parse_mode="Markdown")
+    if action in {"archive", "delete"} and len(args) >= 2:
+        if archive_workspace(args[1], owner_id):
+            if get_chat_workspace_id(owner_id, int(chat.id)) == args[1]:
+                set_chat_workspace(owner_id, int(chat.id), None)
+            return await message.reply_text("✅ Workspace archived. Its existing history remains retained, but new tasks cannot use it.")
+        return await message.reply_text("Workspace not found, already archived, or not owned by you.")
+    if action in {"clear", "none", "off"}:
+        set_chat_workspace(owner_id, int(chat.id), None)
+        return await message.reply_text("✅ Chat workspace cleared. New messages use private chat scope.")
+    await message.reply_text("Usage: /workspace [list|create <name> | <instructions>|select <workspace_id>|archive <workspace_id>|clear]")
+
+
+async def workspace_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user or not query.message:
+        return
+    match = re.fullmatch(r"workspace:(select|archive):([A-Za-z0-9_-]{6,80})|workspace:clear", str(query.data or ""))
+    if not match:
+        await query.answer("That workspace control is no longer available.", show_alert=True)
+        return
+    owner_id = int(query.from_user.id)
+    chat_id = int(query.message.chat_id)
+    if not is_allowed_user(owner_id):
+        await query.answer("Your account is not allowed to use GreyAI.", show_alert=True)
+        return
+    data = str(query.data)
+    try:
+        if data == "workspace:clear":
+            set_chat_workspace(owner_id, chat_id, None)
+            await query.answer("Workspace cleared")
+        else:
+            action, workspace_id = data.split(":", 2)[1:]
+            if action == "select":
+                workspace = set_chat_workspace(owner_id, chat_id, workspace_id)
+                await query.answer(f"Using {workspace['name']}")
+            elif archive_workspace(workspace_id, owner_id):
+                if get_chat_workspace_id(owner_id, chat_id) == workspace_id:
+                    set_chat_workspace(owner_id, chat_id, None)
+                await query.answer("Workspace archived")
+            else:
+                await query.answer("Workspace unavailable", show_alert=True)
+        rows = list_workspaces(owner_id, include_archived=False)
+        active = get_chat_workspace(owner_id, chat_id)
+        body = "Your active workspaces:\n\n" + ("\n".join(f"{'✅ ' if active and active['workspace_id'] == row['workspace_id'] else ''}{_workspace_label(row)}" for row in rows[:20]) or "No active workspaces.")
+        await query.edit_message_text(body, reply_markup=_workspace_keyboard(owner_id, chat_id, rows))
+    except (ValueError, KeyError):
+        await query.answer("Workspace is no longer available.", show_alert=True)
+
+
 def build_help_sections(user_id: int | None = None) -> list[tuple[str, str]]:
     user = get_user(int(user_id)) if user_id is not None else None
     admin_view = bool(user_id is not None and is_admin(int(user_id)))
@@ -10251,6 +10366,14 @@ def build_help_sections(user_id: int | None = None) -> list[tuple[str, str]]:
             "Use save_session:name and load_session:name inside authorized browser workflows.",
             "/settings — Open button-driven settings for persistent login, automatic session saving, handoffs, and session cleanup.",
             "Login state is encrypted and reused only for approved sites and authorized tasks.",
+        ))),
+        ("Workspaces and project memory", "\n".join((
+            "/workspace — List and select your isolated project workspaces",
+            "/workspace create <name> | <instructions> — Create and select a workspace",
+            "/workspace select <workspace_id> — Switch the current chat to a workspace",
+            "/workspace archive <workspace_id> — Archive one of your workspaces",
+            "/workspace clear — Return this chat to private scope",
+            "Workspace selection scopes chat memory, tasks, watchers, schedules, and future evidence receipts.",
         ))),
         ("Account and support", "\n".join((
             "/start — Start GreyAI and get your referral link",
@@ -10441,8 +10564,11 @@ def main():
     app.add_handler(CommandHandler("pair", pair_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("workspace", workspace_command))
+    app.add_handler(CommandHandler("workspaces", workspace_command))
     app.add_handler(CallbackQueryHandler(approval_callback, pattern=r"^approval:(approve|reject):[A-Za-z0-9_-]{6,80}$"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(settings:|session:delete:)"))
+    app.add_handler(CallbackQueryHandler(workspace_callback, pattern=r"^workspace:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(text_viewer_callback, pattern=r"^page:[A-Za-z0-9_-]{6,24}:\d{1,4}:\d{1,20}$"))
     app.add_handler(CommandHandler("ask", ask_command))

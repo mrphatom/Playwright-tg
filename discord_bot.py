@@ -58,6 +58,7 @@ from control_plane import (
     create_dashboard_login_token,
     create_discord_schedule,
     create_discord_watcher,
+    create_workspace,
     create_report,
     deactivate_discord_schedule,
     deactivate_discord_watcher,
@@ -66,14 +67,18 @@ from control_plane import (
     get_discord_pairing_for_telegram,
     get_or_create_referral_code,
     get_referral_stats,
+    get_chat_workspace,
     get_user,
     is_allowed_user,
     list_all_discord_schedules,
     list_all_discord_watchers,
     list_discord_schedules,
     list_discord_watchers,
+    list_workspaces,
     record_contact_log,
     record_security_audit,
+    archive_workspace,
+    set_chat_workspace,
     revoke_account_pairing,
     update_discord_schedule_next_run,
     update_discord_watcher_health,
@@ -1085,6 +1090,75 @@ def create_discord_bot() -> commands.Bot:
         owner_id = await _authenticate_interaction(interaction)
         if owner_id is not None:
             await interaction.response.send_message(_settings_summary(owner_id), ephemeral=True, view=DiscordSettingsView(owner_id))
+
+    @client.tree.command(name="workspace", description="List or manage your isolated GreyAI workspaces")
+    @app_commands.describe(
+        action="list, create, select, archive, or clear",
+        workspace_id="Workspace ID for select/archive",
+        name="Name when creating a workspace",
+        instructions="Optional workspace instructions when creating",
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="List active workspaces", value="list"),
+        app_commands.Choice(name="Create workspace", value="create"),
+        app_commands.Choice(name="Select workspace", value="select"),
+        app_commands.Choice(name="Archive workspace", value="archive"),
+        app_commands.Choice(name="Clear current channel", value="clear"),
+    ])
+    async def workspace_command(
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str],
+        workspace_id: str = "",
+        name: str = "",
+        instructions: str = "",
+    ) -> None:
+        owner_id = await _authenticate_interaction(interaction)
+        if owner_id is None:
+            return
+        selected_action = str(action.value)
+        channel_id = int(interaction.channel_id)
+        if selected_action == "list":
+            rows = list_workspaces(owner_id, include_archived=False)
+            active = get_chat_workspace(owner_id, channel_id)
+            body = "**Your active workspaces**\n\n" + ("\n".join(
+                f"{'✅ ' if active and active['workspace_id'] == row['workspace_id'] else ''}`{row['workspace_id']}` · {str(row['name'])[:80]}"
+                for row in rows[:20]
+            ) or "No active workspaces. Use action `create` to create one.")
+            await interaction.response.send_message(_safe_text(body), ephemeral=True)
+            return
+        if selected_action == "create":
+            if not str(name).strip():
+                await interaction.response.send_message("Provide a workspace name when using action `create`.", ephemeral=True)
+                return
+            try:
+                workspace = create_workspace(owner_id, name, instructions)
+                set_chat_workspace(owner_id, channel_id, workspace["workspace_id"])
+            except ValueError as exc:
+                await interaction.response.send_message(f"Could not create workspace: {_safe_text(exc, 200)}", ephemeral=True)
+                return
+            await interaction.response.send_message(f"Created and selected workspace **{_safe_text(workspace['name'], 80)}** (`{workspace['workspace_id']}`).", ephemeral=True)
+            return
+        if selected_action == "select":
+            if not str(workspace_id).strip():
+                await interaction.response.send_message("Provide a workspace ID when using action `select`.", ephemeral=True)
+                return
+            try:
+                workspace = set_chat_workspace(owner_id, channel_id, workspace_id.strip())
+            except ValueError as exc:
+                await interaction.response.send_message(f"Could not select workspace: {_safe_text(exc, 200)}", ephemeral=True)
+                return
+            await interaction.response.send_message(f"Active workspace for this channel: **{_safe_text(workspace['name'], 80)}**.", ephemeral=True)
+            return
+        if selected_action == "archive":
+            if not str(workspace_id).strip() or not archive_workspace(workspace_id.strip(), owner_id):
+                await interaction.response.send_message("Workspace not found, already archived, or not owned by you.", ephemeral=True)
+                return
+            if get_chat_workspace(owner_id, channel_id) and get_chat_workspace(owner_id, channel_id)["workspace_id"] == workspace_id.strip():
+                set_chat_workspace(owner_id, channel_id, None)
+            await interaction.response.send_message("Workspace archived. Existing history is retained; new tasks cannot use it.", ephemeral=True)
+            return
+        set_chat_workspace(owner_id, channel_id, None)
+        await interaction.response.send_message("Current channel workspace cleared; new requests use private scope.", ephemeral=True)
 
     @client.tree.command(name="grey", description="Show your paired GreyAI account state")
     async def grey_command(interaction: discord.Interaction) -> None:
